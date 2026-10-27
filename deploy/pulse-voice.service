@@ -1,0 +1,21 @@
+[Unit]
+Description=Pulse voice signaling service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pulse-voice
+Group=pulse-voice
+WorkingDirectory=/opt/pulse-voice
+EnvironmentFile=/etc/pulse-voice.env
+ExecStart=/usr/bin/node /opt/pulse-voice/server/signaling.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

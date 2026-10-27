@@ -1,0 +1,4 @@
+voice.example.com {
+	@voice path /voice
+	reverse_proxy @voice 127.0.0.1:8787
+}

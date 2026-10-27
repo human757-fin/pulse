@@ -1,0 +1,20 @@
+node_modules/
+dist/
+src-tauri/target/
+logs/
+
+.env
+.env.*
+!.env.example
+*.log
+
+# Local server and Pterodactyl secrets/binaries
+cloudflared
+server/.env
+deploy/.env
+
+# Editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
