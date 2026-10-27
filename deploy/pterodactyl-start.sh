@@ -3,19 +3,24 @@
 # Keep this script in the foreground so Pterodactyl can stop both processes.
 set -Eeuo pipefail
 
-cd /home/container
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+app_dir="$(cd -- "$script_dir/.." && pwd)"
+cd "$app_dir"
 export GIT_TERMINAL_PROMPT=0
-mkdir -p /home/container/logs
-voice_log=/home/container/logs/pulse-voice.log
-tunnel_log=/home/container/logs/cloudflared.log
+mkdir -p "$app_dir/logs"
+voice_log="$app_dir/logs/pulse-voice.log"
+tunnel_log="$app_dir/logs/cloudflared.log"
 
 if [[ ! -f server/signaling.mjs ]]; then
   echo "Missing server/signaling.mjs. Upload or clone the Pulse repository first."
   exit 1
 fi
 
-if [[ ! -x ./cloudflared ]]; then
-  echo "Missing cloudflared binary at /home/container/cloudflared"
+cloudflared_bin="$app_dir/cloudflared"
+if [[ -f "$cloudflared_bin" ]]; then chmod +x "$cloudflared_bin" 2>/dev/null || true; fi
+if [[ ! -x "$cloudflared_bin" ]]; then cloudflared_bin="$(command -v cloudflared || true)"; fi
+if [[ -z "$cloudflared_bin" || ! -x "$cloudflared_bin" ]]; then
+  echo "Missing cloudflared. Upload it beside this repository's package.json or install it in PATH."
   exit 1
 fi
 
@@ -25,7 +30,7 @@ if [[ ! -f package-lock.json ]]; then
 fi
 
 if [[ ! -f .env ]]; then
-  echo "Missing /home/container/.env with CLOUDFLARE_TUNNEL_TOKEN and PULSE_VOICE_TOKEN"
+  echo "Missing .env beside package.json with CLOUDFLARE_TUNNEL_TOKEN and PULSE_VOICE_TOKEN"
   exit 1
 fi
 
@@ -56,12 +61,12 @@ elif [[ "${AUTO_UPDATE:-true}" == "true" ]]; then
 fi
 
 if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
-  echo "CLOUDFLARE_TUNNEL_TOKEN is missing from /home/container/.env"
+  echo "CLOUDFLARE_TUNNEL_TOKEN is missing from .env"
   exit 1
 fi
 
 if [[ -z "${PULSE_VOICE_TOKEN:-}" ]]; then
-  echo "PULSE_VOICE_TOKEN is missing from /home/container/.env"
+  echo "PULSE_VOICE_TOKEN is missing from .env"
   exit 1
 fi
 
@@ -79,7 +84,7 @@ export PULSE_VOICE_PORT="${SERVER_PORT:-${PULSE_VOICE_PORT:-8787}}"
 echo "Pulse signaling will listen on 0.0.0.0:${PULSE_VOICE_PORT}"
 
 echo "Starting Cloudflare Tunnel. Logs: $tunnel_log"
-./cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" >>"$tunnel_log" 2>&1 &
+"$cloudflared_bin" tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" >>"$tunnel_log" 2>&1 &
 tunnel_pid=$!
 
 echo "Starting Pulse voice signaling. Logs: $voice_log"
