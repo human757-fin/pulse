@@ -15,17 +15,19 @@ The `quay.io/ydrag0n/pterodactyl-vps-egg` starts its shell with `./run.sh`. The 
    AUTO_UPDATE=true
    ```
 
-3. Upload the Linux `cloudflared` binary next to `package.json`.
+3. The startup script installs `cloudflared` from Cloudflare's official apt repository if it is not already installed. If your image cannot install apt packages, upload the Linux `cloudflared` binary next to `package.json` instead.
 4. In the server's **Startup** settings, set the command to:
 
    ```sh
    bash /home/container/deploy/pterodactyl-node-entrypoint.sh
    ```
 
-   The entrypoint installs Node.js 18+, npm, and Git through `apt` when they are missing, then starts Pulse. It requires a Debian or Ubuntu root filesystem. If Startup is locked to `./run.sh`, the panel administrator must change the egg's startup command; the File Manager cannot edit the egg's `/autorun.sh` path.
+   The entrypoint installs Node.js 18+, npm, Git, and `cloudflared` through `apt` when they are missing, then starts Pulse. It requires a Debian or Ubuntu root filesystem with permission to install apt packages. If Startup is locked to `./run.sh`, the panel administrator must change the egg's startup command; the File Manager cannot edit the egg's `/autorun.sh` path.
 5. Configure the Cloudflare Tunnel Public Hostname to route your domain to `http://127.0.0.1:<Pterodactyl TCP port>`. In Pulse, set `wss://your-domain/voice` and the same shared token.
 
 The startup script pulls `origin main`, then runs `npm ci` and `npm run build` when the source commit changes. It writes service logs under `logs/`.
+
+The entrypoint keeps Pulse and `cloudflared` running in the foreground under Pterodactyl. Do not also run `sudo cloudflared service install <token>` on the host for this same tunnel, or you will run a second connector. For auto boot after a VPS restart, the Pterodactyl node administrator must enable automatic startup for this server in their panel/host setup; a systemd service cannot be installed from the container's File Manager.
 
 ## Configure environment
 
