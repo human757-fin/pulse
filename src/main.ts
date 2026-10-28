@@ -36,6 +36,8 @@ let totpSetup: { challengeId: string; secret: string; account: string; issuer: s
 let availableUpdate: { version: string; body?: string; install: () => Promise<void> } | undefined;
 let updateInstalling = false;
 let updateError = '';
+let updateChecking = false;
+let updateCheckMessage = 'Pulse checks for updates when it starts.';
 let totpRecoveryCodes: string[] = [];
 let totpError = '';
 let cryptoReady = false;
@@ -301,7 +303,7 @@ function renderSettings() {
     ${authenticatorSettings}
     ${securityChallenge ? `<label class="field-label">Code sent to ${esc(securityChallenge.email)}<input id="security-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code"></label><button type="button" class="primary-button security-verify" id="security-verify">Verify code</button>` : ''}<div class="settings-form-error" role="alert">${esc(securityError)}</div>
   </section>`;
-  const updateSettings = `<section class="settings-section"><div class="settings-section-heading"><div><h2>Beta access</h2><p>Preview upcoming Pulse builds before they reach everyone.</p></div></div><label class="beta-setting"><span><strong>Check for beta updates</strong><small>At startup, Pulse will ask before installing an available beta.</small></span><input id="beta-access" type="checkbox" ${localStorage.getItem('pulse.betaAccess') === 'true' ? 'checked' : ''}><span class="toggle-track" aria-hidden="true"></span></label></section>`;
+  const updateSettings = `<section class="settings-section"><div class="settings-section-heading"><div><h2>Updates</h2><p>Pulse asks before installing an update. Beta builds may include unfinished changes.</p></div></div><label class="beta-setting"><span><strong>Check for beta updates</strong><small>Include prerelease builds when checking.</small></span><input id="beta-access" type="checkbox" ${localStorage.getItem('pulse.betaAccess') === 'true' ? 'checked' : ''}><span class="toggle-track" aria-hidden="true"></span></label><div class="update-check-row"><p id="update-check-status" role="status" aria-live="polite">${esc(updateCheckMessage)}</p><button type="button" class="secondary-button" id="check-updates" ${updateChecking ? 'disabled' : ''}>${updateChecking ? 'Checking…' : 'Check for updates'}</button></div></section>`;
   const settingsTitle = settingsTab === 'security' ? 'Security' : settingsTab === 'updates' ? 'Updates' : 'Profile';
   app.innerHTML = `<aside class="rail"><button class="brand-mark brand-tab" id="friends-home" title="Friends" aria-label="Friends"><img class="app-mark" src="/pulse-mark.svg" alt=""></button>${railCall}<div class="rail-divider"></div><div class="rail-bottom"><button class="account-tab active" id="settings-open" title="Settings" aria-label="Settings">${avatar(me, 'me')}</button></div></aside>
   <aside class="sidebar settings-sidebar"><header class="side-header"><div><div class="eyebrow">PULSE</div><div class="space-title">Settings</div></div></header><nav class="settings-nav" aria-label="Settings sections"><button class="settings-nav-item ${settingsTab === 'profile' ? 'active' : ''}" data-settings-tab="profile">Profile</button><button class="settings-nav-item ${settingsTab === 'security' ? 'active' : ''}" data-settings-tab="security">Security</button><button class="settings-nav-item ${settingsTab === 'updates' ? 'active' : ''}" data-settings-tab="updates">Updates</button></nav><div class="settings-sidebar-bottom"><button class="settings-nav-item signout-item" id="logout-settings" type="button">↪ <span>Sign out</span></button></div></aside>
@@ -313,7 +315,8 @@ function renderSettings() {
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
   app.querySelectorAll<HTMLButtonElement>('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab as typeof settingsTab; renderSettings(); });
-  app.querySelector<HTMLInputElement>('#beta-access')?.addEventListener('change', event => { localStorage.setItem('pulse.betaAccess', String((event.currentTarget as HTMLInputElement).checked)); });
+  app.querySelector<HTMLInputElement>('#beta-access')?.addEventListener('change', event => { localStorage.setItem('pulse.betaAccess', String((event.currentTarget as HTMLInputElement).checked)); void checkDesktopUpdates(); });
+  app.querySelector<HTMLButtonElement>('#check-updates')?.addEventListener('click', () => { void checkDesktopUpdates(); });
   app.querySelector<HTMLButtonElement>('#verify-email-button')?.addEventListener('click', async () => {
     try { const email = (app.querySelector<HTMLInputElement>('#security-email')!.value || '').trim().toLowerCase(); const result = await api<{ challengeId: string }>('/auth/email-code', { method: 'POST', body: JSON.stringify({ email, purpose: 'verify-email' }) }); securityChallenge = { challengeId: result.challengeId, purpose: 'verify-email', email }; securityError = ''; renderSettings(); }
     catch (error) { securityError = error instanceof Error ? error.message : 'Could not send verification code.'; renderSettings(); }
@@ -362,11 +365,11 @@ function renderSettings() {
 }
 
 async function start() {
+  window.setTimeout(() => { void checkDesktopUpdates(); }, 8000);
   if (token) {
     try { me = await hydrateProfile((await api<{ user: User }>('/me')).user); try { await initializeAccountCrypto(me); } catch (error) { notice = `Encryption setup failed: ${error instanceof Error ? error.message : 'sign in again to retry'}`; } await refreshFriends(); await refreshUnread(); render(); }
     catch { token = ''; localStorage.removeItem('pulse.authToken'); renderAuth(); }
   } else renderAuth();
-  window.setTimeout(() => { void checkDesktopUpdates(); }, 8000);
   window.setInterval(async () => {
     if (!me) return;
     try { const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join(); const previousUnread = JSON.stringify(unreadCounts); await refreshFriends(); await refreshUnread(); if (previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join() || previousUnread !== JSON.stringify(unreadCounts)) render(); if (activeFriend) await refreshMessages(); }
@@ -375,17 +378,36 @@ async function start() {
 }
 
 async function checkDesktopUpdates() {
-  if (!('__TAURI_INTERNALS__' in window)) return;
+  if (updateChecking) return;
+  if (!('__TAURI_INTERNALS__' in window)) {
+    updateCheckMessage = 'Automatic updates are available in the Pulse desktop app.';
+    renderUpdateCheckStatus();
+    return;
+  }
+  updateChecking = true;
+  const betaAccess = localStorage.getItem('pulse.betaAccess') === 'true';
+  const channel = betaAccess ? 'beta' : 'stable';
+  updateCheckMessage = `Checking the ${channel} channel…`;
+  renderUpdateCheckStatus();
   try {
     const { check } = await import('@tauri-apps/plugin-updater');
-    const betaAccess = localStorage.getItem('pulse.betaAccess') === 'true';
     const update = await check({ headers: { 'X-Pulse-Channel': betaAccess ? 'beta' : 'stable' } });
-    if (!update) return;
+    if (!update) { updateCheckMessage = `Pulse is up to date on the ${channel} channel.`; return; }
     availableUpdate = { version: update.version, body: update.body, install: () => update.downloadAndInstall() };
+    updateCheckMessage = `Pulse ${update.version} is available. Choose Install update in the banner.`;
     renderUpdateBanner();
   } catch (error) {
     console.warn('Pulse automatic update check failed:', error);
+    updateCheckMessage = `Could not check for updates: ${error instanceof Error ? error.message : 'try again later.'}`;
+  } finally {
+    updateChecking = false;
+    renderUpdateCheckStatus();
   }
+}
+
+function renderUpdateCheckStatus() {
+  document.querySelectorAll<HTMLElement>('#update-check-status').forEach(element => { element.textContent = updateCheckMessage; });
+  document.querySelectorAll<HTMLButtonElement>('#check-updates').forEach(button => { button.disabled = updateChecking; button.textContent = updateChecking ? 'Checking…' : 'Check for updates'; });
 }
 
 function renderUpdateBanner() {
