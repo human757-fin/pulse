@@ -3,6 +3,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 
 const port = Number(process.env.PULSE_VOICE_PORT || process.env.SERVER_PORT || 8787);
 const apiBase = (process.env.PULSE_API_URL || 'http://127.0.0.1:8788').replace(/\/$/, '');
+const voiceProtocol = 'pulse-aesgcm-v1';
 const turnUrl = process.env.PULSE_TURN_URL || '';
 const turnSecret = process.env.PULSE_TURN_SECRET || '';
 const parsedTurnTtl = Number(process.env.PULSE_TURN_TTL_SECONDS || 3600);
@@ -51,6 +52,7 @@ async function handle(client, message) {
       const roomName = String(message.room || '').slice(0, 128);
       const friendId = String(message.friendId || '');
       const authToken = String(message.authToken || '').trim();
+      if (message.voiceProtocol !== voiceProtocol) { send(client, { type: 'error', message: 'Voice versions do not match. Update Pulse on both devices and restart the Pulse server.' }); return; }
       if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Pulse and select an accepted friend before calling.' }); return; }
       client.joining = true;
       let account;
@@ -76,7 +78,7 @@ async function handle(client, message) {
       client.name = String(account.username).slice(0, 48);
       room.set(client.id, client);
       const iceServers = turnCredentials(client.id);
-      send(client, { type: 'joined', id: client.id, peers, iceServers, iceTransportPolicy: turnOnly && iceServers.length ? 'relay' : 'all' });
+      send(client, { type: 'joined', id: client.id, peers, iceServers, voiceProtocol, iceTransportPolicy: turnOnly && iceServers.length ? 'relay' : 'all' });
       for (const peer of room.values()) if (peer !== client) send(peer, { type: 'peer-joined', id: client.id, name: client.name });
       return;
     }

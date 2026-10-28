@@ -2,6 +2,7 @@ export type VoiceState = 'disconnected' | 'connecting' | 'waiting' | 'connected'
 export type VoiceUpdate = { state: VoiceState; message: string; peers: string[] };
 
 type Signal = { type: string; [key: string]: unknown };
+const voiceProtocol = 'pulse-aesgcm-v1';
 
 export class VoiceClient {
   private socket?: WebSocket;
@@ -24,7 +25,7 @@ export class VoiceClient {
     this.emit('connecting', 'Requesting microphone…');
     try {
       const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => unknown }).RTCRtpScriptTransform;
-      if (!Transform) throw new Error('This browser does not support encrypted voice. Update Microsoft Edge/WebView2 and retry.');
+      if (!Transform || !('transform' in RTCRtpSender.prototype) || !('transform' in RTCRtpReceiver.prototype)) throw new Error('This browser cannot encrypt and decrypt Pulse voice. Update Microsoft Edge/WebView2 and retry.');
       const parsedEndpoint = new URL(endpoint);
       if (parsedEndpoint.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsedEndpoint.hostname)) throw new Error('Use a secure wss:// voice address to protect your Pulse sign-in.');
       this.voiceKey = voiceKey;
@@ -43,9 +44,9 @@ export class VoiceClient {
         socket.onerror = () => { window.clearTimeout(timer); reject(new Error(`Can’t reach voice server at ${endpoint}`)); };
       });
       if (this.stopped) return;
-      socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal); };
+      socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal).catch(error => this.fail(error instanceof Error ? error.message : 'Voice setup failed.')); };
       socket.onclose = () => { if (!this.stopped) this.fail('Voice server disconnected.'); };
-      socket.send(JSON.stringify({ type: 'join', room, friendId, authToken }));
+      socket.send(JSON.stringify({ type: 'join', room, friendId, authToken, voiceProtocol }));
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'Could not join voice.');
     }
@@ -77,6 +78,7 @@ export class VoiceClient {
 
   private async handle(msg: Signal) {
     if (msg.type === 'joined') {
+      if (msg.voiceProtocol !== voiceProtocol) { this.fail('Voice versions do not match. Update Pulse on both devices and restart the Pulse server.'); return; }
       this.turnServers = (msg.iceServers as RTCIceServer[]) || [];
       this.iceTransportPolicy = msg.iceTransportPolicy === 'relay' && this.turnServers.length ? 'relay' : 'all';
       const peers = (msg.peers as Array<{ id: string; name: string }>) || [];
@@ -154,7 +156,8 @@ export class VoiceClient {
     });
     pc.onicecandidate = event => { if (event.candidate) this.send({ type: 'ice', to: id, candidate: event.candidate }); };
     pc.ontrack = event => {
-      this.applyTransform(event.receiver, 'decrypt');
+      try { this.applyTransform(event.receiver, 'decrypt'); }
+      catch (error) { this.fail(error instanceof Error ? error.message : 'Could not decrypt incoming voice.'); return; }
       let audio = this.audioElements.get(id);
       if (!audio) {
         audio = document.createElement('audio');
@@ -177,7 +180,10 @@ export class VoiceClient {
   private applyTransform(endpoint: RTCRtpSender | RTCRtpReceiver, mode: 'encrypt' | 'decrypt') {
     const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => RTCRtpScriptTransform }).RTCRtpScriptTransform;
     if (!Transform || !this.cryptoWorker || !this.voiceKey) throw new Error('Encrypted voice is unavailable in this browser.');
-    (endpoint as RTCRtpSender & { transform?: RTCRtpScriptTransform | null }).transform = new Transform(this.cryptoWorker, { mode, keyBytes: this.voiceKey });
+    const rtpEndpoint = endpoint as (RTCRtpSender | RTCRtpReceiver) & { transform?: RTCRtpScriptTransform | null };
+    const transform = new Transform(this.cryptoWorker, { mode, keyBytes: this.voiceKey });
+    rtpEndpoint.transform = transform;
+    if (rtpEndpoint.transform !== transform) throw new Error('This browser could not attach encrypted voice. Update Microsoft Edge/WebView2 and retry.');
   }
 
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }

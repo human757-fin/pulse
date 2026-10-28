@@ -33,5 +33,5 @@ jobs:
           releaseName: Pulse ${{ github.ref_name }}
           releaseBody: Signed Windows installers and update metadata for Pulse.
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           updaterJsonPreferNsis: true

@@ -21,6 +21,8 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```dotenv
    CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
    AUTO_UPDATE=true
+   RESEND_API_KEY=re_your_server_api_key
+   PULSE_EMAIL_FROM='Pulse <no-reply@your-verified-domain.example>'
    ```
 
 3. Create `/autorun.sh` at the guest filesystem root with this content:
@@ -45,11 +47,15 @@ Create `/root/pulse/.env` in the server's File Manager:
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
 AUTO_UPDATE=true
+RESEND_API_KEY=re_your_server_api_key
+PULSE_EMAIL_FROM='Pulse <no-reply@your-verified-domain.example>'
 ```
+
+Create a Resend API key and verify the sender domain in Resend, then replace the two email values above. The `PULSE_EMAIL_FROM` value must be quoted because the display name contains shell-sensitive characters. Keep the API key private. Without these values, account creation, email verification, and two-factor code delivery return an email setup error.
 
 Confirm the egg's **PORT 2** field matches the second allocation. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
 
-Pulse currently allows public account signup at `https://pulse.overclockd.shop`. Members create their own username/password, add friends by exact username, and accept requests. Passwords are salted and hashed; account data and encrypted message envelopes are stored in `data/pulse.json`. Back this file up and do not publish it. New direct messages and voice audio are encrypted on the clients. Messages sent before the E2EE update remain plaintext in the database. Each device keeps its private key in browser storage; clearing that storage loses access to messages encrypted for that device. Keys are trusted on first use, so compare a friend's key fingerprint out of band before trusting it. This version does not provide forward secrecy or synchronize keys across devices. The voice token remains separate from account passwords.
+Pulse allows public account signup at `https://pulse.overclockd.shop`. New accounts must verify an email address with a six-digit code before account creation. Existing members can add/verify an email in Settings, then use that email to sign in. Optional two-factor authentication sends a second six-digit code to the verified email on each new sign-in. Passwords are salted and hashed; account data and encrypted message envelopes are stored in `data/pulse.json`. Back this file up and do not publish it. New direct messages and voice audio are encrypted on the clients. Messages sent before the E2EE update remain plaintext in the database. Each device keeps its private key in browser storage; clearing that storage loses access to messages encrypted for that device. Keys are trusted on first use, so compare a friend's key fingerprint out of band before trusting it. This version does not provide forward secrecy or synchronize keys across devices. The voice token remains separate from account passwords.
 
 The script runs `git pull --ff-only origin main` at each boot. When the commit changes, it runs `npm ci` and `npm run build`. On the first boot it installs/builds if `node_modules` or `dist/index.html` are missing. If the repo uses another branch, change `main` in the script.
 
