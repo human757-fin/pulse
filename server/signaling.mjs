@@ -2,7 +2,8 @@ import { createServer } from 'node:http';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 
 const port = Number(process.env.PULSE_VOICE_PORT || process.env.SERVER_PORT || 8787);
-const accessToken = process.env.PULSE_VOICE_TOKEN || '';
+// Pterodactyl .env files may be edited on Windows and retain a trailing CR.
+const accessToken = (process.env.PULSE_VOICE_TOKEN || '').trim();
 const turnUrl = process.env.PULSE_TURN_URL || '';
 const turnSecret = process.env.PULSE_TURN_SECRET || '';
 const parsedTurnTtl = Number(process.env.PULSE_TURN_TTL_SECONDS || 3600);
@@ -39,7 +40,7 @@ function leave(client) {
 
 function tokenIsValid(candidate) {
   if (!accessToken) return true;
-  const actual = Buffer.from(String(candidate || ''));
+  const actual = Buffer.from(String(candidate || '').trim());
   const expected = Buffer.from(accessToken);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
