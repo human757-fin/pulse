@@ -42,3 +42,9 @@ See [VOICE_SETUP.md](VOICE_SETUP.md) for a direct VPS setup and [deploy/PTERODAC
 - This initial key setup does not provide forward secrecy or multi-device key synchronization. Losing browser storage means that device cannot decrypt messages sent to its old key.
 - Open a friend's DM and press **Call**. The first time, enter the shared voice token. Your friend opens the same DM and presses **Call** too. On the hosted site, the signaling address is inferred from the `pulse.*` hostname; desktop builds can set `VITE_PULSE_SIGNAL_URL`.
 - Calls require a browser with WebRTC encoded transforms (current Edge/WebView2 or Chrome). Voice supports two people per room; group voice, streaming, and account 2FA are not implemented.
+
+## Desktop updates
+
+Pulse checks for signed Windows app updates shortly after startup and installs a newer release automatically. The updater verifies signatures with the public key in `src-tauri/tauri.conf.json`; never commit or share `src-tauri/pulse-updater.key`.
+
+To publish a release, add the contents of the local `src-tauri/pulse-updater.key` file as the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, then push a version tag such as `v0.3.0`. The workflow builds NSIS/MSI installers and the signed updater manifest. Versions installed before updater support need one manual install of the first updater-enabled installer; later versions update from inside Pulse.

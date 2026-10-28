@@ -77,7 +77,7 @@ async function toggleCall() {
   if (voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting') { voiceRoom = ''; voiceMuted = false; voice.leave(); return; }
   if (!me || !activeFriend) return;
   if (!cryptoReady) { showError(new Error('This device’s encryption key is not ready. Sign out and back in, then retry.')); return; }
-  const endpoint = localStorage.getItem('pulse.signalUrl') || import.meta.env.VITE_PULSE_SIGNAL_URL || 'ws://127.0.0.1:8787';
+  const endpoint = signalUrl();
   let access = localStorage.getItem('pulse.voiceToken') || '';
   if (!access) {
     access = window.prompt('Enter the shared Pulse voice token. Pulse will save it on this device.', '')?.trim() || '';
@@ -100,7 +100,7 @@ function render() {
   app.innerHTML = `<aside class="rail"><div class="brand-mark">P<span>·</span></div><div class="rail-divider"></div><button class="server active" title="Friends">F</button><div class="rail-bottom"><button class="icon-button" title="Sign out" id="logout">↪</button><div class="avatar me">${esc(me.username[0].toUpperCase())}</div></div></aside>
   <aside class="sidebar"><header class="side-header"><div><div class="eyebrow">PULSE</div><div class="space-title">Friends</div></div><button class="icon-button" title="Sign out" id="logout-top">↪</button></header>
     <label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>
-    <div class="side-scroll"><section><div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}"><span class="avatar tiny" style="--av:#8276ff">${esc(f.username[0].toUpperCase())}</span><span>${esc(f.username)}</span></button>`).join('') || '<p class="side-empty">Add someone by their username to start chatting.</p>'}</section>
+    <div class="side-scroll"><section><div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<div class="friend-list-row"><button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}"><span class="avatar tiny" style="--av:#8276ff">${esc(f.username[0].toUpperCase())}</span><span>${esc(f.username)}</span></button><button class="friend-call" data-call-friend="${esc(f.id)}" title="Call ${esc(f.username)}" aria-label="Call ${esc(f.username)}">☎</button></div>`).join('') || '<p class="side-empty">Add someone by their username to start chatting.</p>'}</section>
     <section><div class="section-title">FRIEND REQUESTS <span>${friends.incoming.length}</span></div>${friends.incoming.map(f => `<div class="request-row"><span>${esc(f.username)}</span><button class="accept-button" data-accept="${esc(f.id)}">Accept</button></div>`).join('') || '<p class="side-empty">No new requests.</p>'}${friends.outgoing.map(f => `<p class="side-empty">Request sent to ${esc(f.username)}</p>`).join('')}</section>
     <section><div class="section-title">ADD A FRIEND</div><form id="add-friend" class="add-friend"><input name="username" required maxlength="24" placeholder="Pulse username"/><button title="Send friend request">＋</button></form></section></div>
     <div class="profile"><div class="avatar me">${esc(me.username[0].toUpperCase())}</div><div class="profile-copy"><strong>${esc(me.username)}</strong><small>Signed in</small></div><button class="icon-button" id="logout-bottom" title="Sign out">↪</button></div></aside>
@@ -112,6 +112,14 @@ function render() {
     <div class="encryption"><span class="lock">🔒</span><div><strong>End-to-end encrypted</strong><p>New DMs and voice are encrypted on this device. Old messages remain unencrypted.</p>${friend ? `<button id="show-key-codes" class="key-code-button">Compare safety codes</button>` : ''}</div></div></aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
 
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
+  app.querySelectorAll<HTMLButtonElement>('[data-call-friend]').forEach(button => button.onclick = () => {
+    const selected = friends.friends.find(f => f.id === button.dataset.callFriend);
+    if (!selected) return;
+    const isSameCall = voiceRoom === chatRoom(selected) && (voiceState === 'connecting' || voiceState === 'waiting' || voiceState === 'connected');
+    if (isSameCall) { void toggleCall(); return; }
+    if (voiceState === 'connecting' || voiceState === 'waiting' || voiceState === 'connected') voice.leave();
+    voiceRoom = ''; activeFriend = selected; messages = []; render(); void toggleCall();
+  });
   app.querySelectorAll<HTMLButtonElement>('[data-accept]').forEach(button => button.onclick = async () => { try { await api(`/friends/${button.dataset.accept}/accept`, { method: 'POST', body: '{}' }); await refreshFriends(); render(); } catch (e) { showError(e); } });
   app.querySelector<HTMLFormElement>('#add-friend')!.onsubmit = async e => { e.preventDefault(); const form = new FormData(e.currentTarget as HTMLFormElement); try { await api('/friends', { method: 'POST', body: JSON.stringify({ username: form.get('username') }) }); await refreshFriends(); notice = 'Friend request sent.'; render(); } catch (error) { showError(error); } };
   const signOut = async () => { try { await api('/logout', { method: 'POST', body: '{}' }); } catch {} token = ''; me = undefined; activeFriend = undefined; localStorage.removeItem('pulse.authToken'); voice.leave(); renderAuth(); };
@@ -138,10 +146,28 @@ async function start() {
     try { me = (await api<{ user: User }>('/me')).user; try { await initializeAccountCrypto(me); } catch (error) { notice = `Encryption setup failed: ${error instanceof Error ? error.message : 'sign in again to retry'}`; } await refreshFriends(); render(); }
     catch { token = ''; localStorage.removeItem('pulse.authToken'); renderAuth(); }
   } else renderAuth();
+  window.setTimeout(() => { void checkDesktopUpdates(); }, 8000);
   window.setInterval(async () => {
     if (!me) return;
     try { const previousIncoming = friends.incoming.map(f => f.id).join(); const previousFriends = friends.friends.map(f => f.id).join(); await refreshFriends(); if (previousIncoming !== friends.incoming.map(f => f.id).join() || previousFriends !== friends.friends.map(f => f.id).join()) render(); if (activeFriend) await refreshMessages(); }
     catch (error) { if (error instanceof Error && error.message === 'Sign in to continue.') { token = ''; me = undefined; localStorage.removeItem('pulse.authToken'); renderAuth(); } }
   }, 3000);
 }
+
+async function checkDesktopUpdates() {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  try {
+    const { check } = await import('@tauri-apps/plugin-updater');
+    const update = await check();
+    if (!update) return;
+    notice = `Installing Pulse ${update.version}…`;
+    render();
+    await update.downloadAndInstall();
+    const { relaunch } = await import('@tauri-apps/plugin-process');
+    await relaunch();
+  } catch (error) {
+    console.warn('Pulse automatic update check failed:', error);
+  }
+}
+
 void start();
