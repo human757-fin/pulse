@@ -20,18 +20,18 @@ sudo chown -R pulse-voice:pulse-voice /opt/pulse-voice
 sudo cp deploy/pulse-voice.service /etc/systemd/system/pulse-voice.service
 ```
 
-Generate an access token and create `/etc/pulse-voice.env`:
+Create `/etc/pulse-voice.env` for the signaling server configuration:
 
 ```sh
-openssl rand -hex 32
 sudo nano /etc/pulse-voice.env
 ```
 
-Put these settings in the file, using the generated token:
+Set the signaling port and the address of the Pulse account API (running on the same VPS by default):
 
 ```ini
 PULSE_VOICE_PORT=8787
-PULSE_VOICE_TOKEN=PASTE_GENERATED_TOKEN
+# Pulse voice checks account sessions and friend relationships through the API.
+PULSE_API_URL=http://127.0.0.1:8788
 ```
 
 Then protect and start the service:
@@ -53,9 +53,9 @@ Put `deploy/Caddyfile` in Caddy's config (commonly `/etc/caddy/Caddyfile`) and r
 sudo systemctl reload caddy
 ```
 
-Allow inbound TCP ports 80 and 443 so Caddy can obtain and renew the certificate. In Pulse, set the signaling server to `wss://voice.example.com/voice` and enter the same access token configured on the VPS. The token is shared by your group; this prototype does not yet have individual accounts or room-level permissions.
+Allow inbound TCP ports 80 and 443 so Caddy can obtain and renew the certificate. In Pulse, set the signaling server to `wss://voice.example.com/voice`. Callers must sign in to Pulse and be accepted friends; no shared voice token is required.
 
-For local development, `.env.example` shows how to prefill the VPS URL in a client build. Copy it to `.env.local` and replace the example domain, or enter the URL directly in the voice panel. Do not put the access token in `.env.local` or in a distributed client build.
+For local development, `.env.example` shows how to prefill the VPS URL in a client build. Copy it to `.env.local` and replace the example domain, or enter the URL directly in the voice panel.
 
 ## 4. Optional TURN relay for restrictive networks
 
@@ -81,6 +81,6 @@ sudo ufw allow 49160:49200/udp
 ## Scope and security
 
 - This is a 1:1 WebRTC milestone, not the later multi-user SFU.
-- The shared access token prevents casual strangers from using signaling, but it is not a substitute for Pulse accounts.
+- The signaling server checks Pulse sessions and accepted-friend relationships before admitting a caller to a DM voice room.
 - WebRTC encrypts media in transit. This prototype does not authenticate device identities, so it does not yet meet the spec's full end-to-end encryption design.
 - Voice and chat room names are still demo identifiers. The text chat itself is local sample data.

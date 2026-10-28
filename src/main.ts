@@ -6,8 +6,10 @@ type User = { id: string; username: string };
 type ChatMessage = { id: string; from: User; text: string; createdAt: string; iv?: string; ciphertext?: string; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 const app = document.querySelector<HTMLDivElement>('#app')!;
-const apiBase = (import.meta.env.VITE_PULSE_API_URL || window.location.origin).replace(/\/$/, '');
+const runningInTauri = window.location.protocol === 'tauri:' || '__TAURI_INTERNALS__' in window;
+const apiBase = (import.meta.env.VITE_PULSE_API_URL || (runningInTauri ? 'https://pulse.overclockd.shop' : window.location.origin)).replace(/\/$/, '');
 let token = localStorage.getItem('pulse.authToken') || '';
+localStorage.removeItem('pulse.voiceToken');
 let me: User | undefined;
 let friends: Friends = { friends: [], incoming: [], outgoing: [] };
 let messages: ChatMessage[] = [];
@@ -26,8 +28,7 @@ const decryptedCache = new Map<string, string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; render(); });
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-const signalUrl = () => localStorage.getItem('pulse.signalUrl') || import.meta.env.VITE_PULSE_SIGNAL_URL || (window.location.hostname.startsWith('pulse.') ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname.replace(/^pulse\./, 'voice.')}/voice` : 'ws://127.0.0.1:8787');
-const voiceToken = () => localStorage.getItem('pulse.voiceToken') || '';
+const signalUrl = () => localStorage.getItem('pulse.signalUrl') || import.meta.env.VITE_PULSE_SIGNAL_URL || (runningInTauri ? 'wss://voice.overclockd.shop/voice' : window.location.hostname.startsWith('pulse.') ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname.replace(/^pulse\./, 'voice.')}/voice` : 'ws://127.0.0.1:8787');
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${apiBase}/api${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers } });
@@ -78,16 +79,10 @@ async function toggleCall() {
   if (!me || !activeFriend) return;
   if (!cryptoReady) { showError(new Error('This device’s encryption key is not ready. Sign out and back in, then retry.')); return; }
   const endpoint = signalUrl();
-  let access = localStorage.getItem('pulse.voiceToken') || '';
-  if (!access) {
-    access = window.prompt('Enter the shared Pulse voice token. Pulse will save it on this device.', '')?.trim() || '';
-    if (!access) return;
-    localStorage.setItem('pulse.voiceToken', access);
-  }
   try {
     const key = await voiceEncryptionKey(me.id, activeFriend.id, fetchFriendKey);
     voiceRoom = chatRoom(activeFriend);
-    await voice.join(endpoint, voiceRoom, me.username, access, key);
+    await voice.join(endpoint, voiceRoom, activeFriend.id, token, key);
   } catch (error) { showError(error); }
 }
 
@@ -108,7 +103,7 @@ function render() {
     <div class="message-area" id="messages">${friend ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}"><div class="avatar message-avatar" style="--av:${m.from.id === me!.id ? '#8276ff' : '#d68bff'}">${esc(m.from.username[0].toUpperCase())}</div><div class="message-body"><div class="message-meta"><strong>${esc(m.from.username)}</strong><time>${time(m.createdAt)}</time></div><p>${esc(m.text)}</p></div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>Say hello to ${esc(friend.username)}</h2><p>Messages in this conversation will appear here.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>Welcome to Pulse, ${esc(me.username)}</h2><p>Add a friend by username. Once they accept, you can chat and join a voice call.</p></div>`}</div>
     ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" title="Attachments are not available yet" disabled>＋</button><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint">🔒 End-to-end encrypted</div></form>` : ''}
   </main><aside class="rightbar"><div class="right-title">YOUR ACCOUNT</div><div class="account-info"><div class="avatar" style="--av:#8276ff">${esc(me.username[0].toUpperCase())}</div><strong>${esc(me.username)}</strong><p>Share your username with friends so they can find you.</p></div>
-    ${friend ? `<div class="voice-card ${voiceState === 'connected' ? 'connected' : ''}"><div class="voice-top"><span class="voice-dot"></span><strong>Encrypted voice</strong></div><div class="voice-room"><span>◖))</span><span>${esc(friend.username)}</span><span class="voice-count">${voicePeers.length ? voicePeers.length + 1 : '—'}</span></div><div class="voice-status ${voiceState === 'error' ? 'voice-error' : ''}">${esc(voiceMessage)}</div><div class="voice-controls">${callActive ? `<button id="voice-mute" class="voice-mute">${voiceMuted ? 'Unmute' : 'Mute'}</button>` : ''}<button id="voice-toggle" class="voice-button">${callActive ? 'End call' : 'Call'}${voiceState === 'connecting' ? 'ing…' : ''}</button></div><details class="voice-settings"><summary>Call setup</summary><label class="voice-setting">Signaling server<input id="voice-endpoint" value="${esc(signalUrl())}" spellcheck="false"/></label><label class="voice-setting">Access token<input id="voice-token" type="password" value="${esc(voiceToken())}" autocomplete="off" placeholder="Saved on this device"/></label><small>Both people need the same server and token. The first call asks for the token.</small></details></div>` : '<div class="empty-help">Choose a friend to open a DM and voice call.</div>'}
+    ${friend ? `<div class="voice-card ${voiceState === 'connected' ? 'connected' : ''}"><div class="voice-top"><span class="voice-dot"></span><strong>Encrypted voice</strong></div><div class="voice-room"><span>◖))</span><span>${esc(friend.username)}</span><span class="voice-count">${voicePeers.length ? voicePeers.length + 1 : '—'}</span></div><div class="voice-status ${voiceState === 'error' ? 'voice-error' : ''}">${esc(voiceMessage)}</div><div class="voice-controls">${callActive ? `<button id="voice-mute" class="voice-mute">${voiceMuted ? 'Unmute' : 'Mute'}</button>` : ''}<button id="voice-toggle" class="voice-button">${callActive ? 'End call' : 'Call'}${voiceState === 'connecting' ? 'ing…' : ''}</button></div><details class="voice-settings"><summary>Call setup</summary><label class="voice-setting">Signaling server<input id="voice-endpoint" value="${esc(signalUrl())}" spellcheck="false"/></label><small>Calls are authorized through your Pulse account. You do not need a shared voice token.</small></details></div>` : '<div class="empty-help">Choose a friend to open a DM and voice call.</div>'}
     <div class="encryption"><span class="lock">🔒</span><div><strong>End-to-end encrypted</strong><p>New DMs and voice are encrypted on this device. Old messages remain unencrypted.</p>${friend ? `<button id="show-key-codes" class="key-code-button">Compare safety codes</button>` : ''}</div></div></aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
 
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
@@ -133,7 +128,6 @@ function render() {
   app.querySelector<HTMLButtonElement>('#show-key-codes')?.addEventListener('click', async () => { try { const codes = await safetyCodes(friend!.id, fetchFriendKey); window.alert(`Compare these codes with ${friend!.username} over a separate trusted channel. They should match exactly.\n\nYour code: ${codes.own}\nTheir code: ${codes.friend}`); } catch (error) { showError(error); } });
   app.querySelector<HTMLButtonElement>('#voice-mute')?.addEventListener('click', () => { voiceMuted = voice.toggleMute(); render(); });
   app.querySelector<HTMLInputElement>('#voice-endpoint')?.addEventListener('change', e => localStorage.setItem('pulse.signalUrl', (e.currentTarget as HTMLInputElement).value.trim()));
-  app.querySelector<HTMLInputElement>('#voice-token')?.addEventListener('change', e => localStorage.setItem('pulse.voiceToken', (e.currentTarget as HTMLInputElement).value.trim()));
   const nextDraft = app.querySelector<HTMLInputElement>('#message-input');
   if (nextDraft && draft) { nextDraft.value = draft; if (wasComposing) nextDraft.focus(); }
   const area = app.querySelector('#messages'); if (area && friend) area.scrollTop = area.scrollHeight;

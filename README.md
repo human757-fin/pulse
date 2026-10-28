@@ -28,7 +28,7 @@ Start the desktop client in a third terminal:
 npm run tauri dev
 ```
 
-Open `http://localhost:8788` to create an account in a browser. Set `PULSE_VOICE_TOKEN` for the voice server and use the same token in the client. The default signaling address is `ws://127.0.0.1:8787`.
+Open `http://localhost:8788` to create an account in a browser. Calls use your Pulse login and accepted-friend relationship; there is no shared voice token to configure. The default signaling address is `ws://127.0.0.1:8787`.
 
 ## VPS deployment
 
@@ -40,11 +40,11 @@ See [VOICE_SETUP.md](VOICE_SETUP.md) for a direct VPS setup and [deploy/PTERODAC
 - 1:1 voice audio is encrypted end-to-end using WebRTC encoded audio transforms. The server relays call setup messages, not audio.
 - Keys are created per account on each device and stored in that browser's IndexedDB. The first key from a friend is trusted on first use; compare keys out-of-band before trusting a new friend. A key change is blocked until verified.
 - This initial key setup does not provide forward secrecy or multi-device key synchronization. Losing browser storage means that device cannot decrypt messages sent to its old key.
-- Open a friend's DM and press **Call**. The first time, enter the shared voice token. Your friend opens the same DM and presses **Call** too. On the hosted site, the signaling address is inferred from the `pulse.*` hostname; desktop builds can set `VITE_PULSE_SIGNAL_URL`.
+- Open a friend's DM and press **Call**. Your friend opens the same DM and presses **Call** too. Calls are authorized with each person’s Pulse account; no shared voice token is needed. The hosted site and desktop app use the configured Pulse voice server by default; builds can override it with `VITE_PULSE_SIGNAL_URL`.
 - Calls require a browser with WebRTC encoded transforms (current Edge/WebView2 or Chrome). Voice supports two people per room; group voice, streaming, and account 2FA are not implemented.
 
 ## Desktop updates
 
 Pulse checks for signed Windows app updates shortly after startup and installs a newer release automatically. The updater verifies signatures with the public key in `src-tauri/tauri.conf.json`; never commit or share `src-tauri/pulse-updater.key`.
 
-To publish a release, add the contents of the local `src-tauri/pulse-updater.key` file as the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, then push a version tag such as `v0.3.0`. The workflow builds NSIS/MSI installers and the signed updater manifest. Versions installed before updater support need one manual install of the first updater-enabled installer; later versions update from inside Pulse.
+To publish a release, add the contents of the local `src-tauri/pulse-updater.key` file as the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, then push a version tag such as `v0.3.1`. The workflow builds NSIS/MSI installers and the signed updater manifest. Versions installed before updater support need one manual install of the first updater-enabled installer; later versions update from inside Pulse.

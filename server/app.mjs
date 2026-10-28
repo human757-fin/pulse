@@ -15,7 +15,9 @@ if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
   catch { console.error(`Could not parse ${dbPath}; refusing to overwrite it.`); process.exit(1); }
 }
+for (const user of db.users) if (!user.key && user.username) user.key = String(user.username).trim().toLowerCase();
 const requestWindows = new Map();
+const signupReservations = new Set();
 
 function persist() {
   const temp = `${dbPath}.tmp`;
@@ -42,6 +44,7 @@ function sessionUser(req) {
 }
 function friendship(a, b) { return db.friendships.find(f => (f.from === a && f.to === b) || (f.from === b && f.to === a)); }
 function usernameKey(value) { return String(value || '').trim().toLowerCase(); }
+function usernameTaken(key) { return db.users.some(user => usernameKey(user.username || user.key) === key); }
 async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' }); res.end(); return; }
@@ -60,15 +63,19 @@ async function serve(req, res) {
         const username = String(body.username || '').trim(); const key = usernameKey(username); const password = String(body.password || '');
         if (!/^[a-zA-Z0-9._]{3,24}$/.test(username)) return json(res, 400, { error: 'Username must be 3–24 characters and use only letters, numbers, dots, or underscores.' });
         if (password.length < 10 || password.length > 128) return json(res, 400, { error: 'Password must be 10–128 characters.' });
-        if (db.users.some(u => u.key === key)) return json(res, 409, { error: 'That username is already taken.' });
-        const salt = randomBytes(16).toString('hex'); const passwordHash = (await scrypt(password, salt, 64)).toString('hex');
-        const user = { id: randomBytes(16).toString('hex'), username, key, salt, passwordHash, createdAt: new Date().toISOString() };
-        db.users.push(user);
-        const token = randomBytes(32).toString('hex'); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
-        return json(res, 201, { token, user: publicUser(user) });
+        if (usernameTaken(key) || signupReservations.has(key)) return json(res, 409, { error: 'That username is already taken.' });
+        signupReservations.add(key);
+        try {
+          const salt = randomBytes(16).toString('hex'); const passwordHash = (await scrypt(password, salt, 64)).toString('hex');
+          if (usernameTaken(key)) return json(res, 409, { error: 'That username is already taken.' });
+          const user = { id: randomBytes(16).toString('hex'), username, key, salt, passwordHash, createdAt: new Date().toISOString() };
+          db.users.push(user);
+          const token = randomBytes(32).toString('hex'); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
+          return json(res, 201, { token, user: publicUser(user) });
+        } finally { signupReservations.delete(key); }
       }
       if (url.pathname === '/api/login' && req.method === 'POST') {
-        const key = usernameKey(body.username); const user = db.users.find(u => u.key === key);
+        const key = usernameKey(body.username); const user = db.users.find(u => usernameKey(u.username || u.key) === key);
         const candidate = user ? await scrypt(String(body.password || ''), user.salt, 64) : Buffer.alloc(64);
         const expected = user ? Buffer.from(user.passwordHash, 'hex') : Buffer.alloc(64);
         if (!user || !timingSafeEqual(candidate, expected)) return json(res, 401, { error: 'Username or password is incorrect.' });
@@ -79,6 +86,13 @@ async function serve(req, res) {
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: publicUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
       if (url.pathname === '/api/logout' && req.method === 'POST') { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); db.sessions = db.sessions.filter(s => s.token !== token); persist(); return json(res, 200, { ok: true }); }
+      if (url.pathname === '/api/voice/authorize' && req.method === 'POST') {
+        const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
+        if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
+        const expectedRoom = `dm-${[user.id, target.id].sort().join('-')}`;
+        if (body.room !== expectedRoom) return json(res, 403, { error: 'This voice room is not authorized.' });
+        return json(res, 200, { user: publicUser(user) });
+      }
       if (url.pathname === '/api/keys' && req.method === 'POST') {
         const publicKey = body.publicKey;
         if (!publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.x || '') || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.y || '')) return json(res, 400, { error: 'Invalid Pulse encryption public key.' });

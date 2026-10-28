@@ -20,7 +20,6 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
 
    ```dotenv
    CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
-   PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_TOKEN
    AUTO_UPDATE=true
    ```
 
@@ -33,7 +32,7 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```
 
    The entrypoint installs Node.js 18+, npm, Git, and `cloudflared` through `apt` if missing, then starts Pulse. It requires a Debian or Ubuntu guest and permission to install apt packages. If apt is unavailable, upload a Linux `cloudflared` binary into `/root/pulse` and install Node.js/npm/Git in the guest first.
-4. In the Pterodactyl Startup page, put the second allocation's numeric value in the egg's **PORT 2** field. Add the two Cloudflare Public Hostnames from the table above, using the actual allocated port numbers. In the desktop client's voice panel, use `wss://voice.overclockd.shop/voice` and enter the same voice token.
+4. In the Pterodactyl Startup page, put the second allocation's numeric value in the egg's **PORT 2** field. Add the two Cloudflare Public Hostnames from the table above, using the actual allocated port numbers. Calls use Pulse account sign-in; no shared voice token is required.
 
 The script checks `origin main` on each boot and runs `npm ci` plus `npm run build` when it detects a new commit. Accounts and messages are saved at `/root/pulse/data/pulse.json`; keep that data directory when updating the code and back it up. Logs are under `/root/pulse/logs/`.
 
@@ -45,11 +44,10 @@ Create `/root/pulse/.env` in the server's File Manager:
 
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
-PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_PULSE_TOKEN
 AUTO_UPDATE=true
 ```
 
-Generate a strong shared Pulse voice token with `openssl rand -hex 32`. Give this token to your callers; they enter it in the Pulse voice panel. Confirm the egg's **PORT 2** field matches the second allocation. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
+Confirm the egg's **PORT 2** field matches the second allocation. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
 
 Pulse currently allows public account signup at `https://pulse.overclockd.shop`. Members create their own username/password, add friends by exact username, and accept requests. Passwords are salted and hashed; account data and encrypted message envelopes are stored in `data/pulse.json`. Back this file up and do not publish it. New direct messages and voice audio are encrypted on the clients. Messages sent before the E2EE update remain plaintext in the database. Each device keeps its private key in browser storage; clearing that storage loses access to messages encrypted for that device. Keys are trusted on first use, so compare a friend's key fingerprint out of band before trusting it. This version does not provide forward secrecy or synchronize keys across devices. The voice token remains separate from account passwords.
 
@@ -65,7 +63,7 @@ In Pulse, set **Signaling server** to:
 wss://voice.overclockd.shop/voice
 ```
 
-On the website, the signaling address is inferred from `pulse.overclockd.shop` as `wss://voice.overclockd.shop/voice`. Open a friend's DM and press **Call**; the first call asks for the shared voice token once and saves it in that browser. Your friend opens the same DM and presses **Call** too. Desktop builds use `.env.local` with `VITE_PULSE_SIGNAL_URL=wss://voice.overclockd.shop/voice` and `VITE_PULSE_API_URL=https://pulse.overclockd.shop`. Current Edge/WebView2 or Chrome is required for encrypted audio transforms.
+On the website, the signaling address is inferred from `pulse.overclockd.shop` as `wss://voice.overclockd.shop/voice`. Open a friend's DM and press **Call**. Your friend opens the same DM and presses **Call** too. Calls use the signed-in Pulse account; no shared voice token is requested. Desktop builds default to the Pulse site and voice host; `.env.local` can override them with `VITE_PULSE_SIGNAL_URL=wss://voice.overclockd.shop/voice` and `VITE_PULSE_API_URL=https://pulse.overclockd.shop`. Current Edge/WebView2 or Chrome is required for encrypted audio transforms.
 
 ## Optional TURN media relay on the VPS
 
@@ -85,7 +83,7 @@ PULSE_TURN_ONLY=true
 ## Notes
 
 - This is the 1:1 voice milestone; a group call needs an SFU.
-- Account signup is public; friend requests gate direct messages. The shared voice token is still separate from account login.
+- Account signup is public; accepted-friend relationships gate direct messages and voice calls. The signaling server verifies each call against the Pulse account API, so callers do not need a shared voice token.
 - New messages and voice audio are end-to-end encrypted. Signaling still goes through the Pulse server; compare key fingerprints with your friend to protect against a first-contact server key substitution.
 - Pterodactyl must have outbound internet access for GitHub and Cloudflare Tunnel.
 - If GitHub update fails, startup continues with the checked-out code, matching the previous entrypoint behavior.

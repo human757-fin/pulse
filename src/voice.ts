@@ -19,12 +19,14 @@ export class VoiceClient {
 
   constructor(private onUpdate: (update: VoiceUpdate) => void) {}
 
-  async join(endpoint: string, room: string, name: string, token: string, voiceKey: ArrayBuffer) {
+  async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer) {
     this.stopped = false;
     this.emit('connecting', 'Requesting microphone…');
     try {
       const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => unknown }).RTCRtpScriptTransform;
       if (!Transform) throw new Error('This browser does not support encrypted voice. Update Microsoft Edge/WebView2 and retry.');
+      const parsedEndpoint = new URL(endpoint);
+      if (parsedEndpoint.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsedEndpoint.hostname)) throw new Error('Use a secure wss:// voice address to protect your Pulse sign-in.');
       this.voiceKey = voiceKey;
       this.cryptoWorker = new Worker(new URL('./voice-crypto-worker.ts', import.meta.url), { type: 'module' });
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this WebView. Update Microsoft Edge WebView2 and retry.');
@@ -43,7 +45,7 @@ export class VoiceClient {
       if (this.stopped) return;
       socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal); };
       socket.onclose = () => { if (!this.stopped) this.fail('Voice server disconnected.'); };
-      socket.send(JSON.stringify({ type: 'join', room, name, token }));
+      socket.send(JSON.stringify({ type: 'join', room, friendId, authToken }));
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'Could not join voice.');
     }

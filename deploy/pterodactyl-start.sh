@@ -31,7 +31,7 @@ if [[ ! -f package-lock.json ]]; then
 fi
 
 if [[ ! -f .env ]]; then
-  echo "Missing .env beside package.json with CLOUDFLARE_TUNNEL_TOKEN and PULSE_VOICE_TOKEN"
+  echo "Missing .env beside package.json with CLOUDFLARE_TUNNEL_TOKEN"
   exit 1
 fi
 
@@ -66,11 +66,6 @@ if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
   exit 1
 fi
 
-if [[ -z "${PULSE_VOICE_TOKEN:-}" ]]; then
-  echo "PULSE_VOICE_TOKEN is missing from .env"
-  exit 1
-fi
-
 if [[ ! -d node_modules ]]; then
   echo "Installing Node dependencies..."
   npm ci
@@ -91,6 +86,7 @@ if [[ ! "$egg_port2" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$egg_port2 > 65535 )); the
   exit 1
 fi
 export PULSE_WEB_PORT="$egg_port2"
+export PULSE_API_URL="http://127.0.0.1:${PULSE_WEB_PORT}"
 echo "Pulse signaling will listen on 0.0.0.0:${PULSE_VOICE_PORT}"
 echo "Pulse website and API will listen on 0.0.0.0:${PULSE_WEB_PORT}"
 

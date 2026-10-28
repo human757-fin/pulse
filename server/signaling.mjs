@@ -1,9 +1,8 @@
 import { createServer } from 'node:http';
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 
 const port = Number(process.env.PULSE_VOICE_PORT || process.env.SERVER_PORT || 8787);
-// Pterodactyl .env files may be edited on Windows and retain a trailing CR.
-const accessToken = (process.env.PULSE_VOICE_TOKEN || '').trim();
+const apiBase = (process.env.PULSE_API_URL || 'http://127.0.0.1:8788').replace(/\/$/, '');
 const turnUrl = process.env.PULSE_TURN_URL || '';
 const turnSecret = process.env.PULSE_TURN_SECRET || '';
 const parsedTurnTtl = Number(process.env.PULSE_TURN_TTL_SECONDS || 3600);
@@ -38,13 +37,6 @@ function leave(client) {
   client.id = undefined;
 }
 
-function tokenIsValid(candidate) {
-  if (!accessToken) return true;
-  const actual = Buffer.from(String(candidate || '').trim());
-  const expected = Buffer.from(accessToken);
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
 function turnCredentials(clientId) {
   if (!turnUrl || !turnSecret) return [];
   const username = `${Math.floor(Date.now() / 1000) + turnTtl}:${clientId}`;
@@ -52,24 +44,40 @@ function turnCredentials(clientId) {
   return [{ urls: turnUrl, username, credential }];
 }
 
-function handle(client, message) {
+async function handle(client, message) {
     if (message.type === 'join') {
+      if (client.joining) return;
       leave(client);
-      if (!tokenIsValid(message.token)) { send(client, { type: 'error', message: 'Invalid voice access token.' }); return; }
       const roomName = String(message.room || '').slice(0, 128);
-      const name = String(message.name || 'Pulse member').slice(0, 48);
-      if (!roomName) { send(client, { type: 'error', message: 'A voice room is required.' }); return; }
+      const friendId = String(message.friendId || '');
+      const authToken = String(message.authToken || '').trim();
+      if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Pulse and select an accepted friend before calling.' }); return; }
+      client.joining = true;
+      let account;
+      try {
+        const response = await fetch(`${apiBase}/api/voice/authorize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+          body: JSON.stringify({ room: roomName, friendId }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (response.ok) account = (await response.json()).user;
+      } catch {
+        send(client, { type: 'error', message: 'Pulse could not verify your account. Try again in a moment.' });
+        return;
+      } finally { client.joining = false; }
+      if (!account?.id || !account?.username) { send(client, { type: 'error', message: 'Sign in again and make sure you are friends before calling.' }); return; }
       let room = rooms.get(roomName);
       if (!room) { room = new Map(); rooms.set(roomName, room); }
       if (room.size >= 2) { send(client, { type: 'error', message: 'This first version supports two people per voice room.' }); return; }
       const peers = [...room.entries()].map(([id, peer]) => ({ id, name: peer.name }));
       client.room = roomName;
       client.id = randomUUID();
-      client.name = name;
+      client.name = String(account.username).slice(0, 48);
       room.set(client.id, client);
       const iceServers = turnCredentials(client.id);
       send(client, { type: 'joined', id: client.id, peers, iceServers, iceTransportPolicy: turnOnly && iceServers.length ? 'relay' : 'all' });
-      for (const peer of room.values()) if (peer !== client) send(peer, { type: 'peer-joined', id: client.id, name });
+      for (const peer of room.values()) if (peer !== client) send(peer, { type: 'peer-joined', id: client.id, name: client.name });
       return;
     }
     if (message.type === 'leave') { leave(client); return; }
@@ -102,7 +110,7 @@ function consume(client, chunk) {
     if (opcode !== 1) continue;
     let message;
     try { message = JSON.parse(payload.toString()); } catch { send(client, { type: 'error', message: 'Invalid signaling message.' }); continue; }
-    handle(client, message);
+    void handle(client, message).catch(() => send(client, { type: 'error', message: 'Voice signaling failed. Please try again.' }));
   }
 }
 
