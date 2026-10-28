@@ -39,26 +39,38 @@ set -a
 source ./.env
 set +a
 
-if [[ "${AUTO_UPDATE:-true}" == "true" && -d .git ]]; then
-  echo "Checking GitHub for updates..."
+if [[ "${AUTO_UPDATE:-true}" == "true" ]] && [[ "$(git -C "$app_dir" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]]; then
+  branch_name="$(git -C "$app_dir" branch --show-current 2>/dev/null || true)"
+  [[ -n "$branch_name" ]] || branch_name="detached HEAD"
+  echo "Checking GitHub updates from origin/main (checkout: $branch_name)..."
   if [[ -f /home/container/.ssh/github_deploy_key ]]; then
     export GIT_SSH_COMMAND="/usr/bin/ssh -i /home/container/.ssh/github_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
   fi
-  before_commit=$(git rev-parse HEAD 2>/dev/null || true)
-  if git pull --ff-only origin main; then
-    after_commit=$(git rev-parse HEAD 2>/dev/null || true)
-    if [[ "$before_commit" != "$after_commit" ]]; then
-      echo "New code found; installing dependencies and building the client..."
-      npm ci
-      npm run build
+  before_commit="$(git -C "$app_dir" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -z "$before_commit" ]]; then
+    echo "Git update skipped: could not read the current commit in $app_dir."
+  elif git -C "$app_dir" fetch --no-tags origin main; then
+    remote_commit="$(git -C "$app_dir" rev-parse FETCH_HEAD 2>/dev/null || true)"
+    if [[ -z "$remote_commit" ]]; then
+      echo "Git update failed: origin/main did not resolve to a commit."
+    elif [[ "$before_commit" == "$remote_commit" ]]; then
+      echo "Already up to date ($before_commit)."
+    elif git -C "$app_dir" merge-base --is-ancestor "$before_commit" "$remote_commit"; then
+      if git -C "$app_dir" merge --ff-only "$remote_commit"; then
+        echo "Updated Pulse from $before_commit to $remote_commit; installing dependencies and building..."
+        npm ci
+        npm run build
+      else
+        echo "Git update failed: checkout could not fast-forward to origin/main. Resolve local changes in $app_dir and restart."
+      fi
     else
-      echo "Already up to date."
+      echo "Git update skipped: local checkout ($before_commit) has diverged from origin/main ($remote_commit); refusing to overwrite it."
     fi
   else
-    echo "Git update failed; continuing with the currently installed version."
+    echo "Git fetch failed; continuing with the currently installed version. Check repository access and network connectivity."
   fi
 elif [[ "${AUTO_UPDATE:-true}" == "true" ]]; then
-  echo "No .git checkout found; skipping GitHub update."
+  echo "Git update skipped: $app_dir is not a Git working tree. Install the repo with Git metadata to enable AUTO_UPDATE."
 fi
 
 if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
