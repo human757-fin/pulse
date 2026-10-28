@@ -3,7 +3,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 
 const port = Number(process.env.PULSE_VOICE_PORT || process.env.SERVER_PORT || 8787);
 const apiBase = (process.env.PULSE_API_URL || 'http://127.0.0.1:8788').replace(/\/$/, '');
-const voiceProtocol = 'pulse-aesgcm-v1';
+const voiceProtocol = 'pulse-dtls-srtp-v1';
 const turnUrl = process.env.PULSE_TURN_URL || '';
 const turnSecret = process.env.PULSE_TURN_SECRET || '';
 const parsedTurnTtl = Number(process.env.PULSE_TURN_TTL_SECONDS || 3600);

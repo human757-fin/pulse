@@ -2,7 +2,7 @@ export type VoiceState = 'disconnected' | 'connecting' | 'reconnecting' | 'waiti
 export type VoiceUpdate = { state: VoiceState; message: string; peers: string[] };
 
 type Signal = { type: string; [key: string]: unknown };
-const voiceProtocol = 'pulse-aesgcm-v1';
+const voiceProtocol = 'pulse-dtls-srtp-v1';
 type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer };
 
 export class VoiceClient {
@@ -16,7 +16,6 @@ export class VoiceClient {
   private muted = false;
   private turnServers: RTCIceServer[] = [];
   private iceTransportPolicy: RTCIceTransportPolicy = 'all';
-  private cryptoWorker?: Worker;
   private voiceKey?: ArrayBuffer;
   private joinOptions?: JoinOptions;
   private reconnectTimer?: number;
@@ -30,12 +29,9 @@ export class VoiceClient {
     this.reconnectAttempts = 0;
     this.emit('connecting', 'Requesting microphone…');
     try {
-      const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => unknown }).RTCRtpScriptTransform;
-      if (!Transform || !('transform' in RTCRtpSender.prototype) || !('transform' in RTCRtpReceiver.prototype)) throw new Error('This browser cannot encrypt and decrypt Pulse voice. Update Microsoft Edge/WebView2 and retry.');
       const parsedEndpoint = new URL(endpoint);
       if (parsedEndpoint.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsedEndpoint.hostname)) throw new Error('Use a secure wss:// voice address to protect your Pulse sign-in.');
       this.voiceKey = voiceKey;
-      this.cryptoWorker = new Worker(new URL('./voice-crypto-worker.ts', import.meta.url), { type: 'module' });
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this WebView. Update Microsoft Edge WebView2 and retry.');
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -58,7 +54,7 @@ export class VoiceClient {
     this.socket?.close();
     this.socket = undefined;
     this.clearPeers();
-    this.cryptoWorker?.terminate(); this.cryptoWorker = undefined; this.voiceKey = undefined;
+    this.voiceKey = undefined;
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
     this.muted = false;
@@ -103,18 +99,22 @@ export class VoiceClient {
     }
     if (msg.type === 'offer') {
       const from = String(msg.from);
+      const description = msg.description as RTCSessionDescriptionInit;
+      if (!await this.verifyDescription(description, String(msg.voiceProof || ''))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       const pc = this.makePeer(from);
-      await pc.setRemoteDescription(msg.description as RTCSessionDescriptionInit);
+      await pc.setRemoteDescription(description);
       await this.flushIce(from, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      this.send({ type: 'answer', to: from, description: pc.localDescription });
+      this.send({ type: 'answer', to: from, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!) });
       return;
     }
     if (msg.type === 'answer') {
       const from = String(msg.from);
       const pc = this.peers.get(from);
-      if (pc) { await pc.setRemoteDescription(msg.description as RTCSessionDescriptionInit); await this.flushIce(from, pc); }
+      const description = msg.description as RTCSessionDescriptionInit;
+      if (!await this.verifyDescription(description, String(msg.voiceProof || ''))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (pc) { await pc.setRemoteDescription(description); await this.flushIce(from, pc); }
       return;
     }
     if (msg.type === 'ice') {
@@ -132,7 +132,31 @@ export class VoiceClient {
     const pc = this.makePeer(id);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    this.send({ type: 'offer', to: id, description: pc.localDescription });
+    this.send({ type: 'offer', to: id, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!) });
+  }
+
+  private descriptionProofData(description: RTCSessionDescriptionInit) {
+    const room = this.joinOptions?.room;
+    if (!room || !description.sdp) throw new Error('Could not verify this voice connection.');
+    const fingerprints = [...description.sdp.matchAll(/^a=fingerprint:[^\r\n]+$/gmi)].map(match => match[0].trim().toLowerCase()).sort();
+    if (!fingerprints.length) throw new Error('This browser did not provide an encrypted voice fingerprint.');
+    return new TextEncoder().encode(`${voiceProtocol}\n${room}\n${description.type}\n${fingerprints.join('\n')}`);
+  }
+
+  private async signDescription(description: RTCSessionDescriptionInit) {
+    if (!this.voiceKey) throw new Error('Voice encryption key is unavailable.');
+    const key = await crypto.subtle.importKey('raw', this.voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const proof = new Uint8Array(await crypto.subtle.sign('HMAC', key, this.descriptionProofData(description)));
+    return btoa(Array.from(proof, byte => String.fromCharCode(byte)).join(''));
+  }
+
+  private async verifyDescription(description: RTCSessionDescriptionInit, proof: string) {
+    if (!this.voiceKey || !proof) return false;
+    try {
+      const key = await crypto.subtle.importKey('raw', this.voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+      const signature = Uint8Array.from(atob(proof), character => character.charCodeAt(0));
+      return await crypto.subtle.verify('HMAC', key, signature, this.descriptionProofData(description));
+    } catch { return false; }
   }
 
   private async openSignaling() {
@@ -197,13 +221,10 @@ export class VoiceClient {
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, ...this.turnServers], iceTransportPolicy: this.iceTransportPolicy });
     this.peers.set(id, pc);
     this.stream?.getAudioTracks().forEach(track => {
-      const sender = pc.addTrack(track, this.stream!);
-      this.applyTransform(sender, 'encrypt');
+      pc.addTrack(track, this.stream!);
     });
     pc.onicecandidate = event => { if (event.candidate) this.send({ type: 'ice', to: id, candidate: event.candidate }); };
     pc.ontrack = event => {
-      try { this.applyTransform(event.receiver, 'decrypt'); }
-      catch (error) { this.fail(error instanceof Error ? error.message : 'Could not decrypt incoming voice.'); return; }
       let audio = this.audioElements.get(id);
       if (!audio) {
         audio = document.createElement('audio');
@@ -222,15 +243,6 @@ export class VoiceClient {
       if (pc.connectionState === 'failed') this.fail('Peer connection failed. Check network or TURN settings.');
     };
     return pc;
-  }
-
-  private applyTransform(endpoint: RTCRtpSender | RTCRtpReceiver, mode: 'encrypt' | 'decrypt') {
-    const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => RTCRtpScriptTransform }).RTCRtpScriptTransform;
-    if (!Transform || !this.cryptoWorker || !this.voiceKey) throw new Error('Encrypted voice is unavailable in this browser.');
-    const rtpEndpoint = endpoint as (RTCRtpSender | RTCRtpReceiver) & { transform?: RTCRtpScriptTransform | null };
-    const transform = new Transform(this.cryptoWorker, { mode, keyBytes: this.voiceKey });
-    rtpEndpoint.transform = transform;
-    if (rtpEndpoint.transform !== transform) throw new Error('This browser could not attach encrypted voice. Update Microsoft Edge/WebView2 and retry.');
   }
 
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
