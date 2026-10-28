@@ -1,6 +1,6 @@
 # Pulse web, accounts, and voice on Pterodactyl
 
-This setup runs Pulse's website/API and voice signaling in one Pterodactyl VPS egg. Allocate **two TCP ports** to this server in the Panel. The first allocation is provided as `SERVER_PORT`. This egg exposes its second port as the lowercase `port2` variable, shown as **PORT 2** in the server's Startup page. Set **PORT 2** to the second allocated port; Pulse reads that egg variable directly for the website/API listener and exits with an explanatory error if it is blank or invalid. The VPS egg uses the same `port2` value in its port mapping.
+This setup runs Pulse's website/API and voice signaling in one Pterodactyl VPS egg. Allocate **two TCP ports** to this server in the Panel. The first allocation is provided as `SERVER_PORT`. This egg exposes its second port as **PORT 2** (`port2`) and writes it to `/vps.config` inside the guest filesystem. Pulse reads the egg value from the environment or that generated config file for its website/API listener, then exits with an explanatory error if it is blank or invalid. The VPS egg uses the same value in its port mapping.
 
 In the same Cloudflare Tunnel, configure two Public Hostnames:
 
