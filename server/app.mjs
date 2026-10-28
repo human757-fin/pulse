@@ -37,11 +37,11 @@ function json(res, status, value) {
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
 function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled }; }
-function profileData(user) { return { displayName: user.displayName || user.username, avatar: user.avatar || '', banner: user.banner || '' }; }
+function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
 function readBody(req) {
   return new Promise((resolveBody, reject) => {
     let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 1500000) { reject(new Error('Request is too large.')); req.destroy(); } });
+    req.on('data', chunk => { body += chunk; if (body.length > 2_000_000) { reject(new Error('Request is too large.')); req.destroy(); } });
     req.on('end', () => { try { resolveBody(JSON.parse(body || '{}')); } catch { reject(new Error('Request must be valid JSON.')); } });
     req.on('error', reject);
   });
@@ -221,21 +221,24 @@ async function serve(req, res) {
       if (url.pathname === '/api/profile' && req.method === 'POST') {
         const displayName = String(body.displayName || '').trim();
         if (displayName.length < 1 || displayName.length > 40) return json(res, 400, { error: 'Display name must be 1–40 characters.' });
+        const bio = String(body.bio || '').trim();
+        if (bio.length > 160) return json(res, 400, { error: 'Bio must be 160 characters or fewer.' });
         const validateImage = (value, limit, label) => {
           if (value === undefined) return undefined;
           if (value === '') return '';
-          const match = /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(value));
-          if (!match) throw new Error(`${label} must be a PNG, JPEG, or WebP image.`);
+          const match = /^data:image\/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(value));
+          if (!match) throw new Error(`${label} must be a PNG, JPEG, WebP, or GIF image.`);
           const bytes = Buffer.from(match[2], 'base64');
           if (!bytes.length || bytes.length > limit || bytes.toString('base64') !== match[2]) throw new Error(`${label} is too large or invalid.`);
-          const validSignature = match[1] === 'png' ? bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) : match[1] === 'jpeg' ? bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 : bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WEBP';
+          const validSignature = match[1] === 'png' ? bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) : match[1] === 'jpeg' ? bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 : match[1] === 'gif' ? ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString()) : bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WEBP';
           if (!validSignature) throw new Error(`${label} image data does not match its file type.`);
           return `data:image/${match[1]};base64,${match[2]}`;
         };
         try {
-          const avatar = validateImage(body.avatar, 256 * 1024, 'Profile picture');
+          const avatar = validateImage(body.avatar, 512 * 1024, 'Profile picture');
           const banner = validateImage(body.banner, 768 * 1024, 'Banner');
           user.displayName = displayName;
+          user.bio = bio;
           if (avatar !== undefined) user.avatar = avatar;
           if (banner !== undefined) user.banner = banner;
           user.profileVersion = new Date().toISOString();
@@ -301,7 +304,7 @@ async function serve(req, res) {
         const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
         if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
         if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
-        if (!ciphertext || ciphertext.length > 12_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
+        if (!ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
         const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }; db.messages.push(message); persist();
         return json(res, 201, { message: { id: message.id, from: publicUser(user), ciphertext, iv, encryptionVersion: 1, createdAt: message.createdAt } });
       }
