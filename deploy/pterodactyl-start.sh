@@ -10,6 +10,7 @@ export GIT_TERMINAL_PROMPT=0
 mkdir -p "$app_dir/logs"
 voice_log="$app_dir/logs/pulse-voice.log"
 tunnel_log="$app_dir/logs/cloudflared.log"
+web_log="$app_dir/logs/pulse-web.log"
 
 if [[ ! -f server/signaling.mjs ]]; then
   echo "Missing server/signaling.mjs. Upload or clone the Pulse repository first."
@@ -81,7 +82,9 @@ if [[ ! -f dist/index.html ]]; then
 fi
 
 export PULSE_VOICE_PORT="${SERVER_PORT:-${PULSE_VOICE_PORT:-8787}}"
+export PULSE_WEB_PORT="${SERVER_PORT_2:-${PULSE_WEB_PORT:-8788}}"
 echo "Pulse signaling will listen on 0.0.0.0:${PULSE_VOICE_PORT}"
+echo "Pulse website and API will listen on 0.0.0.0:${PULSE_WEB_PORT}"
 
 echo "Starting Cloudflare Tunnel. Logs: $tunnel_log"
 "$cloudflared_bin" tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" >>"$tunnel_log" 2>&1 &
@@ -90,17 +93,20 @@ tunnel_pid=$!
 echo "Starting Pulse voice signaling. Logs: $voice_log"
 node server/signaling.mjs >>"$voice_log" 2>&1 &
 voice_pid=$!
+echo "Starting Pulse website and account API. Logs: $web_log"
+node server/app.mjs >>"$web_log" 2>&1 &
+web_pid=$!
 
 stop() {
-  echo "Stopping Pulse voice and Cloudflare Tunnel..."
-  kill "$voice_pid" "$tunnel_pid" 2>/dev/null || true
-  wait "$voice_pid" "$tunnel_pid" 2>/dev/null || true
+  echo "Stopping Pulse services and Cloudflare Tunnel..."
+  kill "$voice_pid" "$web_pid" "$tunnel_pid" 2>/dev/null || true
+  wait "$voice_pid" "$web_pid" "$tunnel_pid" 2>/dev/null || true
 }
 trap stop INT TERM EXIT
 
-# Keep the voice server as the main process for Pterodactyl health and shutdown.
+# Fail the Pterodactyl server if either application process exits.
 set +e
-wait "$voice_pid"
+wait -n "$voice_pid" "$web_pid"
 status=$?
 set -e
 exit "$status"

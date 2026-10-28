@@ -1,6 +1,15 @@
-# Pulse voice on Pterodactyl
+# Pulse web, accounts, and voice on Pterodactyl
 
-This setup runs the Pulse signaling service in a Pterodactyl container and exposes it with Cloudflare Tunnel. Configure the Cloudflare Public Hostname to proxy `voice.example.com` to `http://127.0.0.1:SERVER_PORT`, where `SERVER_PORT` is the allocation assigned to this server. Cloudflare carries the WSS signaling connection. Coturn, if used, is a separate UDP service on the VPS host; Cloudflare Tunnel does not relay TURN UDP media.
+This setup runs Pulse's website/API and voice signaling in one Pterodactyl server. Allocate **two TCP ports** to this server in the Panel. Set `SERVER_PORT` to the first allocation and set `PULSE_WEB_PORT` to the second allocation in the server's environment/startup variables. Some VPS eggs expose the second port as `SERVER_PORT_2`; the startup script uses that automatically when present. Otherwise, explicitly set `PULSE_WEB_PORT` to the second allocated port. Do not use a random port that is not allocated.
+
+In the same Cloudflare Tunnel, configure two Public Hostnames:
+
+| Hostname | Service | Use |
+| --- | --- | --- |
+| `voice.overclockd.shop` | `http://127.0.0.1:SERVER_PORT` | WebSocket signaling at `/voice` |
+| `pulse.overclockd.shop` | `http://127.0.0.1:PULSE_WEB_PORT` | Website and `/api/*` account/chat API |
+
+Replace the port names above with the numeric values from the Panel. Both hostnames can route through the same tunnel token/connector. Cloudflare provides HTTPS/WSS at the public hostnames. Voice audio remains WebRTC peer-to-peer unless TURN is separately configured; Cloudflare Tunnel does not carry TURN UDP media.
 
 ## No-terminal setup for the VPS egg
 
@@ -12,6 +21,7 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```dotenv
    CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
    PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_TOKEN
+   PULSE_WEB_PORT=SECOND_ALLOCATED_PORT
    AUTO_UPDATE=true
    ```
 
@@ -24,9 +34,9 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```
 
    The entrypoint installs Node.js 18+, npm, Git, and `cloudflared` through `apt` if missing, then starts Pulse. It requires a Debian or Ubuntu guest and permission to install apt packages. If apt is unavailable, upload a Linux `cloudflared` binary into `/root/pulse` and install Node.js/npm/Git in the guest first.
-4. In Pulse, set the signaling server to `wss://your-domain/voice` and enter the same voice token.
+4. Add the two Cloudflare Public Hostnames from the table above, using the actual allocated port numbers. In the desktop client's voice panel, use `wss://voice.overclockd.shop/voice` and enter the same voice token.
 
-The script checks `origin main` on each boot and runs `npm ci` plus `npm run build` when it detects a new commit. Logs are under `/root/pulse/logs/`.
+The script checks `origin main` on each boot and runs `npm ci` plus `npm run build` when it detects a new commit. Accounts and messages are saved at `/root/pulse/data/pulse.json`; keep that data directory when updating the code and back it up. Logs are under `/root/pulse/logs/`.
 
 The entrypoint keeps Pulse and `cloudflared` running under the VPS egg. Do not also run `sudo cloudflared service install <token>` on the outer host for the same tunnel, or you will start a second connector. For boot after the physical VPS restarts, the Pterodactyl node administrator must configure the server to auto-start; the guest's `autorun.sh` runs whenever Pterodactyl starts this server.
 
@@ -37,24 +47,27 @@ Create `/root/pulse/.env` in the server's File Manager:
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
 PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_PULSE_TOKEN
+PULSE_WEB_PORT=SECOND_ALLOCATED_PORT
 AUTO_UPDATE=true
 ```
 
-Generate a strong shared Pulse token with `openssl rand -hex 32`. Give the token to your invited callers; they enter it in the Pulse voice panel. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
+Generate a strong shared Pulse voice token with `openssl rand -hex 32`. Give this token to your callers; they enter it in the Pulse voice panel. `PULSE_WEB_PORT` must equal the server's second allocated port. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
+
+Pulse currently allows public account signup at `https://pulse.overclockd.shop`. Members create their own username/password, add friends by exact username, accept requests, and send direct messages. Passwords are salted and hashed; account data and chat text are stored in the server's `data/pulse.json`. Back this file up and do not publish it. Chat is **not end-to-end encrypted** in this release, so do not use it for sensitive messages. The voice token remains separate from account passwords.
 
 The script runs `git pull --ff-only origin main` at each boot. When the commit changes, it runs `npm ci` and `npm run build`. On the first boot it installs/builds if `node_modules` or `dist/index.html` are missing. If the repo uses another branch, change `main` in the script.
 
 ## Configure the Cloudflare Tunnel
 
-In Cloudflare Zero Trust, route a Public Hostname such as `voice.example.com` to the server's local HTTP service at `http://127.0.0.1:SERVER_PORT`. The Pulse WebSocket path is `/voice`; Cloudflare Tunnel supports WebSockets through the HTTP service. Start the Pterodactyl server and check `logs/pulse-voice.log` and `logs/cloudflared.log` if the hostname does not connect.
+In Cloudflare Zero Trust, add both Public Hostnames listed above and route them to their corresponding local HTTP services. The website/API runs on the second allocation; voice runs on the first. Start the Pterodactyl server and check `logs/pulse-web.log`, `logs/pulse-voice.log`, and `logs/cloudflared.log` if a hostname does not connect.
 
 In Pulse, set **Signaling server** to:
 
 ```text
-wss://voice.example.com/voice
+wss://voice.overclockd.shop/voice
 ```
 
-Then enter the same `PULSE_VOICE_TOKEN` value. You can use `.env.local` with `VITE_PULSE_SIGNAL_URL=wss://voice.example.com/voice` before building the desktop client to prefill that URL.
+Then enter the same `PULSE_VOICE_TOKEN` value. Desktop builds use `.env.local` with `VITE_PULSE_SIGNAL_URL=wss://voice.overclockd.shop/voice` and `VITE_PULSE_API_URL=https://pulse.overclockd.shop`.
 
 ## Optional TURN media relay on the VPS
 
@@ -74,6 +87,6 @@ PULSE_TURN_ONLY=true
 ## Notes
 
 - This is the 1:1 voice milestone; a group call needs an SFU.
-- The shared access token gates signaling but does not create Pulse accounts or per-user permissions.
+- Account signup is public; friend requests gate direct messages. The shared voice token is still separate from account login.
 - Pterodactyl must have outbound internet access for GitHub and Cloudflare Tunnel.
 - If GitHub update fails, startup continues with the checked-out code, matching the previous entrypoint behavior.

@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 
-const port = Number(process.env.PULSE_VOICE_PORT || 8787);
+const port = Number(process.env.PULSE_VOICE_PORT || process.env.SERVER_PORT || 8787);
 const accessToken = process.env.PULSE_VOICE_TOKEN || '';
 const turnUrl = process.env.PULSE_TURN_URL || '';
 const turnSecret = process.env.PULSE_TURN_SECRET || '';

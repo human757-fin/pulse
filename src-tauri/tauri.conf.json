@@ -5,5 +5,5 @@
   "identifier": "com.pulse.client",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": { "windows": [{ "title": "Pulse", "width": 1280, "height": 820, "minWidth": 960, "minHeight": 640, "resizable": true }] },
-  "bundle": { "active": true, "targets": ["nsis", "msi"] }
+  "bundle": { "active": true, "targets": ["nsis", "msi"], "icon": ["icons/icon.ico"] }
 }
