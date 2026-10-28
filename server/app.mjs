@@ -79,6 +79,19 @@ async function serve(req, res) {
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: publicUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
       if (url.pathname === '/api/logout' && req.method === 'POST') { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); db.sessions = db.sessions.filter(s => s.token !== token); persist(); return json(res, 200, { ok: true }); }
+      if (url.pathname === '/api/keys' && req.method === 'POST') {
+        const publicKey = body.publicKey;
+        if (!publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.x || '') || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.y || '')) return json(res, 400, { error: 'Invalid Pulse encryption public key.' });
+        user.publicKey = { kty: 'EC', crv: 'P-256', x: publicKey.x, y: publicKey.y, ext: true };
+        persist(); return json(res, 200, { ok: true });
+      }
+      const publicKeyRequest = url.pathname.match(/^\/api\/keys\/([a-f0-9]+)$/);
+      if (publicKeyRequest && req.method === 'GET') {
+        const target = db.users.find(u => u.id === publicKeyRequest[1]);
+        if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Encryption keys are available to friends only.' });
+        if (!target.publicKey) return json(res, 404, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
+        return json(res, 200, { publicKey: target.publicKey });
+      }
       if (url.pathname === '/api/friends' && req.method === 'GET') {
         const friends = db.friendships.filter(f => f.status === 'accepted' && (f.from === user.id || f.to === user.id)).map(f => publicUser(db.users.find(u => u.id === (f.from === user.id ? f.to : f.from)))).filter(Boolean);
         const incoming = db.friendships.filter(f => f.status === 'pending' && f.to === user.id).map(f => publicUser(db.users.find(u => u.id === f.from))).filter(Boolean);
@@ -104,14 +117,15 @@ async function serve(req, res) {
         const target = db.users.find(u => u.key === usernameKey(url.searchParams.get('with')));
         if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
         const items = db.messages.filter(m => (m.from === user.id && m.to === target.id) || (m.from === target.id && m.to === user.id)).slice(-100);
-        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), text: m.text, createdAt: m.createdAt })) });
+        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt })) });
       }
       if (url.pathname === '/api/messages' && req.method === 'POST') {
-        const target = db.users.find(u => u.key === usernameKey(body.to)); const text = String(body.text || '').trim();
+        const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
         if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
-        if (!text || text.length > 4096) return json(res, 400, { error: 'Message must be 1–4096 characters.' });
-        const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, text, createdAt: new Date().toISOString() }; db.messages.push(message); persist();
-        return json(res, 201, { message: { ...message, from: publicUser(user) } });
+        if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
+        if (!ciphertext || ciphertext.length > 12_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
+        const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }; db.messages.push(message); persist();
+        return json(res, 201, { message: { id: message.id, from: publicUser(user), ciphertext, iv, encryptionVersion: 1, createdAt: message.createdAt } });
       }
       return json(res, 404, { error: 'API route not found.' });
     } catch (error) { return json(res, 400, { error: error instanceof Error ? error.message : 'Request failed.' }); }

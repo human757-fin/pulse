@@ -14,13 +14,19 @@ export class VoiceClient {
   private muted = false;
   private turnServers: RTCIceServer[] = [];
   private iceTransportPolicy: RTCIceTransportPolicy = 'all';
+  private cryptoWorker?: Worker;
+  private voiceKey?: ArrayBuffer;
 
   constructor(private onUpdate: (update: VoiceUpdate) => void) {}
 
-  async join(endpoint: string, room: string, name: string, token: string) {
+  async join(endpoint: string, room: string, name: string, token: string, voiceKey: ArrayBuffer) {
     this.stopped = false;
     this.emit('connecting', 'Requesting microphone…');
     try {
+      const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => unknown }).RTCRtpScriptTransform;
+      if (!Transform) throw new Error('This browser does not support encrypted voice. Update Microsoft Edge/WebView2 and retry.');
+      this.voiceKey = voiceKey;
+      this.cryptoWorker = new Worker(new URL('./voice-crypto-worker.ts', import.meta.url), { type: 'module' });
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this WebView. Update Microsoft Edge WebView2 and retry.');
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -54,6 +60,7 @@ export class VoiceClient {
     this.audioElements.clear();
     this.peerNames.clear();
     this.pendingIce.clear();
+    this.cryptoWorker?.terminate(); this.cryptoWorker = undefined; this.voiceKey = undefined;
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
     this.muted = false;
@@ -139,9 +146,13 @@ export class VoiceClient {
     if (old) return old;
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, ...this.turnServers], iceTransportPolicy: this.iceTransportPolicy });
     this.peers.set(id, pc);
-    this.stream?.getAudioTracks().forEach(track => pc.addTrack(track, this.stream!));
+    this.stream?.getAudioTracks().forEach(track => {
+      const sender = pc.addTrack(track, this.stream!);
+      this.applyTransform(sender, 'encrypt');
+    });
     pc.onicecandidate = event => { if (event.candidate) this.send({ type: 'ice', to: id, candidate: event.candidate }); };
     pc.ontrack = event => {
+      this.applyTransform(event.receiver, 'decrypt');
       let audio = this.audioElements.get(id);
       if (!audio) {
         audio = document.createElement('audio');
@@ -159,6 +170,12 @@ export class VoiceClient {
       if (pc.connectionState === 'failed') this.fail('Peer connection failed. Check network or TURN settings.');
     };
     return pc;
+  }
+
+  private applyTransform(endpoint: RTCRtpSender | RTCRtpReceiver, mode: 'encrypt' | 'decrypt') {
+    const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => RTCRtpScriptTransform }).RTCRtpScriptTransform;
+    if (!Transform || !this.cryptoWorker || !this.voiceKey) throw new Error('Encrypted voice is unavailable in this browser.');
+    (endpoint as RTCRtpSender & { transform?: RTCRtpScriptTransform | null }).transform = new Transform(this.cryptoWorker, { mode, keyBytes: this.voiceKey });
   }
 
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }

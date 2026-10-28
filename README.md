@@ -34,7 +34,11 @@ Open `http://localhost:8788` to create an account in a browser. Set `PULSE_VOICE
 
 See [VOICE_SETUP.md](VOICE_SETUP.md) for a direct VPS setup and [deploy/PTERODACTYL.md](deploy/PTERODACTYL.md) for Pterodactyl with GitHub updates and Cloudflare Tunnel.
 
-## Current scope
+## Encryption and calls
 
-- Voice supports two people per room. The server relays signaling; WebRTC sends voice peer-to-peer unless coturn relay-only mode is configured.
-- Messages are stored on the server and are not end-to-end encrypted yet. Voice calls are 1:1; group voice, streaming, and account 2FA are not implemented.
+- New direct messages use AES-GCM encryption on the client. The server stores ciphertext; older messages from before this update remain plaintext and cannot be converted retroactively.
+- 1:1 voice audio is encrypted end-to-end using WebRTC encoded audio transforms. The server relays call setup messages, not audio.
+- Keys are created per account on each device and stored in that browser's IndexedDB. The first key from a friend is trusted on first use; compare keys out-of-band before trusting a new friend. A key change is blocked until verified.
+- This initial key setup does not provide forward secrecy or multi-device key synchronization. Losing browser storage means that device cannot decrypt messages sent to its old key.
+- Open a friend's DM and press **Call**. The first time, enter the shared voice token. Your friend opens the same DM and presses **Call** too. On the hosted site, the signaling address is inferred from the `pulse.*` hostname; desktop builds can set `VITE_PULSE_SIGNAL_URL`.
+- Calls require a browser with WebRTC encoded transforms (current Edge/WebView2 or Chrome). Voice supports two people per room; group voice, streaming, and account 2FA are not implemented.
