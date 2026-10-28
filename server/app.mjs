@@ -58,7 +58,7 @@ async function serve(req, res) {
       const body = ['POST'].includes(req.method) ? await readBody(req) : {};
       if (url.pathname === '/api/signup' && req.method === 'POST') {
         const username = String(body.username || '').trim(); const key = usernameKey(username); const password = String(body.password || '');
-        if (!/^[a-zA-Z0-9_]{3,24}$/.test(username)) return json(res, 400, { error: 'Username must be 3–24 letters, numbers, or underscores.' });
+        if (!/^[a-zA-Z0-9._]{3,24}$/.test(username)) return json(res, 400, { error: 'Username must be 3–24 characters and use only letters, numbers, dots, or underscores.' });
         if (password.length < 10 || password.length > 128) return json(res, 400, { error: 'Password must be 10–128 characters.' });
         if (db.users.some(u => u.key === key)) return json(res, 409, { error: 'That username is already taken.' });
         const salt = randomBytes(16).toString('hex'); const passwordHash = (await scrypt(password, salt, 64)).toString('hex');
