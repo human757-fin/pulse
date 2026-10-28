@@ -28,7 +28,12 @@ let authError = '';
 let notice = '';
 let busy = false;
 let settingsOpen = false;
-let settingsTab: 'profile' | 'security' | 'updates' = 'profile';
+let settingsTab: 'profile' | 'security' | 'calls' | 'updates' = 'profile';
+let audioInputDeviceId = localStorage.getItem('pulse.audioInput') || '';
+let audioOutputDeviceId = localStorage.getItem('pulse.audioOutput') || '';
+let audioDevices: MediaDeviceInfo[] = [];
+let audioDeviceMessage = 'Using Windows default audio devices.';
+let audioDevicesLoading = false;
 let friendsPanel: 'friends' | 'requests' | 'add' = 'friends';
 let securityChallenge: { challengeId: string; purpose: string; email: string } | undefined;
 let securityError = '';
@@ -43,6 +48,7 @@ let totpError = '';
 let cryptoReady = false;
 const decryptedCache = new Map<string, string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; voiceMuted = false; } render(); });
+voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const signalUrl = () => localStorage.getItem('pulse.signalUrl') || import.meta.env.VITE_PULSE_SIGNAL_URL || (runningInTauri ? 'wss://voice.overclockd.shop/voice' : window.location.hostname.startsWith('pulse.') ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname.replace(/^pulse\./, 'voice.')}/voice` : 'ws://127.0.0.1:8787');
@@ -278,6 +284,30 @@ async function signOut() {
   localStorage.removeItem('pulse.authToken'); voice.leave(); renderAuth();
 }
 
+function audioDeviceOptions(kind: 'audioinput' | 'audiooutput', selectedId: string) {
+  const devices = audioDevices.filter(device => device.kind === kind);
+  const unavailable = selectedId && !devices.some(device => device.deviceId === selectedId)
+    ? `<option value="${esc(selectedId)}" selected>Previously selected device (unavailable)</option>`
+    : '';
+  return `<option value="" ${selectedId ? '' : 'selected'}>Windows default</option>${unavailable}${devices.map((device, index) => `<option value="${esc(device.deviceId)}" ${device.deviceId === selectedId ? 'selected' : ''}>${esc(device.label || `${kind === 'audioinput' ? 'Microphone' : 'Speaker'} ${index + 1}`)}</option>`).join('')}`;
+}
+
+async function refreshAudioDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) { audioDeviceMessage = 'Audio device selection is unavailable in this app environment.'; renderSettings(); return; }
+  audioDevicesLoading = true;
+  audioDeviceMessage = 'Looking for audio devices…';
+  renderSettings();
+  try {
+    audioDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => (device.kind === 'audioinput' || device.kind === 'audiooutput') && device.deviceId !== 'default');
+    audioDeviceMessage = audioDevices.some(device => device.label) ? 'Device list is up to date. Changes apply to your next call or immediately during a call.' : 'Windows has not shared device names yet. Start a call and allow microphone access, then reopen this tab.';
+  } catch (error) {
+    audioDeviceMessage = error instanceof Error ? `Could not list audio devices: ${error.message}` : 'Could not list audio devices.';
+  } finally {
+    audioDevicesLoading = false;
+    if (settingsOpen && settingsTab === 'calls') renderSettings();
+  }
+}
+
 function renderSettings() {
   if (!me) return;
   app.classList.add('settings-view');
@@ -303,18 +333,49 @@ function renderSettings() {
     ${authenticatorSettings}
     ${securityChallenge ? `<label class="field-label">Code sent to ${esc(securityChallenge.email)}<input id="security-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code"></label><button type="button" class="primary-button security-verify" id="security-verify">Verify code</button>` : ''}<div class="settings-form-error" role="alert">${esc(securityError)}</div>
   </section>`;
+  const callSettings = `<section class="settings-section"><div class="settings-section-heading"><div><h2>Call audio</h2><p>Choose the microphone and speaker Pulse uses for calls.</p></div></div>
+    <label class="field-label">Microphone<select id="audio-input" ${audioDevicesLoading ? 'disabled' : ''}>${audioDeviceOptions('audioinput', audioInputDeviceId)}</select><small class="field-hint">Windows default follows your current Windows input device.</small></label>
+    <label class="field-label">Speaker<select id="audio-output" ${audioDevicesLoading ? 'disabled' : ''}>${audioDeviceOptions('audiooutput', audioOutputDeviceId)}</select><small class="field-hint">Windows default follows your current Windows output device.</small></label>
+    <p class="audio-device-status" role="status" aria-live="polite">${esc(audioDeviceMessage)}</p>
+  </section>`;
   const updateSettings = `<section class="settings-section"><div class="settings-section-heading"><div><h2>Updates</h2><p>Pulse asks before installing an update. Beta builds may include unfinished changes.</p></div></div><label class="beta-setting"><span><strong>Check for beta updates</strong><small>Include prerelease builds when checking.</small></span><input id="beta-access" type="checkbox" ${localStorage.getItem('pulse.betaAccess') === 'true' ? 'checked' : ''}><span class="toggle-track" aria-hidden="true"></span></label><div class="update-check-row"><p id="update-check-status" role="status" aria-live="polite">${esc(updateCheckMessage)}</p><button type="button" class="secondary-button" id="check-updates" ${updateChecking ? 'disabled' : ''}>${updateChecking ? 'Checking…' : 'Check for updates'}</button></div></section>`;
-  const settingsTitle = settingsTab === 'security' ? 'Security' : settingsTab === 'updates' ? 'Updates' : 'Profile';
+  const settingsTitle = settingsTab === 'security' ? 'Security' : settingsTab === 'calls' ? 'Calls' : settingsTab === 'updates' ? 'Updates' : 'Profile';
   app.innerHTML = `<aside class="rail"><button class="brand-mark brand-tab" id="friends-home" title="Friends" aria-label="Friends"><img class="app-mark" src="/pulse-mark.svg" alt=""></button>${railCall}<div class="rail-divider"></div><div class="rail-bottom"><button class="account-tab active" id="settings-open" title="Settings" aria-label="Settings">${avatar(me, 'me')}</button></div></aside>
-  <aside class="sidebar settings-sidebar"><header class="side-header"><div><div class="eyebrow">PULSE</div><div class="space-title">Settings</div></div></header><nav class="settings-nav" aria-label="Settings sections"><button class="settings-nav-item ${settingsTab === 'profile' ? 'active' : ''}" data-settings-tab="profile">Profile</button><button class="settings-nav-item ${settingsTab === 'security' ? 'active' : ''}" data-settings-tab="security">Security</button><button class="settings-nav-item ${settingsTab === 'updates' ? 'active' : ''}" data-settings-tab="updates">Updates</button></nav><div class="settings-sidebar-bottom"><button class="settings-nav-item signout-item" id="logout-settings" type="button">↪ <span>Sign out</span></button></div></aside>
-  <main class="main settings-main"><header class="chat-header"><div class="chat-heading"><div><h1>${settingsTitle}</h1><p>${settingsTab === 'profile' ? 'Edit your public profile.' : settingsTab === 'security' ? 'Manage your sign-in and account protection.' : 'Choose which builds Pulse checks for.'}</p></div></div><div class="header-actions"><button type="button" class="settings-close" id="settings-close" title="Close settings" aria-label="Close settings">×</button></div></header><div class="settings-scroll"><div class="settings-content">${settingsTab === 'profile' ? profileSettings : settingsTab === 'security' ? securitySettings : updateSettings}</div></div></main><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
+  <aside class="sidebar settings-sidebar"><header class="side-header"><div><div class="eyebrow">PULSE</div><div class="space-title">Settings</div></div></header><nav class="settings-nav" aria-label="Settings sections"><button class="settings-nav-item ${settingsTab === 'profile' ? 'active' : ''}" data-settings-tab="profile">Profile</button><button class="settings-nav-item ${settingsTab === 'security' ? 'active' : ''}" data-settings-tab="security">Security</button><button class="settings-nav-item ${settingsTab === 'calls' ? 'active' : ''}" data-settings-tab="calls">Calls</button><button class="settings-nav-item ${settingsTab === 'updates' ? 'active' : ''}" data-settings-tab="updates">Updates</button></nav><div class="settings-sidebar-bottom"><button class="settings-nav-item signout-item" id="logout-settings" type="button">↪ <span>Sign out</span></button></div></aside>
+  <main class="main settings-main"><header class="chat-header"><div class="chat-heading"><div><h1>${settingsTitle}</h1><p>${settingsTab === 'profile' ? 'Edit your public profile.' : settingsTab === 'security' ? 'Manage your sign-in and account protection.' : settingsTab === 'calls' ? 'Choose your call microphone and speaker.' : 'Choose which builds Pulse checks for.'}</p></div></div><div class="header-actions"><button type="button" class="settings-close" id="settings-close" title="Close settings" aria-label="Close settings">×</button></div></header><div class="settings-scroll"><div class="settings-content">${settingsTab === 'profile' ? profileSettings : settingsTab === 'security' ? securitySettings : settingsTab === 'calls' ? callSettings : updateSettings}</div></div></main><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   let avatarData: string | undefined; let bannerData: string | undefined; let clearAvatar = false;
   let clearBanner = false;
   app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; messages = []; render(); };
   app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { if (!callFriend) return; settingsOpen = false; friendsPanel = 'friends'; openFriend(callFriend); });
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
-  app.querySelectorAll<HTMLButtonElement>('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab as typeof settingsTab; renderSettings(); });
+  app.querySelectorAll<HTMLButtonElement>('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab as typeof settingsTab; renderSettings(); if (settingsTab === 'calls') void refreshAudioDevices(); });
+  app.querySelector<HTMLSelectElement>('#audio-input')?.addEventListener('change', async event => {
+    const select = event.currentTarget as HTMLSelectElement;
+    select.disabled = true;
+    try {
+      await voice.setAudioInputDevice(select.value);
+      audioInputDeviceId = select.value;
+      localStorage.setItem('pulse.audioInput', audioInputDeviceId);
+      audioDeviceMessage = audioInputDeviceId ? 'Microphone changed. It will stay selected for future calls.' : 'Using the Windows default microphone.';
+    } catch (error) {
+      audioDeviceMessage = error instanceof Error ? `Could not change microphone: ${error.message}` : 'Could not change microphone.';
+    }
+    renderSettings();
+  });
+  app.querySelector<HTMLSelectElement>('#audio-output')?.addEventListener('change', async event => {
+    const select = event.currentTarget as HTMLSelectElement;
+    select.disabled = true;
+    try {
+      await voice.setAudioOutputDevice(select.value);
+      audioOutputDeviceId = select.value;
+      localStorage.setItem('pulse.audioOutput', audioOutputDeviceId);
+      audioDeviceMessage = audioOutputDeviceId ? 'Speaker changed. It will stay selected for future calls.' : 'Using the Windows default speaker.';
+    } catch (error) {
+      audioDeviceMessage = error instanceof Error ? `Could not change speaker: ${error.message}` : 'Could not change speaker.';
+    }
+    renderSettings();
+  });
   app.querySelector<HTMLInputElement>('#beta-access')?.addEventListener('change', event => { localStorage.setItem('pulse.betaAccess', String((event.currentTarget as HTMLInputElement).checked)); void checkDesktopUpdates(); });
   app.querySelector<HTMLButtonElement>('#check-updates')?.addEventListener('click', () => { void checkDesktopUpdates(); });
   app.querySelector<HTMLButtonElement>('#verify-email-button')?.addEventListener('click', async () => {
@@ -366,6 +427,7 @@ function renderSettings() {
 
 async function start() {
   window.setTimeout(() => { void checkDesktopUpdates(); }, 8000);
+  navigator.mediaDevices?.addEventListener('devicechange', () => { if (settingsOpen && settingsTab === 'calls') void refreshAudioDevices(); });
   if (token) {
     try { me = await hydrateProfile((await api<{ user: User }>('/me')).user); try { await initializeAccountCrypto(me); } catch (error) { notice = `Encryption setup failed: ${error instanceof Error ? error.message : 'sign in again to retry'}`; } await refreshFriends(); await refreshUnread(); render(); }
     catch { token = ''; localStorage.removeItem('pulse.authToken'); renderAuth(); }

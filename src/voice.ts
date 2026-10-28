@@ -14,6 +14,8 @@ export class VoiceClient {
   private peerNames = new Map<string, string>();
   private pendingIce = new Map<string, RTCIceCandidateInit[]>();
   private muted = false;
+  private inputDeviceId = '';
+  private outputDeviceId = '';
   private turnServers: RTCIceServer[] = [];
   private iceTransportPolicy: RTCIceTransportPolicy = 'all';
   private voiceKey?: ArrayBuffer;
@@ -22,6 +24,47 @@ export class VoiceClient {
   private reconnectAttempts = 0;
 
   constructor(private onUpdate: (update: VoiceUpdate) => void) {}
+
+  setPreferredAudioDevices(inputDeviceId: string, outputDeviceId: string) {
+    this.inputDeviceId = inputDeviceId;
+    this.outputDeviceId = outputDeviceId;
+  }
+
+  async setAudioInputDevice(deviceId: string) {
+    if (deviceId === this.inputDeviceId) return;
+    if (!this.stream) { this.inputDeviceId = deviceId; return; }
+    const nextStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) },
+      video: false,
+    });
+    const nextTrack = nextStream.getAudioTracks()[0];
+    if (!nextTrack) { nextStream.getTracks().forEach(track => track.stop()); throw new Error('That microphone did not provide an audio track.'); }
+    nextTrack.contentHint = 'speech';
+    nextTrack.enabled = !this.muted;
+    try {
+      const senders = [...this.peers.values()].flatMap(peer => peer.getSenders().filter(sender => sender.track?.kind === 'audio'));
+      await Promise.all(senders.map(sender => sender.replaceTrack(nextTrack)));
+      const previousStream = this.stream;
+      this.stream = nextStream;
+      this.inputDeviceId = deviceId;
+      previousStream.getTracks().forEach(track => track.stop());
+    } catch (error) {
+      nextStream.getTracks().forEach(track => track.stop());
+      throw error;
+    }
+  }
+
+  async setAudioOutputDevice(deviceId: string) {
+    const supportsOutputSelection = 'setSinkId' in HTMLMediaElement.prototype;
+    if (deviceId && !supportsOutputSelection) throw new Error('Speaker selection is unavailable in this version of Windows WebView. Update Pulse and WebView2.');
+    const mediaElements = [...this.audioElements.values()];
+    const setSinkId = (audio: HTMLAudioElement, sinkId: string) => {
+      const media = audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
+      return media.setSinkId ? media.setSinkId(sinkId) : Promise.resolve();
+    };
+    await Promise.all(mediaElements.map(audio => setSinkId(audio, deviceId)));
+    this.outputDeviceId = deviceId;
+  }
 
   async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer) {
     this.stopped = false;
@@ -34,7 +77,7 @@ export class VoiceClient {
       this.voiceKey = voiceKey;
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this WebView. Update Microsoft Edge WebView2 and retry.');
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, ...(this.inputDeviceId ? { deviceId: { exact: this.inputDeviceId } } : {}) },
         video: false,
       });
       this.stream.getAudioTracks().forEach(track => { track.contentHint = 'speech'; });
@@ -233,6 +276,8 @@ export class VoiceClient {
         audio.dataset.voicePeer = id;
         document.body.append(audio);
         this.audioElements.set(id, audio);
+        const media = audio as HTMLAudioElement & { setSinkId?: (deviceId: string) => Promise<void> };
+        if (media.setSinkId) void media.setSinkId(this.outputDeviceId).catch(error => this.emit('connected', error instanceof Error ? `Could not select speaker: ${error.message}` : 'Could not select speaker.'));
       }
       audio.srcObject = event.streams[0];
       void audio.play().catch(() => this.emit('connected', 'Voice connected · click Pulse to hear audio'));
