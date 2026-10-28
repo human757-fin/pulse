@@ -30,7 +30,7 @@ npm run tauri dev
 
 Open `http://localhost:8788` to create an account in a browser. Calls use your Pulse login and accepted-friend relationship; there is no shared voice token to configure. The default signaling address is `ws://127.0.0.1:8787`.
 
-Email verification and optional email-code two-factor authentication use the Resend email API. Set `RESEND_API_KEY` and `PULSE_EMAIL_FROM` in the environment before starting `npm run web-server`; verify the sender domain in Resend. Existing accounts can add and verify an email under **Settings → Sign-in security**. New accounts verify their email before creation.
+Email verification and optional email-code or authenticator-app two-factor authentication use the Resend email API and TOTP. Set `RESEND_API_KEY` and `PULSE_EMAIL_FROM` in the environment before starting `npm run web-server`; verify the sender domain in Resend. Existing accounts can add and verify an email or configure an authenticator app under **Settings → Sign-in security**. New accounts verify their email before creation.
 
 ## VPS deployment
 
@@ -48,6 +48,6 @@ See [VOICE_SETUP.md](VOICE_SETUP.md) for a direct VPS setup and [deploy/PTERODAC
 
 ## Desktop updates
 
-Pulse checks for signed Windows app updates shortly after startup and installs a newer release automatically. The updater verifies signatures with the public key in `src-tauri/tauri.conf.json`; never commit or share `src-tauri/pulse-updater.key`.
+Pulse checks for signed Windows app updates shortly after startup and shows an update banner. It only installs after you choose **Install update**. The updater verifies signatures with the public key in `src-tauri/tauri.conf.json`; never commit or share `src-tauri/pulse-updater.key`.
 
-To publish a release, add the contents of the local `src-tauri/pulse-updater.key` file as the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, then push a version tag. Tags containing a hyphen, such as `v0.3.2-1`, publish as prereleases; tags without one publish as stable. Windows MSI prerelease identifiers must be numeric. Turn on **Settings → Updates → Beta access** to get a startup prompt before installing an available beta. The workflow builds signed Windows installers and updater metadata.
+To publish a release, add the contents of the local `src-tauri/pulse-updater.key` file as the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, then push a version tag. Tags containing a hyphen, such as `v0.3.4-1`, publish as prereleases; tags without one publish as stable. Windows MSI prerelease identifiers must be numeric. Turn on **Settings → Updates → Beta access** to check for beta builds. The workflow builds signed Windows installers and updater metadata.

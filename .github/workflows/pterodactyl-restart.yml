@@ -1,0 +1,51 @@
+name: Restart Pulse VPS after push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  restart-pulse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Restart Pulse through Pterodactyl
+        env:
+          PANEL_URL: ${{ secrets.PTERODACTYL_PANEL_URL }}
+          SERVER_ID: ${{ secrets.PTERODACTYL_SERVER_ID }}
+          API_KEY: ${{ secrets.PTERODACTYL_API_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : "${PANEL_URL:?Add the PTERODACTYL_PANEL_URL GitHub Actions secret}"
+          : "${SERVER_ID:?Add the PTERODACTYL_SERVER_ID GitHub Actions secret}"
+          : "${API_KEY:?Add the PTERODACTYL_API_KEY GitHub Actions secret}"
+          if [[ ! "$PANEL_URL" =~ ^https://[^/]+/?$ ]]; then
+            echo "PTERODACTYL_PANEL_URL must be the HTTPS panel origin, without a path."
+            exit 1
+          fi
+          if [[ ! "$SERVER_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+            echo "PTERODACTYL_SERVER_ID contains unsupported characters."
+            exit 1
+          fi
+          panel_url="${PANEL_URL%/}"
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+            --request POST \
+            --url "$panel_url/api/client/servers/$SERVER_ID/power" \
+            --header "Authorization: Bearer $API_KEY" \
+            --header 'Accept: Application/vnd.pterodactyl.v1+json' \
+            --header 'Content-Type: application/json' \
+            --data '{"signal":"restart"}')"
+          if [[ "$status" != "204" ]]; then
+            echo "Pterodactyl restart request failed with HTTP $status."
+            cat "$response_file"
+            rm -f "$response_file"
+            exit 1
+          fi
+          rm -f "$response_file"
+          echo "Pterodactyl accepted the Pulse server restart."

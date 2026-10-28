@@ -1,8 +1,9 @@
-export type VoiceState = 'disconnected' | 'connecting' | 'waiting' | 'connected' | 'error';
+export type VoiceState = 'disconnected' | 'connecting' | 'reconnecting' | 'waiting' | 'connected' | 'error';
 export type VoiceUpdate = { state: VoiceState; message: string; peers: string[] };
 
 type Signal = { type: string; [key: string]: unknown };
 const voiceProtocol = 'pulse-aesgcm-v1';
+type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer };
 
 export class VoiceClient {
   private socket?: WebSocket;
@@ -17,11 +18,16 @@ export class VoiceClient {
   private iceTransportPolicy: RTCIceTransportPolicy = 'all';
   private cryptoWorker?: Worker;
   private voiceKey?: ArrayBuffer;
+  private joinOptions?: JoinOptions;
+  private reconnectTimer?: number;
+  private reconnectAttempts = 0;
 
   constructor(private onUpdate: (update: VoiceUpdate) => void) {}
 
   async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer) {
     this.stopped = false;
+    this.joinOptions = { endpoint, room, friendId, authToken, voiceKey };
+    this.reconnectAttempts = 0;
     this.emit('connecting', 'Requesting microphone…');
     try {
       const Transform = (window as Window & { RTCRtpScriptTransform?: new (worker: Worker, options?: unknown) => unknown }).RTCRtpScriptTransform;
@@ -35,18 +41,9 @@ export class VoiceClient {
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false,
       });
+      this.stream.getAudioTracks().forEach(track => { track.contentHint = 'speech'; });
       if (this.stopped) { this.stream.getTracks().forEach(track => track.stop()); this.stream = undefined; return; }
-      const socket = new WebSocket(endpoint);
-      this.socket = socket;
-      await new Promise<void>((resolve, reject) => {
-        const timer = window.setTimeout(() => reject(new Error('Signaling server timed out.')), 8000);
-        socket.onopen = () => { window.clearTimeout(timer); resolve(); };
-        socket.onerror = () => { window.clearTimeout(timer); reject(new Error(`Can’t reach voice server at ${endpoint}`)); };
-      });
-      if (this.stopped) return;
-      socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal).catch(error => this.fail(error instanceof Error ? error.message : 'Voice setup failed.')); };
-      socket.onclose = () => { if (!this.stopped) this.fail('Voice server disconnected.'); };
-      socket.send(JSON.stringify({ type: 'join', room, friendId, authToken, voiceProtocol }));
+      await this.openSignaling();
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'Could not join voice.');
     }
@@ -54,15 +51,13 @@ export class VoiceClient {
 
   leave() {
     this.stopped = true;
-    this.socket?.send(JSON.stringify({ type: 'leave' }));
+    this.joinOptions = undefined;
+    if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: 'leave' }));
     this.socket?.close();
     this.socket = undefined;
-    this.peers.forEach(pc => pc.close());
-    this.peers.clear();
-    this.audioElements.forEach(audio => { audio.pause(); audio.srcObject = null; });
-    this.audioElements.clear();
-    this.peerNames.clear();
-    this.pendingIce.clear();
+    this.clearPeers();
     this.cryptoWorker?.terminate(); this.cryptoWorker = undefined; this.voiceKey = undefined;
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
@@ -79,6 +74,7 @@ export class VoiceClient {
   private async handle(msg: Signal) {
     if (msg.type === 'joined') {
       if (msg.voiceProtocol !== voiceProtocol) { this.fail('Voice versions do not match. Update Pulse on both devices and restart the Pulse server.'); return; }
+      this.reconnectAttempts = 0;
       this.turnServers = (msg.iceServers as RTCIceServer[]) || [];
       this.iceTransportPolicy = msg.iceTransportPolicy === 'relay' && this.turnServers.length ? 'relay' : 'all';
       const peers = (msg.peers as Array<{ id: string; name: string }>) || [];
@@ -139,6 +135,56 @@ export class VoiceClient {
     this.send({ type: 'offer', to: id, description: pc.localDescription });
   }
 
+  private async openSignaling() {
+    const options = this.joinOptions;
+    if (!options || this.stopped) return;
+    const socket = new WebSocket(options.endpoint);
+    this.socket = socket;
+    await new Promise<void>((resolve, reject) => {
+      let opened = false; let settled = false;
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true; socket.close(); reject(new Error('Signaling server timed out.'));
+      }, 8000);
+      socket.onopen = () => {
+        opened = true; settled = true; window.clearTimeout(timer);
+        if (this.stopped) { socket.close(); resolve(); return; }
+        socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal).catch(error => this.fail(error instanceof Error ? error.message : 'Voice setup failed.')); };
+        socket.send(JSON.stringify({ type: 'join', room: options.room, friendId: options.friendId, authToken: options.authToken, voiceProtocol }));
+        resolve();
+      };
+      socket.onerror = () => {
+        if (!opened && !settled) { settled = true; window.clearTimeout(timer); reject(new Error(`Can’t reach voice server at ${options.endpoint}`)); }
+      };
+      socket.onclose = () => {
+        if (!opened && !settled) { settled = true; window.clearTimeout(timer); reject(new Error(`Voice server closed before connecting at ${options.endpoint}`)); }
+        else if (!this.stopped) this.scheduleReconnect();
+      };
+    });
+  }
+
+  private scheduleReconnect() {
+    if (this.stopped || !this.joinOptions || this.reconnectTimer !== undefined) return;
+    this.socket = undefined;
+    this.clearPeers();
+    const delay = Math.min(15_000, 1000 * (2 ** this.reconnectAttempts));
+    this.reconnectAttempts += 1;
+    this.emit('reconnecting', 'Voice server restarted · reconnecting…');
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.openSignaling().catch(() => this.scheduleReconnect());
+    }, delay);
+  }
+
+  private clearPeers() {
+    this.peers.forEach(pc => pc.close());
+    this.peers.clear();
+    this.audioElements.forEach(audio => { audio.pause(); audio.srcObject = null; audio.remove(); });
+    this.audioElements.clear();
+    this.peerNames.clear();
+    this.pendingIce.clear();
+  }
+
   private async flushIce(id: string, pc: RTCPeerConnection) {
     const candidates = this.pendingIce.get(id) || [];
     this.pendingIce.delete(id);
@@ -162,6 +208,7 @@ export class VoiceClient {
       if (!audio) {
         audio = document.createElement('audio');
         audio.autoplay = true;
+        audio.volume = 1;
         audio.dataset.voicePeer = id;
         document.body.append(audio);
         this.audioElements.set(id, audio);

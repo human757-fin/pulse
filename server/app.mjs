@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { extname, join, resolve, sep } from 'node:path';
-import { createHmac, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCb);
@@ -10,6 +10,18 @@ const dataDir = resolve(process.env.PULSE_DATA_DIR || 'data');
 const dbPath = join(dataDir, 'pulse.json');
 const webRoot = resolve(process.env.PULSE_WEB_ROOT || 'dist');
 mkdirSync(dataDir, { recursive: true });
+const totpKeyPath = join(dataDir, 'totp.key');
+function loadTotpKey() {
+  if (existsSync(totpKeyPath)) {
+    const key = readFileSync(totpKeyPath);
+    if (key.length !== 32) throw new Error(`Invalid TOTP encryption key at ${totpKeyPath}.`);
+    return key;
+  }
+  const key = randomBytes(32);
+  try { writeFileSync(totpKeyPath, key, { flag: 'wx', mode: 0o600 }); return key; }
+  catch (error) { if (error.code !== 'EEXIST') throw error; return readFileSync(totpKeyPath); }
+}
+const totpEncryptionKey = loadTotpKey();
 let db = { users: [], sessions: [], friendships: [], messages: [] };
 if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
@@ -20,6 +32,9 @@ const requestWindows = new Map();
 const signupReservations = new Set();
 const emailReservations = new Set();
 const emailChallenges = new Map();
+const totpSetups = new Map();
+const totpLoginChallenges = new Map();
+const totpDisableAttempts = new Map();
 const emailProofs = new Map();
 const emailRequestWindows = new Map();
 const challengeSecret = randomBytes(32);
@@ -36,7 +51,7 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
-function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled }; }
+function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
 function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
 function readBody(req) {
   return new Promise((resolveBody, reject) => {
@@ -78,6 +93,66 @@ async function getReleaseUpdate(channel, target) {
   return update;
 }
 function hashCode(id, code) { return createHmac('sha256', challengeSecret).update(`${id}:${code}`).digest('hex'); }
+const base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(bytes) {
+  let bits = 0; let value = 0; let output = '';
+  for (const byte of bytes) { value = (value << 8) | byte; bits += 8; while (bits >= 5) { output += base32Alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; } }
+  if (bits) output += base32Alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
+function base32Decode(value) {
+  let bits = 0; let buffer = 0; const output = [];
+  for (const char of String(value).toUpperCase().replace(/=+$/g, '').replace(/\s/g, '')) {
+    const index = base32Alphabet.indexOf(char); if (index < 0) throw new Error('Invalid authenticator secret.');
+    buffer = (buffer << 5) | index; bits += 5;
+    if (bits >= 8) { output.push((buffer >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return Buffer.from(output);
+}
+function totpCode(secret, time = Date.now()) {
+  const counter = Buffer.alloc(8); counter.writeBigUInt64BE(BigInt(Math.floor(time / 30_000)));
+  const digest = createHmac('sha1', base32Decode(secret)).update(counter).digest();
+  const offset = digest[digest.length - 1] & 15;
+  return String((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, '0');
+}
+function verifyTotp(secret, candidate, now = Date.now()) {
+  if (!/^\d{6}$/.test(String(candidate))) return false;
+  const supplied = Buffer.from(String(candidate));
+  for (const offset of [-30_000, 0, 30_000]) {
+    const expected = Buffer.from(totpCode(secret, now + offset));
+    if (timingSafeEqual(supplied, expected)) return true;
+  }
+  return false;
+}
+function encryptTotpSecret(secret) {
+  const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', totpEncryptionKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(secret, 'utf8'), cipher.final()]);
+  return `${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${ciphertext.toString('base64url')}`;
+}
+function decryptTotpSecret(value) {
+  const [iv, tag, ciphertext] = String(value || '').split('.');
+  if (!iv || !tag || !ciphertext) throw new Error('Authenticator setup is unavailable.');
+  const decipher = createDecipheriv('aes-256-gcm', totpEncryptionKey, Buffer.from(iv, 'base64url'));
+  decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+  return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64url')), decipher.final()]).toString('utf8');
+}
+function recoveryHash(code) { return createHash('sha256').update(String(code).replace(/[^A-Za-z0-9]/g, '').toUpperCase()).digest('hex'); }
+function consumeRecoveryCode(user, code) {
+  const candidate = recoveryHash(code); const hashes = user.totpRecoveryHashes || [];
+  const index = hashes.findIndex(hash => { const stored = Buffer.from(hash, 'hex'); const actual = Buffer.from(candidate, 'hex'); return stored.length === actual.length && timingSafeEqual(stored, actual); });
+  if (index < 0) return false;
+  hashes.splice(index, 1); user.totpRecoveryHashes = hashes; return true;
+}
+function verifySecondFactor(user, code) {
+  if (user.totpEnabled && user.totpSecretEncrypted) {
+    const value = String(code).trim();
+    if (value.length > 24) return false;
+    try { if (verifyTotp(decryptTotpSecret(user.totpSecretEncrypted), value)) return true; }
+    catch { /* Recovery codes remain usable if the encrypted secret must be restored from backup. */ }
+    return consumeRecoveryCode(user, value);
+  }
+  return false;
+}
 async function sendEmailCode(email, purpose, userId = '') {
   if (!process.env.RESEND_API_KEY || !process.env.PULSE_EMAIL_FROM) throw new Error('Email delivery is not configured on the Pulse server.');
   const now = Date.now();
@@ -90,10 +165,20 @@ async function sendEmailCode(email, purpose, userId = '') {
   window.sentAt = now; window.count += 1; emailRequestWindows.set(addressKey, window); globalEmailWindow.count += 1;
   const id = randomBytes(24).toString('hex');
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-  const purposeText = purpose === 'signup' ? 'verify your email and finish creating your Pulse account' : purpose === 'two-factor' ? 'finish signing in to Pulse' : purpose === 'enable-2fa' ? 'enable two-factor authentication on Pulse' : purpose === 'disable-2fa' ? 'disable two-factor authentication on Pulse' : 'verify your email address';
+  const emailCopy = purpose === 'signup'
+    ? { subject: 'Verify your email for Pulse', heading: 'Verify your email', action: 'finish creating your Pulse account' }
+    : purpose === 'two-factor'
+      ? { subject: 'Your Pulse sign-in code', heading: 'Confirm your sign-in', action: 'sign in to your Pulse account' }
+      : purpose === 'enable-2fa'
+        ? { subject: 'Your Pulse security code', heading: 'Enable email two-factor', action: 'enable email two-factor authentication' }
+        : purpose === 'disable-2fa'
+          ? { subject: 'Your Pulse security code', heading: 'Disable email two-factor', action: 'disable email two-factor authentication' }
+          : { subject: 'Verify your email for Pulse', heading: 'Verify your email', action: 'verify your Pulse email address' };
+  const text = `${emailCopy.heading}\n\nYour Pulse verification code is ${code}.\n\nEnter this code to ${emailCopy.action}. It expires in 10 minutes and works once.\n\nIf you did not request this code, ignore this message. Do not share the code with anyone.`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${emailCopy.heading}</title></head><body style="margin:0;background:#f4f4f7;color:#222;font-family:Arial,Helvetica,sans-serif"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f7"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;background:#fff;border:1px solid #e5e5eb;border-radius:12px"><tr><td style="padding:30px 28px"><h1 style="margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;font-size:22px;line-height:1.3;color:#20212a">${emailCopy.heading}</h1><p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#3d3e48">Enter this code to ${emailCopy.action}:</p><p style="margin:0 0 18px;padding:14px 10px;background:#f4f2ff;border-radius:8px;text-align:center;font-family:Consolas,monospace;font-size:30px;line-height:1.3;font-weight:bold;letter-spacing:6px;color:#5146ba">${code}</p><p style="margin:0 0 14px;font-size:13px;line-height:1.6;color:#555661">This code expires in 10 minutes and works once.</p><p style="margin:0;font-size:13px;line-height:1.6;color:#686a74">If you did not request this code, ignore this message. Do not share the code with anyone.</p></td></tr></table><p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:#777">Pulse account security</p></td></tr></table></body></html>`;
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST', headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: process.env.PULSE_EMAIL_FROM, to: [email], subject: 'Your Pulse verification code', text: `Your Pulse code to ${purposeText} is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`, html: `<p>Your Pulse code to ${purposeText} is:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>It expires in 10 minutes. If you did not request this, you can ignore this email.</p>` }),
+    body: JSON.stringify({ from: process.env.PULSE_EMAIL_FROM, to: [email], ...(process.env.PULSE_EMAIL_REPLY_TO ? { reply_to: process.env.PULSE_EMAIL_REPLY_TO } : {}), subject: emailCopy.subject, text, html }),
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) { console.error('Email provider rejected a verification message with status:', response.status); throw new Error('Pulse could not send your email code. Check the email address and try again.'); }
@@ -108,7 +193,7 @@ async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
-    if (['/api/signup', '/api/login', '/api/auth/email-code'].includes(url.pathname)) {
+    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
       const entry = requestWindows.get(key) || { start: now, count: 0 };
       if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
@@ -169,7 +254,7 @@ async function serve(req, res) {
         }
         const targetUser = db.users.find(candidate => candidate.id === challenge.userId);
         if (challenge.purpose === 'two-factor') {
-          if (!targetUser || !targetUser.twoFactorEnabled || !targetUser.emailVerified || emailKey(targetUser.email) !== challenge.email) return json(res, 401, { error: 'Sign in again and request a new code.' });
+          if (!targetUser || targetUser.totpEnabled || !targetUser.twoFactorEnabled || !targetUser.emailVerified || emailKey(targetUser.email) !== challenge.email) return json(res, 401, { error: 'Sign in again and use your configured two-factor method.' });
           const token = randomBytes(32).toString('hex'); db.sessions = db.sessions.filter(session => session.expiresAt > Date.now()); db.sessions.push({ token, userId: targetUser.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
           return json(res, 200, { token, user: accountUser(targetUser) });
         }
@@ -183,6 +268,20 @@ async function serve(req, res) {
         else if (challenge.purpose === 'disable-2fa') targetUser.twoFactorEnabled = false;
         else return json(res, 400, { error: 'Invalid verification request.' });
         persist(); return json(res, 200, { user: accountUser(targetUser) });
+      }
+      if (url.pathname === '/api/auth/totp/login' && req.method === 'POST') {
+        const challengeId = String(body.challengeId || ''); const challenge = totpLoginChallenges.get(challengeId);
+        if (!challenge || challenge.expiresAt <= Date.now()) { totpLoginChallenges.delete(challengeId); return json(res, 400, { error: 'That authenticator request expired. Sign in again.' }); }
+        const targetUser = db.users.find(candidate => candidate.id === challenge.userId);
+        const valid = targetUser && targetUser.totpEnabled && verifySecondFactor(targetUser, String(body.code || '').trim());
+        if (!valid) {
+          challenge.attempts += 1;
+          if (challenge.attempts >= 5) totpLoginChallenges.delete(challengeId);
+          return json(res, 400, { error: 'That authenticator or recovery code is incorrect.' });
+        }
+        totpLoginChallenges.delete(challengeId);
+        const token = randomBytes(32).toString('hex'); db.sessions = db.sessions.filter(session => session.expiresAt > Date.now()); db.sessions.push({ token, userId: targetUser.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
+        return json(res, 200, { token, user: accountUser(targetUser) });
       }
       if (url.pathname === '/api/signup' && req.method === 'POST') {
         const username = String(body.username || '').trim(); const key = usernameKey(username); const password = String(body.password || '');
@@ -208,8 +307,13 @@ async function serve(req, res) {
         const candidate = user ? await scrypt(String(body.password || ''), user.salt, 64) : Buffer.alloc(64);
         const expected = user ? Buffer.from(user.passwordHash, 'hex') : Buffer.alloc(64);
         if (!user || !timingSafeEqual(candidate, expected)) return json(res, 401, { error: 'Username or password is incorrect.' });
+        if (user.totpEnabled && user.totpSecretEncrypted) {
+          const challengeId = randomBytes(24).toString('hex');
+          totpLoginChallenges.set(challengeId, { userId: user.id, expiresAt: Date.now() + 5 * 60_000, attempts: 0 });
+          return json(res, 200, { requiresTwoFactor: true, method: 'totp', challengeId });
+        }
         if (user.twoFactorEnabled) {
-          try { const challengeId = await sendEmailCode(user.email, 'two-factor', user.id); return json(res, 200, { requiresTwoFactor: true, challengeId }); }
+          try { const challengeId = await sendEmailCode(user.email, 'two-factor', user.id); return json(res, 200, { requiresTwoFactor: true, method: 'email', challengeId }); }
           catch (error) { return json(res, 503, { error: error instanceof Error ? error.message : 'Could not send a two-factor code.' }); }
         }
         const token = randomBytes(32).toString('hex'); db.sessions = db.sessions.filter(s => s.expiresAt > Date.now()); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
@@ -218,6 +322,36 @@ async function serve(req, res) {
       const user = sessionUser(req);
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: accountUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (url.pathname === '/api/auth/totp/setup' && req.method === 'POST') {
+        if (user.totpEnabled) return json(res, 409, { error: 'Authenticator two-factor is already enabled.' });
+        const challengeId = randomBytes(24).toString('hex'); const secret = base32Encode(randomBytes(20));
+        totpSetups.set(challengeId, { userId: user.id, secret, expiresAt: Date.now() + 10 * 60_000, attempts: 0 });
+        return json(res, 200, { challengeId, secret, account: user.emailVerified && user.email ? user.email : user.username, issuer: 'Pulse' });
+      }
+      if (url.pathname === '/api/auth/totp/confirm' && req.method === 'POST') {
+        const challengeId = String(body.challengeId || ''); const setup = totpSetups.get(challengeId);
+        if (!setup || setup.expiresAt <= Date.now() || setup.userId !== user.id) { totpSetups.delete(challengeId); return json(res, 400, { error: 'That authenticator setup expired. Start again.' }); }
+        if (!verifyTotp(setup.secret, String(body.code || '').trim())) {
+          setup.attempts += 1; if (setup.attempts >= 5) totpSetups.delete(challengeId);
+          return json(res, 400, { error: 'That code is incorrect. Check your device time and try again.' });
+        }
+        user.totpSecretEncrypted = encryptTotpSecret(setup.secret); user.totpEnabled = true;
+        const recoveryCodes = Array.from({ length: 10 }, () => randomBytes(8).toString('hex').toUpperCase().match(/.{1,4}/g).join('-'));
+        user.totpRecoveryHashes = recoveryCodes.map(recoveryHash); totpSetups.delete(challengeId); persist();
+        return json(res, 200, { user: accountUser(user), recoveryCodes });
+      }
+      if (url.pathname === '/api/auth/totp/disable' && req.method === 'POST') {
+        const previousFailure = totpDisableAttempts.get(user.id) || { start: Date.now(), count: 0 };
+        if (Date.now() - previousFailure.start > 10 * 60_000) { previousFailure.start = Date.now(); previousFailure.count = 0; }
+        if (previousFailure.count >= 10) return json(res, 429, { error: 'Too many attempts. Wait a few minutes and try again.' });
+        if (!user.totpEnabled || !verifySecondFactor(user, String(body.code || '').trim())) {
+          previousFailure.count += 1; totpDisableAttempts.set(user.id, previousFailure);
+          return json(res, 400, { error: 'Enter a valid authenticator or unused recovery code to disable it.' });
+        }
+        totpDisableAttempts.delete(user.id);
+        user.totpEnabled = false; delete user.totpSecretEncrypted; user.totpRecoveryHashes = []; persist();
+        return json(res, 200, { user: accountUser(user) });
+      }
       if (url.pathname === '/api/profile' && req.method === 'POST') {
         const displayName = String(body.displayName || '').trim();
         if (displayName.length < 1 || displayName.length > 40) return json(res, 400, { error: 'Display name must be 1–40 characters.' });
@@ -294,9 +428,24 @@ async function serve(req, res) {
         if (!f) return json(res, 404, { error: 'That friend request is no longer available.' });
         f.status = 'accepted'; f.acceptedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
+      if (url.pathname === '/api/messages/unread' && req.method === 'GET') {
+        const unread = {};
+        for (const message of db.messages) {
+          if (message.to !== user.id || message.readBy?.includes(user.id)) continue;
+          const sender = db.users.find(candidate => candidate.id === message.from);
+          if (sender && friendship(user.id, sender.id)?.status === 'accepted') unread[sender.id] = (unread[sender.id] || 0) + 1;
+        }
+        return json(res, 200, { unread });
+      }
       if (url.pathname === '/api/messages' && req.method === 'GET') {
         const target = db.users.find(u => u.key === usernameKey(url.searchParams.get('with')));
         if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
+        let markedRead = false;
+        for (const message of db.messages) {
+          if (message.from !== target.id || message.to !== user.id || message.readBy?.includes(user.id)) continue;
+          message.readBy = [...(message.readBy || []), user.id]; markedRead = true;
+        }
+        if (markedRead) persist();
         const items = db.messages.filter(m => (m.from === user.id && m.to === target.id) || (m.from === target.id && m.to === user.id)).slice(-100);
         return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt })) });
       }

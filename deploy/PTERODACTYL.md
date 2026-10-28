@@ -22,7 +22,8 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
    AUTO_UPDATE=true
    RESEND_API_KEY=re_your_server_api_key
-   PULSE_EMAIL_FROM='Pulse <no-reply@your-verified-domain.example>'
+   PULSE_EMAIL_FROM='Pulse <security@overclockd.shop>'
+   PULSE_EMAIL_REPLY_TO=security@overclockd.shop
    ```
 
 3. Create `/autorun.sh` at the guest filesystem root with this content:
@@ -48,16 +49,29 @@ Create `/root/pulse/.env` in the server's File Manager:
 CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
 AUTO_UPDATE=true
 RESEND_API_KEY=re_your_server_api_key
-PULSE_EMAIL_FROM='Pulse <no-reply@your-verified-domain.example>'
+PULSE_EMAIL_FROM='Pulse <security@overclockd.shop>'
+PULSE_EMAIL_REPLY_TO=security@overclockd.shop
 ```
 
-Create a Resend API key and verify the sender domain in Resend, then replace the two email values above. The `PULSE_EMAIL_FROM` value must be quoted because the display name contains shell-sensitive characters. Keep the API key private. Without these values, account creation, email verification, and two-factor code delivery return an email setup error.
+Create a Resend API key and verify the sender domain in Resend, then replace the API key above. Use an address on the verified domain for `PULSE_EMAIL_FROM`; this example uses `security@overclockd.shop`. Set `PULSE_EMAIL_REPLY_TO` to a monitored mailbox. The `PULSE_EMAIL_FROM` value must be quoted because the display name contains shell-sensitive characters. Keep the API key private. Without these values, account creation, email verification, and email two-factor codes return an email setup error.
+
+For deliverability, publish the DKIM and SPF records Resend provides, and add a DMARC TXT record at `_dmarc` (start with `v=DMARC1; p=none;` to monitor alignment without rejecting mail). Remove any conflicting NS delegation at `_dmarc` first. A monitor-only DMARC policy does not guarantee inbox placement; keep bounces and spam complaints low and use a consistent sender address.
 
 Confirm the egg's **PORT 2** field matches the second allocation. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
 
-Pulse allows public account signup at `https://pulse.overclockd.shop`. New accounts must verify an email address with a six-digit code before account creation. Existing members can add/verify an email in Settings, then use that email to sign in. Optional two-factor authentication sends a second six-digit code to the verified email on each new sign-in. Passwords are salted and hashed; account data and encrypted message envelopes are stored in `data/pulse.json`. Back this file up and do not publish it. New direct messages and voice audio are encrypted on the clients. Messages sent before the E2EE update remain plaintext in the database. Each device keeps its private key in browser storage; clearing that storage loses access to messages encrypted for that device. Keys are trusted on first use, so compare a friend's key fingerprint out of band before trusting it. This version does not provide forward secrecy or synchronize keys across devices. The voice token remains separate from account passwords.
+Pulse allows public account signup at `https://pulse.overclockd.shop`. New accounts must verify an email address with a six-digit code before account creation. Existing members can add/verify an email in Settings, then use that email to sign in. Optional email or authenticator-app two-factor authentication adds a second step at sign-in. Authenticator recovery codes are shown once at setup; store them safely. Passwords are salted and hashed; account data and encrypted message envelopes are stored in `data/pulse.json`. Back up this file and `data/totp.key` together; the key decrypts authenticator secrets. New direct messages and voice audio are encrypted on the clients. Messages sent before the E2EE update remain plaintext in the database. Each device keeps its private key in browser storage; clearing that storage loses access to messages encrypted for that device. Keys are trusted on first use, so compare a friend's key fingerprint out of band before trusting it. This version does not provide forward secrecy or synchronize keys across devices. The voice token remains separate from account passwords.
 
 At each boot, the script fetches `origin/main` and fast-forwards the installed checkout when it can. It supports normal Git clones and detached Git checkouts, logs the starting and ending commit IDs, and rebuilds with `npm ci` plus `npm run build` after an update. On first boot it installs/builds if `node_modules` or `dist/index.html` are missing. If startup logs say the folder is not a Git working tree, the uploaded files do not include `.git` metadata, so `AUTO_UPDATE` cannot work until you install a Git checkout. If logs report divergence or a failed fast-forward, restore the server's code folder to a clean checkout and restart; the script will not overwrite local changes.
+
+## Restart the VPS after GitHub pushes
+
+The `Restart Pulse VPS after push` GitHub Actions workflow calls Pterodactyl's Client API to restart the Pulse server after each push to `main`. In repository **Settings → Secrets and variables → Actions**, add these repository secrets:
+
+- `PTERODACTYL_PANEL_URL`: the panel's HTTPS origin, such as `https://panel.example.com` (no path).
+- `PTERODACTYL_SERVER_ID`: the server identifier shown in the panel URL or server details.
+- `PTERODACTYL_API_KEY`: a Pterodactyl client API key with permission to send server power actions. Store it only in GitHub Actions secrets.
+
+The workflow sends `restart` to `POST /api/client/servers/{server}/power`. At startup, Pulse fetches `main` and rebuilds if it changed. Open clients retry voice signaling after the restart; audio can pause briefly while both clients reconnect. The workflow can also be started manually from the repository's **Actions** page.
 
 ## Configure the Cloudflare Tunnel
 
