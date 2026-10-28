@@ -39,7 +39,12 @@ set -a
 source ./.env
 set +a
 
-if [[ "${AUTO_UPDATE:-true}" == "true" ]] && [[ "$(git -C "$app_dir" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]]; then
+auto_update="${AUTO_UPDATE:-true}"
+# Pterodactyl File Manager uploads can leave Windows CRLF endings in .env.
+auto_update="${auto_update//$'\r'/}"
+auto_update="${auto_update//[[:space:]]/}"
+
+if [[ "$auto_update" == "true" ]] && [[ "$(git -C "$app_dir" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]]; then
   branch_name="$(git -C "$app_dir" branch --show-current 2>/dev/null || true)"
   [[ -n "$branch_name" ]] || branch_name="detached HEAD"
   echo "Checking GitHub updates from origin/main (checkout: $branch_name)..."
@@ -69,8 +74,10 @@ if [[ "${AUTO_UPDATE:-true}" == "true" ]] && [[ "$(git -C "$app_dir" rev-parse -
   else
     echo "Git fetch failed; continuing with the currently installed version. Check repository access and network connectivity."
   fi
-elif [[ "${AUTO_UPDATE:-true}" == "true" ]]; then
+elif [[ "$auto_update" == "true" ]]; then
   echo "Git update skipped: $app_dir is not a Git working tree. Install the repo with Git metadata to enable AUTO_UPDATE."
+else
+  echo "Git auto-update is disabled (AUTO_UPDATE=${auto_update}). Set AUTO_UPDATE=true in $app_dir/.env and restart."
 fi
 
 if [[ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]]; then
