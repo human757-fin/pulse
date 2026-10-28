@@ -1,13 +1,13 @@
 # Pulse web, accounts, and voice on Pterodactyl
 
-This setup runs Pulse's website/API and voice signaling in one Pterodactyl server. Allocate **two TCP ports** to this server in the Panel. Set `SERVER_PORT` to the first allocation and set `PULSE_WEB_PORT` to the second allocation in the server's environment/startup variables. Some VPS eggs expose the second port as `SERVER_PORT_2`; the startup script uses that automatically when present. Otherwise, explicitly set `PULSE_WEB_PORT` to the second allocated port. Do not use a random port that is not allocated.
+This setup runs Pulse's website/API and voice signaling in one Pterodactyl VPS egg. Allocate **two TCP ports** to this server in the Panel. The first allocation is provided as `SERVER_PORT`. This egg exposes its second port as the lowercase `port2` variable, shown as **PORT 2** in the server's Startup page. Set **PORT 2** to the second allocated port; Pulse reads that egg variable directly for the website/API listener and exits with an explanatory error if it is blank or invalid. The VPS egg uses the same `port2` value in its port mapping.
 
 In the same Cloudflare Tunnel, configure two Public Hostnames:
 
 | Hostname | Service | Use |
 | --- | --- | --- |
 | `voice.overclockd.shop` | `http://127.0.0.1:SERVER_PORT` | WebSocket signaling at `/voice` |
-| `pulse.overclockd.shop` | `http://127.0.0.1:PULSE_WEB_PORT` | Website and `/api/*` account/chat API |
+| `pulse.overclockd.shop` | `http://127.0.0.1:PORT_2` | Website and `/api/*` account/chat API |
 
 Replace the port names above with the numeric values from the Panel. Both hostnames can route through the same tunnel token/connector. Cloudflare provides HTTPS/WSS at the public hostnames. Voice audio remains WebRTC peer-to-peer unless TURN is separately configured; Cloudflare Tunnel does not carry TURN UDP media.
 
@@ -21,7 +21,6 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```dotenv
    CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
    PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_TOKEN
-   PULSE_WEB_PORT=SECOND_ALLOCATED_PORT
    AUTO_UPDATE=true
    ```
 
@@ -34,7 +33,7 @@ The VPS egg needs its own Linux filesystem at `/home/container`; keep its Startu
    ```
 
    The entrypoint installs Node.js 18+, npm, Git, and `cloudflared` through `apt` if missing, then starts Pulse. It requires a Debian or Ubuntu guest and permission to install apt packages. If apt is unavailable, upload a Linux `cloudflared` binary into `/root/pulse` and install Node.js/npm/Git in the guest first.
-4. Add the two Cloudflare Public Hostnames from the table above, using the actual allocated port numbers. In the desktop client's voice panel, use `wss://voice.overclockd.shop/voice` and enter the same voice token.
+4. In the Pterodactyl Startup page, put the second allocation's numeric value in the egg's **PORT 2** field. Add the two Cloudflare Public Hostnames from the table above, using the actual allocated port numbers. In the desktop client's voice panel, use `wss://voice.overclockd.shop/voice` and enter the same voice token.
 
 The script checks `origin main` on each boot and runs `npm ci` plus `npm run build` when it detects a new commit. Accounts and messages are saved at `/root/pulse/data/pulse.json`; keep that data directory when updating the code and back it up. Logs are under `/root/pulse/logs/`.
 
@@ -47,11 +46,10 @@ Create `/root/pulse/.env` in the server's File Manager:
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=YOUR_CLOUDFLARE_TUNNEL_TOKEN
 PULSE_VOICE_TOKEN=YOUR_RANDOM_SHARED_PULSE_TOKEN
-PULSE_WEB_PORT=SECOND_ALLOCATED_PORT
 AUTO_UPDATE=true
 ```
 
-Generate a strong shared Pulse voice token with `openssl rand -hex 32`. Give this token to your callers; they enter it in the Pulse voice panel. `PULSE_WEB_PORT` must equal the server's second allocated port. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
+Generate a strong shared Pulse voice token with `openssl rand -hex 32`. Give this token to your callers; they enter it in the Pulse voice panel. Confirm the egg's **PORT 2** field matches the second allocation. Keep `.env` private. For a private GitHub repository, install a read-only deploy key at `/home/container/.ssh/github_deploy_key` and ensure the panel/container user can read it.
 
 Pulse currently allows public account signup at `https://pulse.overclockd.shop`. Members create their own username/password, add friends by exact username, accept requests, and send direct messages. Passwords are salted and hashed; account data and chat text are stored in the server's `data/pulse.json`. Back this file up and do not publish it. Chat is **not end-to-end encrypted** in this release, so do not use it for sensitive messages. The voice token remains separate from account passwords.
 

@@ -82,7 +82,11 @@ if [[ ! -f dist/index.html ]]; then
 fi
 
 export PULSE_VOICE_PORT="${SERVER_PORT:-${PULSE_VOICE_PORT:-8787}}"
-export PULSE_WEB_PORT="${SERVER_PORT_2:-${PULSE_WEB_PORT:-8788}}"
+if [[ ! "${port2:-}" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#${port2:-0} > 65535 )); then
+  echo "The VPS egg's PORT 2 variable (port2) is missing or invalid. Set PORT 2 to your second allocated port in the Pterodactyl Startup page."
+  exit 1
+fi
+export PULSE_WEB_PORT="$port2"
 echo "Pulse signaling will listen on 0.0.0.0:${PULSE_VOICE_PORT}"
 echo "Pulse website and API will listen on 0.0.0.0:${PULSE_WEB_PORT}"
 

@@ -5,7 +5,7 @@ import { randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCb);
-const port = Number(process.env.PULSE_WEB_PORT || process.env.SERVER_PORT_2 || 8788);
+const port = Number(process.env.PULSE_WEB_PORT || process.env.port2 || 8788);
 const dataDir = resolve(process.env.PULSE_DATA_DIR || 'data');
 const dbPath = join(dataDir, 'pulse.json');
 const webRoot = resolve(process.env.PULSE_WEB_ROOT || 'dist');
