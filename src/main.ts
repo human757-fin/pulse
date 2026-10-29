@@ -1,5 +1,5 @@
 import './style.css';
-import { decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
+import { decryptFile, decryptMessage, encryptFile, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
 import { VoiceClient, type VoiceState, type VoiceUpdate } from './voice';
 
 type User = { id: string; username: string; email?: string; emailVerified?: boolean; twoFactorEnabled?: boolean; authenticatorEnabled?: boolean; displayName?: string; bio?: string; profileVersion?: string; avatar?: string; banner?: string };
@@ -47,6 +47,7 @@ let totpRecoveryCodes: string[] = [];
 let totpError = '';
 let cryptoReady = false;
 const decryptedCache = new Map<string, string>();
+const attachmentUrlCache = new Map<string, string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; voiceMuted = false; } render(); });
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -135,7 +136,20 @@ async function refreshFriends() {
 const displayName = (user: User) => user.displayName?.trim() || user.username;
 const avatar = (user: User, className = '') => `<span class="avatar ${className}"${user.avatar ? ` style="background-image:url('${esc(user.avatar)}');background-size:cover;background-position:center;color:transparent"` : ''}>${user.avatar ? '' : esc(displayName(user)[0]?.toUpperCase() || '?')}</span>`;
 const attachmentPrefix = 'PULSE_ATTACHMENT_V1:';
+const attachmentV2Prefix = 'PULSE_ATTACHMENT_V2:';
 function messageBody(text: string) {
+  if (text.startsWith(attachmentV2Prefix)) {
+    try {
+      const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number };
+      const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
+      if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isFinite(file.size)) throw new Error('invalid attachment');
+      const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
+      if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('video/') ? 'Load video' : type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
+      if (type.startsWith('video/')) return `<div class="message-attachment"><video class="message-attachment-video" controls preload="none" src="${esc(url)}"></video><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
+      if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
+      return `<div class="message-attachment-file"><span class="attachment-file-icon">${type === 'application/pdf' ? 'PDF' : 'TXT'}</span><a href="${esc(url)}" download="${name}">${name}</a></div>`;
+    } catch { return '<p>Could not display this attachment.</p>'; }
+  }
   if (!text.startsWith(attachmentPrefix)) return `<p>${esc(text)}</p>`;
   try {
     const file = JSON.parse(text.slice(attachmentPrefix.length)) as { name?: string; type?: string; data?: string };
@@ -202,11 +216,19 @@ async function toggleCall() {
 }
 function leaveCall() { voiceRoom = ''; callFriend = undefined; voiceMuted = false; voice.leave(); }
 
-function readAttachment(file: File): Promise<string> {
-  const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain'];
-  if (!allowed.includes(file.type)) return Promise.reject(new Error('Choose an image, PDF, or plain-text file.'));
-  if (file.size > 512 * 1024) return Promise.reject(new Error('Attachments must be 512 KB or smaller.'));
-  return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error('Could not read that attachment.')); reader.readAsDataURL(file); });
+function formatFileSize(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`; }
+const attachmentTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
+async function sendAttachment(file: File, target: User) {
+  const isVideo = file.type.startsWith('video/');
+  if (!attachmentTypes.includes(file.type)) throw new Error('Choose an image, PDF, text file, or MP4/WebM video.');
+  const maxBytes = isVideo ? 8 * 1024 * 1024 : 512 * 1024;
+  if (file.size > maxBytes) throw new Error(`${isVideo ? 'Videos must be 8 MB or smaller' : 'Attachments must be 512 KB or smaller'} (${file.name}).`);
+  const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+  const encryptedFile = await encryptFile(me!.id, target.id, id, await file.arrayBuffer(), fetchFriendKey);
+  await api('/attachments', { method: 'POST', body: JSON.stringify({ to: target.username, id, ...encryptedFile }) });
+  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size });
+  const envelope = await encryptMessage(me!.id, target.id, content, fetchFriendKey);
+  await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope }) });
 }
 
 function render() {
@@ -233,8 +255,8 @@ function render() {
     <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
   <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : '✦'}</span><div><h1>${friend ? esc(displayName(friend)) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
-    ${callBar}<div class="message-area" id="messages">${friend ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>Say hello to ${esc(displayName(friend))}</h2><p>Messages in this conversation will appear here.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend to start chatting, or send a request to someone new.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
-    ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" id="attach-button" title="Attach an image, PDF, or text file" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain" hidden/><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint">🔒 End-to-end encrypted</div></form>` : ''}
+    ${callBar}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${friend ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>Say hello to ${esc(displayName(friend))}</h2><p>Messages in this conversation will appear here.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend to start chatting, or send a request to someone new.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
+    ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" id="attach-button" title="Attach files or videos (8 MB max for video)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint">🔒 E2E encrypted · drop files here · video up to 8 MB</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
 
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
@@ -263,10 +285,38 @@ function render() {
   if (composer && friend) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); if (!text) return; input.disabled = true; try { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); input.value = ''; await refreshMessages(); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus(); } catch (error) { showError(error); input.disabled = false; } };
   app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => app.querySelector<HTMLInputElement>('#attachment-input')?.click());
   app.querySelector<HTMLInputElement>('#attachment-input')?.addEventListener('change', async event => {
-    const picker = event.currentTarget as HTMLInputElement; const file = picker.files?.[0]; picker.value = ''; if (!file || !friend) return;
-    try { const data = await readAttachment(file); const content = attachmentPrefix + JSON.stringify({ name: file.name.slice(0, 120), type: file.type, data }); const envelope = await encryptMessage(me!.id, friend.id, content, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); await refreshMessages(); render(); }
+    const picker = event.currentTarget as HTMLInputElement; const files = Array.from(picker.files || []); picker.value = ''; if (!files.length || !friend) return;
+    const target = friend;
+    try { for (const file of files) await sendAttachment(file, target); await refreshMessages(target); render(); }
     catch (error) { showError(error); }
   });
+  app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
+    const id = button.dataset.attachmentLoad; const target = activeFriend; if (!id || !target || attachmentUrlCache.has(id)) return;
+    button.disabled = true; button.textContent = 'Loading encrypted file…';
+    try {
+      const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
+      const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
+      const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
+      if (!message) throw new Error('Attachment details are missing from this chat.');
+      const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { type: string };
+      attachmentUrlCache.set(id, URL.createObjectURL(new Blob([bytes], { type: meta.type })));
+      render();
+    } catch (error) { showError(error); }
+  }));
+  const main = app.querySelector<HTMLElement>('.main');
+  if (main && friend) {
+    let dragDepth = 0;
+    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types || []).includes('Files');
+    main.addEventListener('dragenter', event => { if (!hasFiles(event)) return; event.preventDefault(); dragDepth++; main.classList.add('drag-active'); });
+    main.addEventListener('dragover', event => { if (hasFiles(event)) { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'; } });
+    main.addEventListener('dragleave', event => { if (!hasFiles(event)) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) main.classList.remove('drag-active'); });
+    main.addEventListener('drop', async event => {
+      if (!hasFiles(event)) return; event.preventDefault(); dragDepth = 0; main.classList.remove('drag-active');
+      const files = Array.from(event.dataTransfer?.files || []); const target = friend;
+      try { for (const file of files) await sendAttachment(file, target); await refreshMessages(target); render(); }
+      catch (error) { showError(error); }
+    });
+  }
   app.querySelector<HTMLButtonElement>('#call-button')?.addEventListener('click', () => void toggleCall());
   app.querySelector<HTMLButtonElement>('#call-mute')?.addEventListener('click', () => { voiceMuted = voice.toggleMute(); render(); });
   app.querySelector<HTMLButtonElement>('#call-leave')?.addEventListener('click', leaveCall);

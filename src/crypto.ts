@@ -97,6 +97,22 @@ export async function decryptMessage(ownId: string, friendId: string, iv: string
   return new TextDecoder().decode(plaintext);
 }
 
+export async function encryptFile(ownId: string, friendId: string, attachmentId: string, plaintext: ArrayBuffer, fetchPeerKey: PeerKeyFetcher): Promise<{ iv: string; ciphertext: string }> {
+  const remote = await peerKey(friendId, fetchPeerKey);
+  const key = await deriveAesKey(friendId, remote, 'pulse-dm-file-v1', [ownId, friendId], false);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = encoder.encode(`pulse-file-v1:${[ownId, friendId].sort().join(':')}:${attachmentId}`);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext);
+  return { iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) };
+}
+
+export async function decryptFile(ownId: string, friendId: string, attachmentId: string, iv: string, ciphertext: string, fetchPeerKey: PeerKeyFetcher): Promise<ArrayBuffer> {
+  const remote = await peerKey(friendId, fetchPeerKey);
+  const key = await deriveAesKey(friendId, remote, 'pulse-dm-file-v1', [ownId, friendId], false);
+  const aad = encoder.encode(`pulse-file-v1:${[ownId, friendId].sort().join(':')}:${attachmentId}`);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv), additionalData: aad }, key, fromBase64(ciphertext));
+}
+
 export async function voiceEncryptionKey(ownId: string, friendId: string, fetchPeerKey: PeerKeyFetcher): Promise<ArrayBuffer> {
   const remote = await peerKey(friendId, fetchPeerKey);
   const key = await deriveAesKey(friendId, remote, 'pulse-voice-audio-v1', [ownId, friendId], true);

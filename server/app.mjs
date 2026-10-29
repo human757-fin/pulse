@@ -22,7 +22,7 @@ function loadTotpKey() {
   catch (error) { if (error.code !== 'EEXIST') throw error; return readFileSync(totpKeyPath); }
 }
 const totpEncryptionKey = loadTotpKey();
-let db = { users: [], sessions: [], friendships: [], messages: [] };
+let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [] };
 if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
   catch { console.error(`Could not parse ${dbPath}; refusing to overwrite it.`); process.exit(1); }
@@ -53,10 +53,10 @@ function json(res, status, value) {
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
 function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
 function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
-function readBody(req) {
+function readBody(req, maxBytes = 2_000_000) {
   return new Promise((resolveBody, reject) => {
     let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 2_000_000) { reject(new Error('Request is too large.')); req.destroy(); } });
+    req.on('data', chunk => { body += chunk; if (body.length > maxBytes) { reject(new Error('Request is too large.')); req.destroy(); } });
     req.on('end', () => { try { resolveBody(JSON.parse(body || '{}')); } catch { reject(new Error('Request must be valid JSON.')); } });
     req.on('error', reject);
   });
@@ -216,7 +216,7 @@ async function serve(req, res) {
       }
     }
     try {
-      const body = ['POST'].includes(req.method) ? await readBody(req) : {};
+      const body = ['POST'].includes(req.method) ? await readBody(req, url.pathname === '/api/attachments' ? 12_000_000 : 2_000_000) : {};
       if (url.pathname === '/api/auth/email-code' && req.method === 'POST') {
         const email = emailKey(body.email);
         const purpose = String(body.purpose || '');
@@ -322,6 +322,21 @@ async function serve(req, res) {
       const user = sessionUser(req);
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: accountUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (url.pathname === '/api/attachments' && req.method === 'POST') {
+        const target = db.users.find(u => u.key === usernameKey(body.to));
+        const id = String(body.id || ''); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
+        if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
+        if (!/^[a-f0-9]{32}$/.test(id) || db.attachments.some(item => item.id === id)) return json(res, 400, { error: 'Attachment ID is invalid.' });
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || Buffer.from(ciphertext, 'base64').length < 17 || Buffer.from(ciphertext, 'base64').length > 8 * 1024 * 1024 + 16 || Buffer.from(ciphertext, 'base64').toString('base64') !== ciphertext || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Encrypted file is invalid or larger than 8 MB.' });
+        db.attachments.push({ id, from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }); persist();
+        return json(res, 201, { ok: true });
+      }
+      const attachmentRequest = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})$/);
+      if (attachmentRequest && req.method === 'GET') {
+        const item = db.attachments.find(file => file.id === attachmentRequest[1]);
+        if (!item || (item.from !== user.id && item.to !== user.id) || friendship(user.id, item.from === user.id ? item.to : item.from)?.status !== 'accepted') return json(res, 404, { error: 'Attachment not found.' });
+        return json(res, 200, { iv: item.iv, ciphertext: item.ciphertext });
+      }
       if (url.pathname === '/api/auth/totp/setup' && req.method === 'POST') {
         if (user.totpEnabled) return json(res, 409, { error: 'Authenticator two-factor is already enabled.' });
         const challengeId = randomBytes(24).toString('hex'); const secret = base32Encode(randomBytes(20));
