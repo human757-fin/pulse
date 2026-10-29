@@ -1,15 +1,21 @@
 import { createServer } from 'node:http';
-import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { extname, join, resolve, sep } from 'node:path';
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCb);
 const port = Number(process.env.PULSE_WEB_PORT || process.env.port2 || 8788);
 const dataDir = resolve(process.env.PULSE_DATA_DIR || 'data');
 const dbPath = join(dataDir, 'pulse.json');
+const attachmentDir = join(dataDir, 'attachments');
+const maxAttachmentBytes = 750_000_000;
+const attachmentChunkBytes = 8 * 1024 * 1024;
 const webRoot = resolve(process.env.PULSE_WEB_ROOT || 'dist');
 mkdirSync(dataDir, { recursive: true });
+mkdirSync(attachmentDir, { recursive: true });
 const totpKeyPath = join(dataDir, 'totp.key');
 function loadTotpKey() {
   if (existsSync(totpKeyPath)) {
@@ -47,7 +53,7 @@ function persist() {
   renameSync(temp, dbPath);
 }
 function json(res, status, value) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS' });
   res.end(JSON.stringify(value));
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
@@ -191,7 +197,7 @@ async function sendEmailCode(email, purpose, userId = '') {
 }
 async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' }); res.end(); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
     if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
@@ -215,8 +221,31 @@ async function serve(req, res) {
         return json(res, 503, { error: 'Pulse could not check GitHub for updates.' });
       }
     }
+    const attachmentChunk = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})\/(\d+)$/);
+    if (attachmentChunk && req.method === 'PUT') {
+      const user = sessionUser(req); const [, id, rawIndex] = attachmentChunk; const item = db.attachments.find(file => file.id === id);
+      if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (!item || !Array.isArray(item.chunks) || item.from !== user.id || friendship(user.id, item.to)?.status !== 'accepted') return json(res, 404, { error: 'Attachment upload not found.' });
+      const index = Number(rawIndex);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount) return json(res, 400, { error: 'Attachment chunk index is invalid.' });
+      if (item.chunks.includes(index)) return json(res, 200, { ok: true });
+      const plainSize = Math.min(item.chunkSize, item.size - index * item.chunkSize); const expectedSize = plainSize + 16;
+      const directory = join(attachmentDir, id); mkdirSync(directory, { recursive: true });
+      const temporaryPath = join(directory, `${index}.tmp-${randomBytes(6).toString('hex')}`); const finalPath = join(directory, `${index}.bin`);
+      let received = 0;
+      const limit = new Transform({ transform(chunk, encoding, callback) { received += chunk.length; if (received > expectedSize) callback(new Error('Attachment chunk is too large.')); else callback(null, chunk); } });
+      try {
+        await pipeline(req, limit, createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }));
+        if (received !== expectedSize) throw new Error('Attachment chunk was incomplete.');
+        renameSync(temporaryPath, finalPath); item.chunks.push(index); persist();
+        return json(res, 201, { ok: true });
+      } catch (error) {
+        rmSync(temporaryPath, { force: true });
+        return json(res, 400, { error: error instanceof Error ? error.message : 'Could not save attachment chunk.' });
+      }
+    }
     try {
-      const body = ['POST'].includes(req.method) ? await readBody(req, url.pathname === '/api/attachments' ? 12_000_000 : 2_000_000) : {};
+      const body = ['POST'].includes(req.method) ? await readBody(req) : {};
       if (url.pathname === '/api/auth/email-code' && req.method === 'POST') {
         const email = emailKey(body.email);
         const purpose = String(body.purpose || '');
@@ -324,12 +353,23 @@ async function serve(req, res) {
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
       if (url.pathname === '/api/attachments' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to));
-        const id = String(body.id || ''); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
+        const id = String(body.id || ''); const size = Number(body.size); const ivPrefix = String(body.ivPrefix || '');
         if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
         if (!/^[a-f0-9]{32}$/.test(id) || db.attachments.some(item => item.id === id)) return json(res, 400, { error: 'Attachment ID is invalid.' });
-        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || Buffer.from(ciphertext, 'base64').length < 17 || Buffer.from(ciphertext, 'base64').length > 8 * 1024 * 1024 + 16 || Buffer.from(ciphertext, 'base64').toString('base64') !== ciphertext || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Encrypted file is invalid or larger than 8 MB.' });
-        db.attachments.push({ id, from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }); persist();
+        const prefix = Buffer.from(ivPrefix, 'base64');
+        if (!Number.isSafeInteger(size) || size <= 0 || size > maxAttachmentBytes || prefix.length !== 8 || prefix.toString('base64') !== ivPrefix) return json(res, 400, { error: 'Attachment is invalid or larger than 750 MB.' });
+        const chunkCount = Math.ceil(size / attachmentChunkBytes);
+        db.attachments.push({ id, from: user.id, to: target.id, size, ivPrefix, chunkSize: attachmentChunkBytes, chunkCount, chunks: [], createdAt: new Date().toISOString() }); persist();
+        mkdirSync(join(attachmentDir, id), { recursive: true });
         return json(res, 201, { ok: true });
+      }
+      const attachmentChunkGet = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})\/(\d+)$/);
+      if (attachmentChunkGet && req.method === 'GET') {
+        const [, id, rawIndex] = attachmentChunkGet; const item = db.attachments.find(file => file.id === id); const index = Number(rawIndex);
+        if (!item || !Array.isArray(item.chunks) || !Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount || !item.chunks.includes(index) || (item.from !== user.id && item.to !== user.id) || friendship(user.id, item.from === user.id ? item.to : item.from)?.status !== 'accepted') return json(res, 404, { error: 'Attachment chunk not found.' });
+        const filePath = join(attachmentDir, id, `${index}.bin`); const plainSize = Math.min(item.chunkSize, item.size - index * item.chunkSize);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': plainSize + 16, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'X-Content-Type-Options': 'nosniff' });
+        return createReadStream(filePath).on('error', error => { console.error('Failed reading attachment chunk:', error.message); if (!res.headersSent) json(res, 404, { error: 'Attachment chunk not found.' }); else res.destroy(error); }).pipe(res);
       }
       const attachmentRequest = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})$/);
       if (attachmentRequest && req.method === 'GET') {

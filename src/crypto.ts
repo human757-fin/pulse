@@ -113,6 +113,25 @@ export async function decryptFile(ownId: string, friendId: string, attachmentId:
   return crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv), additionalData: aad }, key, fromBase64(ciphertext));
 }
 
+export async function createAttachmentCipher(ownId: string, friendId: string, fetchPeerKey: PeerKeyFetcher) {
+  const remote = await peerKey(friendId, fetchPeerKey);
+  const key = await deriveAesKey(friendId, remote, 'pulse-dm-file-chunks-v1', [ownId, friendId], false);
+  const participants = [ownId, friendId].sort().join(':');
+  const makeIv = (prefix: Uint8Array, index: number) => {
+    if (prefix.length !== 8 || !Number.isInteger(index) || index < 0 || index > 0xffffffff) throw new Error('Attachment encryption metadata is invalid.');
+    const iv = new Uint8Array(12); iv.set(prefix); new DataView(iv.buffer).setUint32(8, index, false); return iv;
+  };
+  const aad = (attachmentId: string, index: number) => encoder.encode(`pulse-file-chunk-v1:${participants}:${attachmentId}:${index}`);
+  return {
+    async encrypt(attachmentId: string, ivPrefix: Uint8Array, index: number, plaintext: ArrayBuffer): Promise<ArrayBuffer> {
+      return crypto.subtle.encrypt({ name: 'AES-GCM', iv: makeIv(ivPrefix, index), additionalData: aad(attachmentId, index) }, key, plaintext);
+    },
+    async decrypt(attachmentId: string, ivPrefix: Uint8Array, index: number, ciphertext: ArrayBuffer): Promise<ArrayBuffer> {
+      return crypto.subtle.decrypt({ name: 'AES-GCM', iv: makeIv(ivPrefix, index), additionalData: aad(attachmentId, index) }, key, ciphertext);
+    },
+  };
+}
+
 export async function voiceEncryptionKey(ownId: string, friendId: string, fetchPeerKey: PeerKeyFetcher): Promise<ArrayBuffer> {
   const remote = await peerKey(friendId, fetchPeerKey);
   const key = await deriveAesKey(friendId, remote, 'pulse-voice-audio-v1', [ownId, friendId], true);

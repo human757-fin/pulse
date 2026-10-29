@@ -1,5 +1,5 @@
 import './style.css';
-import { decryptFile, decryptMessage, encryptFile, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
+import { createAttachmentCipher, decryptFile, decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
 import { VoiceClient, type VoiceState, type VoiceUpdate } from './voice';
 
 type User = { id: string; username: string; email?: string; emailVerified?: boolean; twoFactorEnabled?: boolean; authenticatorEnabled?: boolean; displayName?: string; bio?: string; profileVersion?: string; avatar?: string; banner?: string };
@@ -140,9 +140,9 @@ const attachmentV2Prefix = 'PULSE_ATTACHMENT_V2:';
 function messageBody(text: string) {
   if (text.startsWith(attachmentV2Prefix)) {
     try {
-      const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number };
+      const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number; chunkCount?: number; ivPrefix?: string };
       const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
-      if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isFinite(file.size)) throw new Error('invalid attachment');
+      if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isSafeInteger(file.size) || file.size! <= 0 || file.size! > maxAttachmentBytes || (file.chunkCount !== undefined && (!Number.isSafeInteger(file.chunkCount) || file.chunkCount !== Math.ceil(file.size! / attachmentChunkBytes) || !file.ivPrefix || bytesFromBase64(file.ivPrefix).length !== 8))) throw new Error('invalid attachment');
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
       if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('video/') ? 'Load video' : type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
       if (type.startsWith('video/')) return `<div class="message-attachment"><video class="message-attachment-video" controls preload="none" src="${esc(url)}"></video><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
@@ -216,17 +216,38 @@ async function toggleCall() {
 }
 function leaveCall() { voiceRoom = ''; callFriend = undefined; voiceMuted = false; voice.leave(); }
 
+const maxAttachmentBytes = 750_000_000;
+const attachmentChunkBytes = 8 * 1024 * 1024;
 function formatFileSize(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`; }
+function base64Bytes(bytes: Uint8Array) { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary); }
+function bytesFromBase64(value: string) { return Uint8Array.from(atob(value), character => character.charCodeAt(0)); }
+async function rawAttachmentRequest(path: string, method: 'GET' | 'PUT', body?: ArrayBuffer): Promise<ArrayBuffer> {
+  const response = await fetch(`${apiBase}/api${path}`, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/octet-stream' } : {}) }, ...(body ? { body } : {}) });
+  if (!response.ok) { const result = await response.json().catch(() => ({})); throw new Error(result.error || `Attachment transfer failed (${response.status}).`); }
+  return response.arrayBuffer();
+}
 const attachmentTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
-async function sendAttachment(file: File, target: User) {
-  const isVideo = file.type.startsWith('video/');
+async function sendAttachment(file: File, target: User, onProgress?: (uploaded: number, total: number) => void) {
   if (!attachmentTypes.includes(file.type)) throw new Error('Choose an image, PDF, text file, or MP4/WebM video.');
-  const maxBytes = isVideo ? 8 * 1024 * 1024 : 512 * 1024;
-  if (file.size > maxBytes) throw new Error(`${isVideo ? 'Videos must be 8 MB or smaller' : 'Attachments must be 512 KB or smaller'} (${file.name}).`);
+  if (file.size > maxAttachmentBytes) throw new Error(`Attachments must be 750 MB or smaller (${file.name}).`);
+  if (!file.size) throw new Error('Empty files cannot be sent.');
   const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
-  const encryptedFile = await encryptFile(me!.id, target.id, id, await file.arrayBuffer(), fetchFriendKey);
-  await api('/attachments', { method: 'POST', body: JSON.stringify({ to: target.username, id, ...encryptedFile }) });
-  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size });
+  const ivPrefix = crypto.getRandomValues(new Uint8Array(8)); const ivPrefixBase64 = base64Bytes(ivPrefix);
+  const chunkCount = Math.ceil(file.size / attachmentChunkBytes);
+  await api('/attachments', { method: 'POST', body: JSON.stringify({ to: target.username, id, size: file.size, ivPrefix: ivPrefixBase64 }) });
+  const cipher = await createAttachmentCipher(me!.id, target.id, fetchFriendKey);
+  let nextIndex = 0; let uploaded = 0;
+  const uploadWorker = async () => {
+    while (nextIndex < chunkCount) {
+      const index = nextIndex++;
+      const start = index * attachmentChunkBytes;
+      const encrypted = await cipher.encrypt(id, ivPrefix, index, await file.slice(start, Math.min(start + attachmentChunkBytes, file.size)).arrayBuffer());
+      await rawAttachmentRequest(`/attachments/${id}/${index}`, 'PUT', encrypted);
+      uploaded += Math.min(attachmentChunkBytes, file.size - start); onProgress?.(uploaded, file.size);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, chunkCount) }, uploadWorker));
+  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64 });
   const envelope = await encryptMessage(me!.id, target.id, content, fetchFriendKey);
   await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope }) });
 }
@@ -256,7 +277,7 @@ function render() {
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
   <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : '✦'}</span><div><h1>${friend ? esc(displayName(friend)) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
     ${callBar}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${friend ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>Say hello to ${esc(displayName(friend))}</h2><p>Messages in this conversation will appear here.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend to start chatting, or send a request to someone new.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
-    ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" id="attach-button" title="Attach files or videos (8 MB max for video)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint">🔒 E2E encrypted · drop files here · video up to 8 MB</div></form>` : ''}
+    ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint" id="attachment-status">🔒 E2E encrypted · drop files here · 750 MB max</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
 
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
@@ -287,19 +308,29 @@ function render() {
   app.querySelector<HTMLInputElement>('#attachment-input')?.addEventListener('change', async event => {
     const picker = event.currentTarget as HTMLInputElement; const files = Array.from(picker.files || []); picker.value = ''; if (!files.length || !friend) return;
     const target = friend;
-    try { for (const file of files) await sendAttachment(file, target); await refreshMessages(target); render(); }
+    try { for (const file of files) await sendAttachment(file, target, (uploaded, total) => { const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`; }); await refreshMessages(target); render(); }
     catch (error) { showError(error); }
   });
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentLoad; const target = activeFriend; if (!id || !target || attachmentUrlCache.has(id)) return;
     button.disabled = true; button.textContent = 'Loading encrypted file…';
     try {
-      const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
-      const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
       const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
       if (!message) throw new Error('Attachment details are missing from this chat.');
-      const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { type: string };
-      attachmentUrlCache.set(id, URL.createObjectURL(new Blob([bytes], { type: meta.type })));
+      const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { type: string; chunkCount?: number; ivPrefix?: string };
+      if (meta.chunkCount && meta.ivPrefix) {
+        const cipher = await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
+        for (let start = 0; start < meta.chunkCount; start += 3) {
+          const batch = Array.from({ length: Math.min(3, meta.chunkCount - start) }, (_, offset) => start + offset);
+          const encryptedChunks = await Promise.all(batch.map(index => rawAttachmentRequest(`/attachments/${id}/${index}`, 'GET')));
+          for (let offset = 0; offset < batch.length; offset++) parts.push(new Uint8Array(await cipher.decrypt(id, ivPrefix, batch[offset], encryptedChunks[offset])));
+        }
+        attachmentUrlCache.set(id, URL.createObjectURL(new Blob(parts, { type: meta.type })));
+      } else {
+        const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
+        const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
+        attachmentUrlCache.set(id, URL.createObjectURL(new Blob([bytes], { type: meta.type })));
+      }
       render();
     } catch (error) { showError(error); }
   }));
@@ -313,7 +344,7 @@ function render() {
     main.addEventListener('drop', async event => {
       if (!hasFiles(event)) return; event.preventDefault(); dragDepth = 0; main.classList.remove('drag-active');
       const files = Array.from(event.dataTransfer?.files || []); const target = friend;
-      try { for (const file of files) await sendAttachment(file, target); await refreshMessages(target); render(); }
+      try { for (const file of files) await sendAttachment(file, target, (uploaded, total) => { const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`; }); await refreshMessages(target); render(); }
       catch (error) { showError(error); }
     });
   }
