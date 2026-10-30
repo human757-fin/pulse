@@ -23,6 +23,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install frontend dependencies
         run: npm ci
+      - name: Set release name
+        id: release-meta
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tag_message="$(git for-each-ref --format='%(contents:subject)' "refs/tags/${GITHUB_REF_NAME}")"
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+            kind="Pre"
+            if [[ "${tag_message,,}" == hotfix:* ]]; then kind="Hotfix"; fi
+            release_name="Pulse ${BASH_REMATCH[1]} ${kind} ${BASH_REMATCH[2]}"
+          elif [[ "${tag_message,,}" == hotfix:* ]]; then
+            release_name="Pulse ${version} Hotfix"
+          else
+            release_name="Pulse ${version}"
+          fi
+          echo "name=${release_name}" >> "$GITHUB_OUTPUT"
       - name: Build and publish signed Windows installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -30,7 +46,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: Pulse ${{ github.ref_name }}
+          releaseName: ${{ steps.release-meta.outputs.name }}
           releaseBody: Signed Windows installers and update metadata for Pulse.
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

@@ -77,15 +77,41 @@ function usernameKey(value) { return String(value || '').trim().toLowerCase(); }
 function usernameTaken(key) { return db.users.some(user => usernameKey(user.username || user.key) === key); }
 const emailKey = value => String(value || '').trim().toLowerCase();
 const emailTaken = value => db.users.some(user => user.email && emailKey(user.email) === emailKey(value));
-async function getReleaseUpdate(channel, target) {
-  const cacheKey = `${channel}:${target}`;
+function parseReleaseVersion(value) {
+  const match = String(value || '').match(/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+  if (!match) return undefined;
+  const numbers = match.slice(1, 4).map(Number);
+  if (!numbers.every(Number.isSafeInteger)) return undefined;
+  return { major: numbers[0], minor: numbers[1], patch: numbers[2], prerelease: match[4]?.split('.') || [] };
+}
+function compareReleaseVersions(left, right) {
+  for (const field of ['major', 'minor', 'patch']) if (left[field] !== right[field]) return left[field] < right[field] ? -1 : 1;
+  const a = left.prerelease; const b = right.prerelease;
+  if (!a.length || !b.length) return a.length === b.length ? 0 : a.length ? -1 : 1;
+  for (let index = 0; index < Math.min(a.length, b.length); index++) {
+    if (a[index] === b[index]) continue;
+    const aNumeric = /^\d+$/.test(a[index]); const bNumeric = /^\d+$/.test(b[index]);
+    if (aNumeric && bNumeric) return Number(a[index]) < Number(b[index]) ? -1 : 1;
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a[index] < b[index] ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+async function getReleaseUpdate(channel, target, currentVersion) {
+  const cacheKey = `${channel}:${target}:${currentVersion}`;
   const cached = updaterCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.update;
   const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Pulse-Updater', 'X-GitHub-Api-Version': '2022-11-28' };
   const releasesResponse = await fetch('https://api.github.com/repos/human757-fin/pulse/releases?per_page=30', { headers, signal: AbortSignal.timeout(10_000) });
   if (!releasesResponse.ok) throw new Error(`GitHub releases request failed (${releasesResponse.status}).`);
   const releases = await releasesResponse.json();
-  const release = releases.find(item => !item.draft && Boolean(item.prerelease) === (channel === 'beta'));
+  const current = parseReleaseVersion(currentVersion);
+  const candidates = releases
+    .filter(item => !item.draft && (channel === 'beta' || !item.prerelease))
+    .map(item => ({ item, version: parseReleaseVersion(item.tag_name) }))
+    .filter(entry => entry.version && (!current || compareReleaseVersions(entry.version, current) > 0))
+    .sort((a, b) => compareReleaseVersions(b.version, a.version));
+  const release = candidates[0]?.item;
   if (!release) { updaterCache.set(cacheKey, { update: null, expiresAt: Date.now() + 5 * 60_000 }); return null; }
   const manifestAsset = release.assets?.find(asset => asset.name === 'latest.json');
   if (!manifestAsset?.browser_download_url) throw new Error('Release has no signed update manifest.');
@@ -209,11 +235,11 @@ async function serve(req, res) {
     if (url.pathname === '/api/health' && req.method === 'GET') return json(res, 200, { ok: true });
     const updaterRequest = url.pathname.match(/^\/api\/updater\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (updaterRequest && req.method === 'GET') {
-      const [, operatingSystem, arch] = updaterRequest;
+      const [, operatingSystem, arch, currentVersion] = updaterRequest;
       if (operatingSystem !== 'windows' || arch !== 'x86_64') return json(res, 404, { error: 'No updater is available for this platform.' });
       const channel = req.headers['x-pulse-channel'] === 'beta' ? 'beta' : 'stable';
       try {
-        const update = await getReleaseUpdate(channel, `${operatingSystem}-${arch}`);
+        const update = await getReleaseUpdate(channel, `${operatingSystem}-${arch}`, decodeURIComponent(currentVersion));
         if (!update) { res.writeHead(204, { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }); res.end(); return; }
         return json(res, 200, update);
       } catch (error) {
