@@ -1,8 +1,9 @@
 export type VoiceState = 'disconnected' | 'connecting' | 'reconnecting' | 'waiting' | 'connected' | 'error';
-export type VoiceUpdate = { state: VoiceState; message: string; peers: string[] };
+export type VoiceUpdate = { state: VoiceState; message: string; peers: string[]; sharingScreen: boolean; videoPeers: string[] };
+export type ScreenShareSettings = { width: number; height: number; fps: number };
 
 type Signal = { type: string; [key: string]: unknown };
-const voiceProtocol = 'pulse-dtls-srtp-v1';
+const voiceProtocol = 'pulse-dtls-srtp-screen-v2';
 type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer };
 
 export class VoiceClient {
@@ -10,6 +11,9 @@ export class VoiceClient {
   private stream?: MediaStream;
   private peers = new Map<string, RTCPeerConnection>();
   private audioElements = new Map<string, HTMLAudioElement>();
+  private videoSenders = new Map<string, RTCRtpSender>();
+  private remoteVideos = new Map<string, MediaStream>();
+  private screenStream?: MediaStream;
   private stopped = false;
   private peerNames = new Map<string, string>();
   private pendingIce = new Map<string, RTCIceCandidateInit[]>();
@@ -22,6 +26,8 @@ export class VoiceClient {
   private joinOptions?: JoinOptions;
   private reconnectTimer?: number;
   private reconnectAttempts = 0;
+  private currentState: VoiceState = 'disconnected';
+  private currentMessage = 'Not connected';
 
   constructor(private onUpdate: (update: VoiceUpdate) => void) {}
 
@@ -97,6 +103,8 @@ export class VoiceClient {
     this.socket?.close();
     this.socket = undefined;
     this.clearPeers();
+    this.screenStream?.getTracks().forEach(track => { track.onended = null; track.stop(); });
+    this.screenStream = undefined;
     this.voiceKey = undefined;
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
@@ -108,6 +116,42 @@ export class VoiceClient {
     this.muted = !this.muted;
     this.stream?.getAudioTracks().forEach(track => { track.enabled = !this.muted; });
     return this.muted;
+  }
+
+  getLocalScreenStream() { return this.screenStream; }
+  getRemoteScreenStream(peerId: string) { return this.remoteVideos.get(peerId); }
+
+  async startScreenShare(settings: ScreenShareSettings) {
+    if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen sharing is unavailable. Update Pulse and Microsoft Edge WebView2.');
+    if (this.screenStream) return;
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } }, audio: false });
+    const track = stream.getVideoTracks()[0];
+    if (!track) { stream.getTracks().forEach(item => item.stop()); throw new Error('The selected screen did not provide a video track.'); }
+    try {
+      await track.applyConstraints({ width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } });
+      await Promise.all([...this.videoSenders.values()].map(sender => sender.replaceTrack(track)));
+      this.screenStream = stream;
+      track.onended = () => { void this.stopScreenShare(); };
+      this.emitCurrent();
+    } catch (error) {
+      stream.getTracks().forEach(item => item.stop());
+      throw new Error(error instanceof Error ? `Could not start screen sharing: ${error.message}` : 'Could not start screen sharing.');
+    }
+  }
+
+  async updateScreenShareSettings(settings: ScreenShareSettings) {
+    const track = this.screenStream?.getVideoTracks()[0];
+    if (track) await track.applyConstraints({ width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } });
+  }
+
+  async stopScreenShare() {
+    const stream = this.screenStream;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0]; if (track) track.onended = null;
+    this.screenStream = undefined;
+    await Promise.all([...this.videoSenders.values()].map(sender => sender.replaceTrack(null).catch(() => undefined)));
+    stream.getTracks().forEach(item => item.stop());
+    this.emitCurrent();
   }
 
   private async handle(msg: Signal) {
@@ -136,6 +180,8 @@ export class VoiceClient {
       const audio = this.audioElements.get(id);
       audio?.pause();
       this.audioElements.delete(id);
+      this.remoteVideos.delete(id);
+      this.videoSenders.delete(id);
       this.peerNames.delete(id);
       this.emit('waiting', 'They left voice. Waiting for someone to join…');
       return;
@@ -145,6 +191,7 @@ export class VoiceClient {
       const description = msg.description as RTCSessionDescriptionInit;
       if (!await this.verifyDescription(description, String(msg.voiceProof || ''))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       const pc = this.makePeer(from);
+      await this.preparePeerVideo(from);
       await pc.setRemoteDescription(description);
       await this.flushIce(from, pc);
       const answer = await pc.createAnswer();
@@ -173,6 +220,7 @@ export class VoiceClient {
 
   private async makeOffer(id: string) {
     const pc = this.makePeer(id);
+    await this.preparePeerVideo(id);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     this.send({ type: 'offer', to: id, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!) });
@@ -248,6 +296,8 @@ export class VoiceClient {
     this.peers.clear();
     this.audioElements.forEach(audio => { audio.pause(); audio.srcObject = null; audio.remove(); });
     this.audioElements.clear();
+    this.remoteVideos.clear();
+    this.videoSenders.clear();
     this.peerNames.clear();
     this.pendingIce.clear();
   }
@@ -263,11 +313,19 @@ export class VoiceClient {
     if (old) return old;
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, ...this.turnServers], iceTransportPolicy: this.iceTransportPolicy });
     this.peers.set(id, pc);
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    this.videoSenders.set(id, videoTransceiver.sender);
     this.stream?.getAudioTracks().forEach(track => {
       pc.addTrack(track, this.stream!);
     });
     pc.onicecandidate = event => { if (event.candidate) this.send({ type: 'ice', to: id, candidate: event.candidate }); };
     pc.ontrack = event => {
+      if (event.track.kind === 'video') {
+        this.remoteVideos.set(id, new MediaStream([event.track]));
+        event.track.onended = () => { this.remoteVideos.delete(id); this.emitCurrent(); };
+        this.emitCurrent();
+        return;
+      }
       let audio = this.audioElements.get(id);
       if (!audio) {
         audio = document.createElement('audio');
@@ -290,7 +348,13 @@ export class VoiceClient {
     return pc;
   }
 
+  private async preparePeerVideo(id: string) {
+    const track = this.screenStream?.getVideoTracks()[0]; const sender = this.videoSenders.get(id);
+    if (track && sender && sender.track !== track) await sender.replaceTrack(track);
+  }
+
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
-  private emit(state: VoiceState, message: string) { this.onUpdate({ state, message, peers: [...this.peerNames.values()] }); }
+  private emit(state: VoiceState, message: string) { this.currentState = state; this.currentMessage = message; this.onUpdate({ state, message, peers: [...this.peerNames.values()], sharingScreen: !!this.screenStream, videoPeers: [...this.remoteVideos.keys()] }); }
+  private emitCurrent() { this.emit(this.currentState, this.currentMessage); }
   private fail(message: string) { if (this.stopped) return; this.emit('error', message); this.leave(); this.emit('error', message); }
 }
