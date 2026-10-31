@@ -23,6 +23,8 @@ let blockedProfiles: User[] = [];
 let activeGroup: GroupChat | undefined;
 let creatingGroup = false;
 let groupPreselectedMemberIds: string[] = [];
+let showingGroupAddMenu = false;
+let noticeTimer: number | undefined;
 let voiceState: VoiceState = 'disconnected';
 let voiceMessage = 'Not connected';
 let voicePeers: string[] = [];
@@ -222,8 +224,8 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { activeGroup = undefined; activeFriend = friend; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
-function openGroup(group: GroupChat) { activeFriend = undefined; activeGroup = group; messages = []; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { showingGroupAddMenu = false; activeGroup = undefined; activeFriend = friend; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { showingGroupAddMenu = false; activeFriend = undefined; activeGroup = group; messages = []; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
 
 async function toggleCall() {
@@ -307,10 +309,15 @@ function render() {
     ${friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
     <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
-  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
+  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend ? `<div class="add-to-group-wrap"><button type="button" id="add-to-group-button" class="call-button" aria-expanded="${showingGroupAddMenu}">Add to group</button>${showingGroupAddMenu ? `<div class="add-to-group-menu" role="menu">${groups.filter(item => !item.members.some(member => member.id === friend.id)).map(item => `<button type="button" role="menuitem" data-add-current-group="${esc(item.id)}">${esc(item.name)}</button>`).join('')}<button type="button" role="menuitem" class="create-group-option" id="create-group-with-friend">＋ Create group with ${esc(displayName(friend))}</button></div>` : ''}</div>` : ''}${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
     ${callBar}${callScreenStage}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
     ${conversation ? `<form id="composer" class="composer">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend ? friend.username : group!.name)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint" id="attachment-status">🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
+  if (notice) {
+    window.clearTimeout(noticeTimer);
+    const message = notice;
+    noticeTimer = window.setTimeout(() => { if (notice === message) { notice = ''; app.querySelector('.toast')?.classList.remove('show'); } }, 3500);
+  }
 
   const localScreenVideo = app.querySelector<HTMLVideoElement>('[data-local-screen]');
   if (localScreenVideo) { localScreenVideo.srcObject = voice.getLocalScreenStream() || null; void localScreenVideo.play().catch(() => undefined); }
@@ -385,6 +392,9 @@ function render() {
     });
   }
   app.querySelector<HTMLButtonElement>('#call-button')?.addEventListener('click', () => void toggleCall());
+  app.querySelector<HTMLButtonElement>('#add-to-group-button')?.addEventListener('click', () => { showingGroupAddMenu = !showingGroupAddMenu; render(); });
+  app.querySelectorAll<HTMLButtonElement>('[data-add-current-group]').forEach(button => button.addEventListener('click', () => { showingGroupAddMenu = false; if (friend) void addFriendToGroup(button.dataset.addCurrentGroup!, friend.id); }));
+  app.querySelector<HTMLButtonElement>('#create-group-with-friend')?.addEventListener('click', () => { showingGroupAddMenu = false; if (friend) void createGroupWithFriend(friend); });
   app.querySelector<HTMLButtonElement>('#call-mute')?.addEventListener('click', () => { voiceMuted = voice.toggleMute(); render(); });
   app.querySelector<HTMLButtonElement>('#call-leave')?.addEventListener('click', leaveCall);
   app.querySelector<HTMLButtonElement>('#screen-share-button')?.addEventListener('click', async () => {
@@ -441,6 +451,14 @@ async function addFriendToGroup(groupId: string, userId: string) {
     closeUserPopup(); render(); notice = 'Friend added to the group.'; render();
   } catch (error) { showError(error); }
 }
+async function createGroupWithFriend(friend: User) {
+  if (!me) return;
+  const name = `${displayName(me)} & ${displayName(friend)}`.slice(0, 60);
+  try {
+    const result = await api<{ group: GroupChat }>('/groups', { method: 'POST', body: JSON.stringify({ name, memberIds: [friend.id] }) });
+    groups = [...groups, result.group]; showingGroupAddMenu = false; openGroup(result.group); notice = `Group chat created with ${displayName(friend)}.`; render();
+  } catch (error) { showError(error); }
+}
 app.addEventListener('contextmenu', event => {
   const element = (event.target as HTMLElement).closest<HTMLElement>('[data-user-context], [data-friend], [data-group]');
   if (element?.dataset.group && !element.dataset.userContext) {
@@ -469,17 +487,16 @@ app.addEventListener('contextmenu', event => {
   window.setTimeout(() => document.addEventListener('pointerdown', closeMenu), 0);
   menu.querySelector('[data-context-action="profile"]')?.addEventListener('click', () => { menu.remove(); void openProfileCard(person.id); });
   menu.querySelector('[data-context-action="message"]')?.addEventListener('click', () => { menu.remove(); if (friend) openFriend(friend); });
-  menu.querySelector('[data-context-action="create-group"]')?.addEventListener('click', async () => {
-    menu.remove(); if (!friend || !me) return;
-    const name = `${displayName(me)} & ${displayName(friend)}`.slice(0, 60);
-    try { const result = await api<{ group: GroupChat }>('/groups', { method: 'POST', body: JSON.stringify({ name, memberIds: [friend.id] }) }); groups = [...groups, result.group]; openGroup(result.group); notice = `Group chat created with ${displayName(friend)}.`; render(); }
-    catch (error) { showError(error); }
-  });
+  menu.querySelector('[data-context-action="create-group"]')?.addEventListener('click', () => { menu.remove(); if (friend) void createGroupWithFriend(friend); });
   menu.querySelector('[data-context-action="groups"]')?.addEventListener('click', () => { const submenu = menu.querySelector<HTMLElement>('.context-submenu'); if (submenu) submenu.hidden = !submenu.hidden; });
   menu.querySelectorAll<HTMLButtonElement>('[data-add-group]').forEach(button => button.addEventListener('click', () => { menu.remove(); void addFriendToGroup(button.dataset.addGroup!, person.id); }));
   menu.querySelector('[data-context-action="block"]')?.addEventListener('click', () => { menu.remove(); void toggleBlock(person.id); });
 });
-app.addEventListener('click', event => { const menu = app.querySelector('.pulse-context-menu'); if (menu && !menu.contains(event.target as Node)) menu.remove(); });
+app.addEventListener('click', event => {
+  const target = event.target as HTMLElement;
+  const menu = app.querySelector('.pulse-context-menu'); if (menu && !menu.contains(target)) menu.remove();
+  const addMenu = app.querySelector('.add-to-group-menu'); if (showingGroupAddMenu && addMenu && !addMenu.contains(target) && !target.closest('#add-to-group-button')) { showingGroupAddMenu = false; addMenu.remove(); }
+});
 
 async function signOut() {
   try { await api('/logout', { method: 'POST', body: '{}' }); } catch {}
