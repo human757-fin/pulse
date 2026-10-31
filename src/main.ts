@@ -174,8 +174,9 @@ function messageBody(text: string) {
       const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
       if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isSafeInteger(file.size) || file.size! <= 0 || file.size! > maxAttachmentBytes || (file.chunkCount !== undefined && (!Number.isSafeInteger(file.chunkCount) || file.chunkCount !== Math.ceil(file.size! / attachmentChunkBytes) || !file.ivPrefix || bytesFromBase64(file.ivPrefix).length !== 8))) throw new Error('invalid attachment');
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
-      if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('video/') ? 'Load video' : type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
-      if (type.startsWith('video/')) return `<div class="message-attachment"><video class="message-attachment-video" controls preload="metadata" playsinline aria-label="${name}"><source src="${esc(url)}" type="${esc(type)}"></video><p class="video-playback-error" hidden></p><a class="attachment-name" href="${esc(url)}" download="${name}">Download ${name}</a></div>`;
+      if (!url && type.startsWith('video/')) return `<div class="video-preview-card"><div class="video-preview-thumb"><span>▶</span><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small>${formatFileSize(file.size!)} · encrypted</small><div class="video-preview-actions"><button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">Preview</button><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
+      if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
+      if (type.startsWith('video/')) return `<div class="message-attachment"><video class="message-attachment-video" controls preload="metadata" playsinline webkit-playsinline aria-label="${name}" src="${esc(url)}"></video><p class="video-playback-error" hidden></p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
       if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
       return `<div class="message-attachment-file"><span class="attachment-file-icon">${type === 'application/pdf' ? 'PDF' : 'TXT'}</span><a href="${esc(url)}" download="${name}">${name}</a></div>`;
     } catch { return '<p>Could not display this attachment.</p>'; }
@@ -300,6 +301,38 @@ async function sendAttachment(file: File, target: User, onProgress?: (uploaded: 
   await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope }) });
 }
 
+async function loadAttachment(id: string, target: User, onProgress?: (percent: number) => void) {
+  const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
+  if (!message) throw new Error('Attachment details are missing from this chat.');
+  const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { name: string; type: string; size: number; chunkCount?: number; ivPrefix?: string };
+  const cached = attachmentUrlCache.get(id);
+  if (cached) return { url: cached, name: meta.name };
+  let blob: Blob;
+  if (meta.chunkCount && meta.ivPrefix) {
+    const cipher = await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
+    for (let start = 0; start < meta.chunkCount; start += 3) {
+      const batch = Array.from({ length: Math.min(3, meta.chunkCount - start) }, (_, offset) => start + offset);
+      const encryptedChunks = await Promise.all(batch.map(index => rawAttachmentRequest(`/attachments/${id}/${index}`, 'GET')));
+      for (let offset = 0; offset < batch.length; offset++) parts.push(new Uint8Array(await cipher.decrypt(id, ivPrefix, batch[offset], encryptedChunks[offset])));
+      onProgress?.(Math.min(100, Math.round((start + batch.length) / meta.chunkCount * 100)));
+    }
+    const actualSize = parts.reduce((total, part) => total + part.byteLength, 0);
+    if (actualSize !== meta.size) throw new Error(`This video is incomplete (${formatFileSize(actualSize)} of ${formatFileSize(meta.size)} downloaded).`);
+    blob = new Blob(parts, { type: meta.type });
+  } else {
+    const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
+    const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
+    blob = new Blob([bytes], { type: meta.type });
+    onProgress?.(100);
+  }
+  const url = URL.createObjectURL(blob);
+  attachmentUrlCache.set(id, url);
+  return { url, name: meta.name };
+}
+function downloadLocalFile(url: string, name: string) {
+  const link = document.createElement('a'); link.href = url; link.download = name; link.style.display = 'none'; document.body.append(link); link.click(); link.remove();
+}
+
 function render() {
   if (!me) { renderAuth(); return; }
   if (settingsOpen) { renderSettings(); return; }
@@ -389,35 +422,23 @@ function render() {
   });
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentLoad; const target = activeFriend; if (!id || !target || attachmentUrlCache.has(id)) return;
-    button.disabled = true; button.textContent = 'Loading encrypted file…';
-    try {
-      const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
-      if (!message) throw new Error('Attachment details are missing from this chat.');
-      const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { type: string; size?: number; chunkCount?: number; ivPrefix?: string };
-      if (meta.chunkCount && meta.ivPrefix) {
-        const cipher = await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
-        for (let start = 0; start < meta.chunkCount; start += 3) {
-          const batch = Array.from({ length: Math.min(3, meta.chunkCount - start) }, (_, offset) => start + offset);
-          const encryptedChunks = await Promise.all(batch.map(index => rawAttachmentRequest(`/attachments/${id}/${index}`, 'GET')));
-          for (let offset = 0; offset < batch.length; offset++) parts.push(new Uint8Array(await cipher.decrypt(id, ivPrefix, batch[offset], encryptedChunks[offset])));
-          const progress = Math.min(100, Math.round((start + batch.length) / meta.chunkCount * 100));
-          button.textContent = `Decrypting file · ${progress}%`;
-        }
-        const bytes = parts.reduce((total, part) => total + part.byteLength, 0);
-        if (meta.size && bytes !== meta.size) throw new Error(`This video is incomplete (${formatFileSize(bytes)} of ${formatFileSize(meta.size)} downloaded).`);
-        attachmentUrlCache.set(id, URL.createObjectURL(new Blob(parts, { type: meta.type })));
-      } else {
-        const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
-        const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
-        attachmentUrlCache.set(id, URL.createObjectURL(new Blob([bytes], { type: meta.type })));
-      }
-      render();
-    } catch (error) { showError(error); }
+    button.disabled = true; button.textContent = 'Loading preview…';
+    try { await loadAttachment(id, target, percent => { button.textContent = `Preparing preview · ${percent}%`; }); render(); }
+    catch (error) { showError(error); }
   }));
-  app.querySelectorAll<HTMLVideoElement>('.message-attachment-video').forEach(video => video.addEventListener('error', () => {
-    const status = video.parentElement?.querySelector<HTMLElement>('.video-playback-error');
-    if (status) { status.hidden = false; status.textContent = video.error?.code === MediaError.MEDIA_ERR_DECODE ? 'Pulse could not decode this video. Download it and try a different player.' : 'Pulse could not play this video. Download it to try another player.'; }
-  }, { once: true }));
+  app.querySelectorAll<HTMLButtonElement>('[data-attachment-download]').forEach(button => button.addEventListener('click', async () => {
+    const id = button.dataset.attachmentDownload; const target = activeFriend; if (!id || !target) return;
+    button.disabled = true; button.textContent = 'Preparing download…';
+    try { const file = await loadAttachment(id, target, percent => { button.textContent = `Preparing download · ${percent}%`; }); render(); downloadLocalFile(file.url, file.name); }
+    catch (error) { showError(error); }
+  }));
+  app.querySelectorAll<HTMLVideoElement>('.message-attachment-video').forEach(video => {
+    video.addEventListener('error', () => {
+      const status = video.parentElement?.querySelector<HTMLElement>('.video-playback-error');
+      if (status) { status.hidden = false; status.textContent = video.error?.code === MediaError.MEDIA_ERR_DECODE ? 'Pulse could not decode this video. Download it and try a different player.' : 'Pulse could not play this video. Download it to try another player.'; }
+    }, { once: true });
+    video.load();
+  });
   const main = app.querySelector<HTMLElement>('.main');
   if (main && friend) {
     let dragDepth = 0;
