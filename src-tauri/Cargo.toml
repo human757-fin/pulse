@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.3.7-5"
+version = "0.3.7-6"
 description = "Pulse desktop client"
 authors = ["Pulse"]
 edition = "2021"

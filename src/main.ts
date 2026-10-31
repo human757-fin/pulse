@@ -4,7 +4,7 @@ import { createAttachmentCipher, decryptFile, decryptMessage, encryptMessage, in
 import { VoiceClient, type ScreenShareSettings, type VoiceState, type VoiceUpdate } from './voice';
 
 type User = { id: string; username: string; email?: string; emailVerified?: boolean; twoFactorEnabled?: boolean; authenticatorEnabled?: boolean; displayName?: string; bio?: string; profileVersion?: string; avatar?: string; banner?: string; encryptionReady?: boolean };
-type ChatMessage = { id: string; from: User; text: string; createdAt: string; iv?: string; ciphertext?: string; encryptionVersion: number };
+type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 type GroupChat = { id: string; name: string; members: User[] };
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -16,6 +16,8 @@ localStorage.removeItem('pulse.voiceToken');
 let me: User | undefined;
 let friends: Friends = { friends: [], incoming: [], outgoing: [] };
 let messages: ChatMessage[] = [];
+let messageSearch = '';
+let editingMessageId = '';
 let activeFriend: User | undefined;
 let groups: GroupChat[] = [];
 let blockedUsers: string[] = [];
@@ -202,6 +204,8 @@ async function refreshMessages(target: User | GroupChat | undefined = activeGrou
   const result = await api<{ messages: ChatMessage[] }>(isGroup ? `/groups/${encodeURIComponent(target.id)}/messages` : `/messages?with=${encodeURIComponent(target.username)}`);
   if (!isGroup) await refreshUnread();
   const decrypted = await Promise.all(result.messages.map(async message => {
+    const previousMessage = messages.find(item => item.id === message.id);
+    if (previousMessage && previousMessage.editedAt !== message.editedAt) decryptedCache.delete(message.id);
     const senderProfile = message.from.id === me!.id ? me! : isGroup ? target.members.find(member => member.id === message.from.id) || message.from : target;
     const from = { ...message.from, displayName: senderProfile.displayName || message.from.displayName, avatar: senderProfile.avatar, banner: senderProfile.banner, bio: senderProfile.bio };
     message = { ...message, from };
@@ -215,7 +219,7 @@ async function refreshMessages(target: User | GroupChat | undefined = activeGrou
     } catch (error) { return { ...message, text: error instanceof Error ? error.message : 'Could not decrypt this message.' }; }
   }));
   if (isGroup ? activeGroup?.id !== target.id : activeFriend?.id !== target.id) return;
-  const changed = decrypted.length !== messages.length || decrypted.at(-1)?.id !== messages.at(-1)?.id || decrypted.at(-1)?.text !== messages.at(-1)?.text;
+  const changed = decrypted.length !== messages.length || decrypted.some((message, index) => message.id !== messages[index]?.id || message.text !== messages[index]?.text || message.editedAt !== messages[index]?.editedAt);
   messages = decrypted;
   if (changed && me) render();
 }
@@ -224,8 +228,8 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { showingGroupAddMenu = false; activeGroup = undefined; activeFriend = friend; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
-function openGroup(group: GroupChat) { showingGroupAddMenu = false; activeFriend = undefined; activeGroup = group; messages = []; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { showingGroupAddMenu = false; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { showingGroupAddMenu = false; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
 
 async function toggleCall() {
@@ -310,8 +314,8 @@ function render() {
     <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
   <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend ? `<div class="add-to-group-wrap"><button type="button" id="add-to-group-button" class="call-button" aria-expanded="${showingGroupAddMenu}">Add to group</button>${showingGroupAddMenu ? `<div class="add-to-group-menu" role="menu">${groups.filter(item => !item.members.some(member => member.id === friend.id)).map(item => `<button type="button" role="menuitem" data-add-current-group="${esc(item.id)}">${esc(item.name)}</button>`).join('')}<button type="button" role="menuitem" class="create-group-option" id="create-group-with-friend">＋ Create group with ${esc(displayName(friend))}</button></div>` : ''}</div>` : ''}${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
-    ${callBar}${callScreenStage}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
-    ${conversation ? `<form id="composer" class="composer">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend ? friend.username : group!.name)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint" id="attachment-status">🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}</div></form>` : ''}
+    ${callBar}${callScreenStage}${conversation ? `<label class="chat-search"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
+    ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : `🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}`}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (notice) {
     window.clearTimeout(noticeTimer);
@@ -341,9 +345,17 @@ function render() {
   app.querySelector<HTMLButtonElement>('#settings-open-sidebar')?.addEventListener('click', openSettings);
   const friendSearch = app.querySelector<HTMLInputElement>('#friend-search');
   friendSearch?.addEventListener('input', () => { const query = friendSearch.value.trim().toLowerCase(); app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => { button.hidden = !button.textContent?.toLowerCase().includes(query); }); });
+  const messageSearchInput = app.querySelector<HTMLInputElement>('#message-search');
+  messageSearchInput?.addEventListener('input', () => { messageSearch = messageSearchInput.value; const cursor = messageSearchInput.selectionStart; render(); const next = app.querySelector<HTMLInputElement>('#message-search'); next?.focus(); next?.setSelectionRange(cursor, cursor); });
+  app.querySelector<HTMLButtonElement>('#clear-message-search')?.addEventListener('click', () => { messageSearch = ''; render(); app.querySelector<HTMLInputElement>('#message-search')?.focus(); });
+  app.querySelector<HTMLButtonElement>('#cancel-message-edit')?.addEventListener('click', () => { editingMessageId = ''; render(); });
+  app.querySelectorAll<HTMLButtonElement>('[data-message-copy]').forEach(button => button.onclick = async () => { const item = messages.find(message => message.id === button.dataset.messageCopy); if (!item) return; try { await navigator.clipboard.writeText(item.text); notice = 'Message copied.'; render(); } catch { showError(new Error('Could not copy this message.')); } });
+  app.querySelectorAll<HTMLButtonElement>('[data-message-edit]').forEach(button => button.onclick = () => { const item = messages.find(message => message.id === button.dataset.messageEdit); if (!item || item.from.id !== me?.id) return; editingMessageId = item.id; render(); const input = app.querySelector<HTMLInputElement>('#message-input'); if (input) { input.value = item.text; input.focus(); input.setSelectionRange(input.value.length, input.value.length); } });
+  app.querySelectorAll<HTMLButtonElement>('[data-message-delete]').forEach(button => button.onclick = async () => { const item = messages.find(message => message.id === button.dataset.messageDelete); if (!item || item.from.id !== me?.id || !window.confirm('Delete this message for everyone?')) return; try { const path = activeGroup ? `/groups/${encodeURIComponent(activeGroup.id)}/messages/${encodeURIComponent(item.id)}` : `/messages/${encodeURIComponent(item.id)}`; await api(path, { method: 'DELETE' }); messages = messages.filter(message => message.id !== item.id); decryptedCache.delete(item.id); notice = 'Message deleted.'; render(); } catch (error) { showError(error); } });
   const composer = app.querySelector<HTMLFormElement>('#composer');
   if (composer && conversation) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); if (!text) return; input.disabled = true; try {
-    if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); }
+    if (editingMessageId) { const path = group ? `/groups/${encodeURIComponent(group.id)}/messages/${encodeURIComponent(editingMessageId)}` : `/messages/${encodeURIComponent(editingMessageId)}`; if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api(path, { method: 'PATCH', body: JSON.stringify(envelope) }); } else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(path, { method: 'PATCH', body: JSON.stringify({ envelopes }) }); } decryptedCache.delete(editingMessageId); editingMessageId = ''; }
+    else if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); }
     else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(`/groups/${encodeURIComponent(group.id)}/messages`, { method: 'POST', body: JSON.stringify({ envelopes }) }); }
     input.value = ''; await refreshMessages(conversation); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus();
   } catch (error) { showError(error); input.disabled = false; } };
@@ -417,6 +429,11 @@ function render() {
 }
 
 function showError(error: unknown) { notice = error instanceof Error ? error.message : 'Something went wrong.'; render(); window.setTimeout(() => { notice = ''; app.querySelector('.toast')?.classList.remove('show'); }, 3500); }
+
+window.addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && !settingsOpen && (activeFriend || activeGroup)) { event.preventDefault(); app.querySelector<HTMLInputElement>('#message-search')?.focus(); }
+  if (event.key === 'Escape' && editingMessageId) { editingMessageId = ''; render(); }
+});
 
 function closeUserPopup() { app.querySelector('.user-popup-layer')?.remove(); }
 function userForId(userId: string): User | undefined { return [me, ...friends.friends, ...friends.incoming, ...friends.outgoing, ...(activeGroup?.members || [])].find(candidate => candidate?.id === userId); }

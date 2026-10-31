@@ -549,11 +549,24 @@ async function serve(req, res) {
         return json(res, 201, { group: { id: group.id, name: group.name, members: members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) } });
       }
       const groupMessages = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})\/messages$/);
+      const groupMessageAction = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})\/messages\/([a-f0-9]{24})$/);
+      if (groupMessageAction && ['PATCH', 'DELETE'].includes(req.method)) {
+        const group = db.groups.find(item => item.id === groupMessageAction[1] && item.members.includes(user.id));
+        const message = db.messages.find(item => item.id === groupMessageAction[2] && item.groupId === groupMessageAction[1]);
+        if (!group || !message) return json(res, 404, { error: 'Group message not found.' });
+        if (message.from !== user.id) return json(res, 403, { error: 'You can only edit or delete your own messages.' });
+        if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
+        const envelopes = body.envelopes;
+        const readyMembers = group.members.filter(id => !!db.users.find(candidate => candidate.id === id)?.publicKey);
+        if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Edited message must include your own encryption envelope and only updated group members.' });
+        for (const envelope of Object.values(envelopes)) if (!envelope || typeof envelope.ciphertext !== 'string' || envelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.ciphertext) || typeof envelope.iv !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.iv) || Buffer.from(envelope.iv, 'base64').length !== 12) return json(res, 400, { error: 'An edited message encryption envelope is invalid.' });
+        message.envelopes = envelopes; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
+      }
       if (groupMessages && req.method === 'GET') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
         const items = db.messages.filter(message => message.groupId === group.id).slice(-200);
-        return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, encryptionVersion: 1 } : { encryptionVersion: 2 }), createdAt: message.createdAt }; }) });
+        return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, encryptionVersion: 1 } : { encryptionVersion: 2 }), createdAt: message.createdAt, ...(message.editedAt ? { editedAt: message.editedAt } : {}) }; }) });
       }
       if (groupMessages && req.method === 'POST') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
@@ -610,7 +623,18 @@ async function serve(req, res) {
         }
         if (markedRead) persist();
         const items = db.messages.filter(m => (m.from === user.id && m.to === target.id) || (m.from === target.id && m.to === user.id)).slice(-100);
-        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt })) });
+        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt, ...(m.editedAt ? { editedAt: m.editedAt } : {}) })) });
+      }
+      const directMessageAction = url.pathname.match(/^\/api\/messages\/([a-f0-9]{24})$/);
+      if (directMessageAction && ['PATCH', 'DELETE'].includes(req.method)) {
+        const message = db.messages.find(item => item.id === directMessageAction[1] && !item.groupId && (item.from === user.id || item.to === user.id));
+        if (!message) return json(res, 404, { error: 'Message not found.' });
+        if (message.from !== user.id) return json(res, 403, { error: 'You can only edit or delete your own messages.' });
+        if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
+        const target = db.users.find(candidate => candidate.id === message.to);
+        const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
+        if (!target || !target.publicKey || !ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Edited message envelope is invalid or too large.' });
+        message.ciphertext = ciphertext; message.iv = iv; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
       if (url.pathname === '/api/messages' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
