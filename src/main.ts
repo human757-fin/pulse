@@ -189,7 +189,7 @@ function messageBody(text: string) {
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
       if (!url && type.startsWith('video/')) return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play loading" data-attachment-load="${esc(file.id)}" aria-label="Preparing video preview" title="Preparing video" disabled>▶</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}">${formatFileSize(file.size!)} · preparing preview…</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
       if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
-      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">▶</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">🔊</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">⛶</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
+      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">${videoPlayIcon}</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">${videoVolumeIcon(false)}</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">${videoFullscreenIcon}</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
       if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
       return `<div class="message-attachment-file"><span class="attachment-file-icon">${type === 'application/pdf' ? 'PDF' : 'TXT'}</span><a href="${esc(url)}" download="${name}">${name}</a></div>`;
     } catch { return '<p>Could not display this attachment.</p>'; }
@@ -419,6 +419,10 @@ function formatVideoTime(seconds: number) {
   const total = Math.floor(seconds); const minutes = Math.floor(total / 60); const remainder = String(total % 60).padStart(2, '0');
   return minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
 }
+const videoPlayIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z" fill="currentColor" stroke="none"/></svg>';
+const videoPauseIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm6 0h4v14h-4z" fill="currentColor" stroke="none"/></svg>';
+const videoVolumeIcon = (muted: boolean) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><${muted ? 'path d="m17 9 5 6m0-6-5 6"' : 'path d="M16 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12"'}/></svg>`;
+const videoFullscreenIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4"/></svg>';
 function reportInlineVideoError(video: HTMLVideoElement, error?: unknown) {
   const status = video.closest('.message-attachment')?.querySelector<HTMLElement>('.video-playback-error');
   if (!status) return;
@@ -558,11 +562,12 @@ function render() {
   }));
   app.querySelectorAll<HTMLInputElement>('[data-video-volume]').forEach(input => input.addEventListener('input', () => {
     const video = input.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');
-    if (video) { video.volume = Number(input.value); video.muted = video.volume === 0; }
+    const button = input.closest('.video-player-shell')?.querySelector<HTMLButtonElement>('[data-video-volume-toggle]');
+    if (video) { video.volume = Number(input.value); video.muted = video.volume === 0; if (button) { button.innerHTML = videoVolumeIcon(video.muted); button.setAttribute('aria-label', video.muted ? 'Unmute video' : 'Mute video'); button.title = video.muted ? 'Unmute' : 'Mute'; } }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-video-volume-toggle]').forEach(button => button.addEventListener('click', () => {
     const shell = button.closest('.video-player-shell'); const video = shell?.querySelector<HTMLVideoElement>('video'); const volume = shell?.querySelector<HTMLInputElement>('[data-video-volume]');
-    if (video) { video.muted = !video.muted; button.textContent = video.muted ? '🔇' : '🔊'; button.setAttribute('aria-label', video.muted ? 'Unmute video' : 'Mute video'); if (volume && !video.muted && Number(volume.value) === 0) { volume.value = '0.7'; video.volume = 0.7; } }
+    if (video) { video.muted = !video.muted; button.innerHTML = videoVolumeIcon(video.muted); button.setAttribute('aria-label', video.muted ? 'Unmute video' : 'Mute video'); button.title = video.muted ? 'Unmute' : 'Mute'; if (volume && !video.muted && Number(volume.value) === 0) { volume.value = '0.7'; video.volume = 0.7; } }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-video-fullscreen]').forEach(button => button.addEventListener('click', () => {
     const shell = button.closest('.video-player-shell');
@@ -587,7 +592,7 @@ function render() {
     const time = video.parentElement?.querySelector<HTMLElement>('[data-video-time]');
     const previous = videoPlayback.get(video.dataset.videoFile || '');
     const updateControls = () => {
-      if (toggle) { toggle.textContent = video.paused ? '▶' : 'Ⅱ'; toggle.setAttribute('aria-label', video.paused ? 'Play video' : 'Pause video'); }
+      if (toggle) { toggle.innerHTML = video.paused ? videoPlayIcon : videoPauseIcon; toggle.setAttribute('aria-label', video.paused ? 'Play video' : 'Pause video'); toggle.title = video.paused ? 'Play' : 'Pause'; }
       if (time) time.textContent = `${formatVideoTime(video.currentTime)} / ${formatVideoTime(video.duration)}`;
       if (seek && Number.isFinite(video.duration) && video.duration > 0) seek.value = String(Math.round(video.currentTime / video.duration * 1000));
     };
