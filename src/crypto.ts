@@ -50,6 +50,7 @@ function keyFingerprint(key: JsonWebKey): string {
 
 async function peerKey(userId: string, fetchPeerKey: PeerKeyFetcher): Promise<CryptoKey> {
   if (!identity) throw new Error('Your encryption key is not ready. Sign in again.');
+  if (userId === identity.userId) return crypto.subtle.importKey('jwk', identity.publicKey, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
   const jwk = await fetchPeerKey(userId);
   const fingerprint = keyFingerprint(jwk);
   const pinName = `pulse.peer-key.${userId}`;

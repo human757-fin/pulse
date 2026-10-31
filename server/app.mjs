@@ -667,7 +667,7 @@ async function serve(req, res) {
         }
         if (markedRead) persist();
         const items = db.messages.filter(m => (m.from === user.id && m.to === target.id) || (m.from === target.id && m.to === user.id)).slice(-100);
-        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt, ...(m.editedAt ? { editedAt: m.editedAt } : {}) })) });
+        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? (m.from === user.id && m.selfEnvelope ? { ...m.selfEnvelope, selfCopy: true, encryptionVersion: 1 } : { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 }) : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt, ...(m.editedAt ? { editedAt: m.editedAt } : {}) })) });
       }
       const directMessageAction = url.pathname.match(/^\/api\/messages\/([a-f0-9]{24})$/);
       if (directMessageAction && ['PATCH', 'DELETE'].includes(req.method)) {
@@ -677,15 +677,17 @@ async function serve(req, res) {
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
         const target = db.users.find(candidate => candidate.id === message.to);
         const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
-        if (!target || !target.publicKey || !ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Edited message envelope is invalid or too large.' });
-        message.ciphertext = ciphertext; message.iv = iv; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
+        const selfEnvelope = body.selfEnvelope;
+        if (!target || !target.publicKey || !ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12 || (selfEnvelope && (!selfEnvelope.ciphertext || selfEnvelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.iv || '') || Buffer.from(selfEnvelope.iv, 'base64').length !== 12))) return json(res, 400, { error: 'Edited message envelope is invalid or too large.' });
+        message.ciphertext = ciphertext; message.iv = iv; if (selfEnvelope) message.selfEnvelope = selfEnvelope; else delete message.selfEnvelope; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
       if (url.pathname === '/api/messages' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
         if (!target || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
         if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
-        if (!ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
-        const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }; db.messages.push(message); persist();
+        const selfEnvelope = body.selfEnvelope;
+        if (!ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12 || (selfEnvelope && (!selfEnvelope.ciphertext || selfEnvelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.iv || '') || Buffer.from(selfEnvelope.iv, 'base64').length !== 12))) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
+        const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, ...(selfEnvelope ? { selfEnvelope } : {}), createdAt: new Date().toISOString() }; db.messages.push(message); persist();
         return json(res, 201, { message: { id: message.id, from: publicUser(user), ciphertext, iv, encryptionVersion: 1, createdAt: message.createdAt } });
       }
       return json(res, 404, { error: 'API route not found.' });
