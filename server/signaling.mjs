@@ -51,6 +51,7 @@ async function handle(client, message) {
       leave(client);
       const roomName = String(message.room || '').slice(0, 128);
       const friendId = String(message.friendId || '');
+      const roomType = message.roomType === 'group' ? 'group' : 'dm';
       const authToken = String(message.authToken || '').trim();
       if (message.voiceProtocol !== voiceProtocol) { send(client, { type: 'error', message: 'Voice versions do not match. Update Pulse on both devices and restart the Pulse server.' }); return; }
       if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Pulse and select an accepted friend before calling.' }); return; }
@@ -60,7 +61,7 @@ async function handle(client, message) {
         const response = await fetch(`${apiBase}/api/voice/authorize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
-          body: JSON.stringify({ room: roomName, friendId }),
+          body: JSON.stringify({ room: roomName, friendId, roomType }),
           signal: AbortSignal.timeout(5000),
         });
         if (response.ok) account = (await response.json()).user;
@@ -71,15 +72,17 @@ async function handle(client, message) {
       if (!account?.id || !account?.username) { send(client, { type: 'error', message: 'Sign in again and make sure you are friends before calling.' }); return; }
       let room = rooms.get(roomName);
       if (!room) { room = new Map(); rooms.set(roomName, room); }
-      if (room.size >= 2) { send(client, { type: 'error', message: 'This first version supports two people per voice room.' }); return; }
-      const peers = [...room.entries()].map(([id, peer]) => ({ id, name: peer.name }));
+      if (room.size >= (roomType === 'group' ? 6 : 2)) { send(client, { type: 'error', message: roomType === 'group' ? 'This group call is full (maximum 6 people).' : 'This direct call is already full.' }); return; }
+      const peers = [...room.entries()].map(([id, peer]) => ({ id, name: peer.name, userId: peer.userId }));
       client.room = roomName;
       client.id = randomUUID();
       client.name = String(account.username).slice(0, 48);
+      client.userId = String(account.id);
+      client.roomType = roomType;
       room.set(client.id, client);
       const iceServers = turnCredentials(client.id);
       send(client, { type: 'joined', id: client.id, peers, iceServers, voiceProtocol, iceTransportPolicy: turnOnly && iceServers.length ? 'relay' : 'all' });
-      for (const peer of room.values()) if (peer !== client) send(peer, { type: 'peer-joined', id: client.id, name: client.name });
+      for (const peer of room.values()) if (peer !== client) send(peer, { type: 'peer-joined', id: client.id, name: client.name, userId: client.userId });
       return;
     }
     if (message.type === 'leave') { leave(client); return; }
@@ -87,7 +90,7 @@ async function handle(client, message) {
     const target = room?.get(String(message.to || ''));
     if (!target || !client.id) return;
     if (!['offer', 'answer', 'ice'].includes(message.type)) return;
-    const relayed = { ...message, from: client.id, name: client.name };
+    const relayed = { ...message, from: client.id, fromUserId: client.userId, name: client.name };
     delete relayed.to;
     send(target, relayed);
 }

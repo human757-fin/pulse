@@ -1,10 +1,11 @@
 export type VoiceState = 'disconnected' | 'connecting' | 'reconnecting' | 'waiting' | 'connected' | 'error';
-export type VoiceUpdate = { state: VoiceState; message: string; peers: string[]; sharingScreen: boolean; videoPeers: string[] };
+export type VoiceParticipant = { id: string; userId: string; name: string };
+export type VoiceUpdate = { state: VoiceState; message: string; peers: string[]; participants: VoiceParticipant[]; sharingScreen: boolean; videoPeers: string[] };
 export type ScreenShareSettings = { width: number; height: number; fps: number };
 
 type Signal = { type: string; [key: string]: unknown };
 const voiceProtocol = 'pulse-dtls-srtp-screen-v2';
-type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer };
+type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer; roomType: 'dm' | 'group'; getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer> };
 
 export class VoiceClient {
   private socket?: WebSocket;
@@ -16,6 +17,7 @@ export class VoiceClient {
   private screenStream?: MediaStream;
   private stopped = false;
   private peerNames = new Map<string, string>();
+  private peerUsers = new Map<string, string>();
   private pendingIce = new Map<string, RTCIceCandidateInit[]>();
   private muted = false;
   private inputDeviceId = '';
@@ -72,9 +74,9 @@ export class VoiceClient {
     this.outputDeviceId = deviceId;
   }
 
-  async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer) {
+  async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer, roomType: 'dm' | 'group' = 'dm', getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer>) {
     this.stopped = false;
-    this.joinOptions = { endpoint, room, friendId, authToken, voiceKey };
+    this.joinOptions = { endpoint, room, friendId, authToken, voiceKey, roomType, getPeerVoiceKey };
     this.reconnectAttempts = 0;
     this.emit('connecting', 'Requesting microphone…');
     try {
@@ -160,16 +162,18 @@ export class VoiceClient {
       this.reconnectAttempts = 0;
       this.turnServers = (msg.iceServers as RTCIceServer[]) || [];
       this.iceTransportPolicy = msg.iceTransportPolicy === 'relay' && this.turnServers.length ? 'relay' : 'all';
-      const peers = (msg.peers as Array<{ id: string; name: string }>) || [];
+      const peers = (msg.peers as Array<{ id: string; name: string; userId?: string }>) || [];
       for (const peer of peers) {
         this.peerNames.set(peer.id, peer.name);
+        if (peer.userId) this.peerUsers.set(peer.id, peer.userId);
         await this.makeOffer(peer.id);
       }
-      this.emit('waiting', peers.length ? 'Connecting to your friend…' : 'Waiting for someone to join…');
+      this.emit('waiting', peers.length ? 'Connecting to the call…' : 'Waiting for someone to join…');
       return;
     }
     if (msg.type === 'peer-joined') {
       this.peerNames.set(String(msg.id), String(msg.name));
+      if (msg.userId) this.peerUsers.set(String(msg.id), String(msg.userId));
       this.emit('waiting', `${String(msg.name)} joined · connecting…`);
       return;
     }
@@ -183,27 +187,29 @@ export class VoiceClient {
       this.remoteVideos.delete(id);
       this.videoSenders.delete(id);
       this.peerNames.delete(id);
+      this.peerUsers.delete(id);
       this.emit('waiting', 'They left voice. Waiting for someone to join…');
       return;
     }
     if (msg.type === 'offer') {
       const from = String(msg.from);
+      if (msg.fromUserId) this.peerUsers.set(from, String(msg.fromUserId));
       const description = msg.description as RTCSessionDescriptionInit;
-      if (!await this.verifyDescription(description, String(msg.voiceProof || ''))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (!await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       const pc = this.makePeer(from);
       await this.preparePeerVideo(from);
       await pc.setRemoteDescription(description);
       await this.flushIce(from, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      this.send({ type: 'answer', to: from, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!) });
+      this.send({ type: 'answer', to: from, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(from)) });
       return;
     }
     if (msg.type === 'answer') {
       const from = String(msg.from);
       const pc = this.peers.get(from);
       const description = msg.description as RTCSessionDescriptionInit;
-      if (!await this.verifyDescription(description, String(msg.voiceProof || ''))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (!await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       if (pc) { await pc.setRemoteDescription(description); await this.flushIce(from, pc); }
       return;
     }
@@ -218,12 +224,19 @@ export class VoiceClient {
     if (msg.type === 'error') this.fail(String(msg.message || 'Voice connection failed.'));
   }
 
+  private async keyForPeer(id: string) {
+    const userId = this.peerUsers.get(id);
+    if (userId && this.joinOptions?.getPeerVoiceKey) return this.joinOptions.getPeerVoiceKey(userId);
+    if (!this.voiceKey) throw new Error('Voice encryption key is unavailable.');
+    return this.voiceKey;
+  }
+
   private async makeOffer(id: string) {
     const pc = this.makePeer(id);
     await this.preparePeerVideo(id);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    this.send({ type: 'offer', to: id, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!) });
+    this.send({ type: 'offer', to: id, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(id)) });
   }
 
   private descriptionProofData(description: RTCSessionDescriptionInit) {
@@ -234,17 +247,16 @@ export class VoiceClient {
     return new TextEncoder().encode(`${voiceProtocol}\n${room}\n${description.type}\n${fingerprints.join('\n')}`);
   }
 
-  private async signDescription(description: RTCSessionDescriptionInit) {
-    if (!this.voiceKey) throw new Error('Voice encryption key is unavailable.');
-    const key = await crypto.subtle.importKey('raw', this.voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  private async signDescription(description: RTCSessionDescriptionInit, voiceKey: ArrayBuffer) {
+    const key = await crypto.subtle.importKey('raw', voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const proof = new Uint8Array(await crypto.subtle.sign('HMAC', key, this.descriptionProofData(description)));
     return btoa(Array.from(proof, byte => String.fromCharCode(byte)).join(''));
   }
 
-  private async verifyDescription(description: RTCSessionDescriptionInit, proof: string) {
-    if (!this.voiceKey || !proof) return false;
+  private async verifyDescription(description: RTCSessionDescriptionInit, proof: string, voiceKey: ArrayBuffer) {
+    if (!proof) return false;
     try {
-      const key = await crypto.subtle.importKey('raw', this.voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+      const key = await crypto.subtle.importKey('raw', voiceKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
       const signature = Uint8Array.from(atob(proof), character => character.charCodeAt(0));
       return await crypto.subtle.verify('HMAC', key, signature, this.descriptionProofData(description));
     } catch { return false; }
@@ -265,7 +277,7 @@ export class VoiceClient {
         opened = true; settled = true; window.clearTimeout(timer);
         if (this.stopped) { socket.close(); resolve(); return; }
         socket.onmessage = event => { void this.handle(JSON.parse(String(event.data)) as Signal).catch(error => this.fail(error instanceof Error ? error.message : 'Voice setup failed.')); };
-        socket.send(JSON.stringify({ type: 'join', room: options.room, friendId: options.friendId, authToken: options.authToken, voiceProtocol }));
+        socket.send(JSON.stringify({ type: 'join', room: options.room, friendId: options.friendId, roomType: options.roomType, authToken: options.authToken, voiceProtocol }));
         resolve();
       };
       socket.onerror = () => {
@@ -299,6 +311,7 @@ export class VoiceClient {
     this.remoteVideos.clear();
     this.videoSenders.clear();
     this.peerNames.clear();
+    this.peerUsers.clear();
     this.pendingIce.clear();
   }
 
@@ -354,7 +367,7 @@ export class VoiceClient {
   }
 
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
-  private emit(state: VoiceState, message: string) { this.currentState = state; this.currentMessage = message; this.onUpdate({ state, message, peers: [...this.peerNames.values()], sharingScreen: !!this.screenStream, videoPeers: [...this.remoteVideos.keys()] }); }
+  private emit(state: VoiceState, message: string) { this.currentState = state; this.currentMessage = message; this.onUpdate({ state, message, peers: [...this.peerNames.values()], participants: [...this.peerNames].map(([id, name]) => ({ id, name, userId: this.peerUsers.get(id) || '' })), sharingScreen: !!this.screenStream, videoPeers: [...this.remoteVideos.keys()] }); }
   private emitCurrent() { this.emit(this.currentState, this.currentMessage); }
   private fail(message: string) { if (this.stopped) return; this.emit('error', message); this.leave(); this.emit('error', message); }
 }

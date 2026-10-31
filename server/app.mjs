@@ -56,7 +56,7 @@ function persist() {
   renameSync(temp, dbPath);
 }
 function json(res, status, value) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
   res.end(JSON.stringify(value));
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
@@ -227,7 +227,7 @@ async function sendEmailCode(email, purpose, userId = '') {
 }
 async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' }); res.end(); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
     if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
@@ -495,6 +495,11 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/logout' && req.method === 'POST') { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); db.sessions = db.sessions.filter(s => s.token !== token); persist(); return json(res, 200, { ok: true }); }
       if (url.pathname === '/api/voice/authorize' && req.method === 'POST') {
+        if (body.roomType === 'group') {
+          const group = db.groups.find(candidate => candidate.id === String(body.friendId || '') && candidate.members.includes(user.id));
+          if (!user.publicKey || !group || body.room !== `group-${group.id}` || group.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This group voice room is not available to your account. Update Pulse and sign in again to enable voice encryption.' });
+          return json(res, 200, { user: publicUser(user) });
+        }
         const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
         if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
         const expectedRoom = `dm-${[user.id, target.id].sort().join('-')}`;
@@ -510,7 +515,8 @@ async function serve(req, res) {
       const publicKeyRequest = url.pathname.match(/^\/api\/keys\/([a-f0-9]+)$/);
       if (publicKeyRequest && req.method === 'GET') {
         const target = db.users.find(u => u.id === publicKeyRequest[1]);
-        if (!target || isBlocked(user.id, target.id) || (target.id !== user.id && friendship(user.id, target.id)?.status !== 'accepted')) return json(res, 403, { error: 'Encryption keys are available to you and your friends only.' });
+        const sharesGroup = db.groups.some(group => group.members.includes(user.id) && group.members.includes(target?.id));
+        if (!target || isBlocked(user.id, target.id) || (target.id !== user.id && friendship(user.id, target.id)?.status !== 'accepted' && !sharesGroup)) return json(res, 403, { error: 'Encryption keys are available to you, your friends, and your group members.' });
         if (!target.publicKey) return json(res, 404, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
         return json(res, 200, { publicKey: target.publicKey });
       }
