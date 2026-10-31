@@ -20,6 +20,7 @@ export class VoiceClient {
   private peerUsers = new Map<string, string>();
   private pendingIce = new Map<string, RTCIceCandidateInit[]>();
   private muted = false;
+  private deafened = false;
   private inputDeviceId = '';
   private outputDeviceId = '';
   private turnServers: RTCIceServer[] = [];
@@ -48,7 +49,7 @@ export class VoiceClient {
     const nextTrack = nextStream.getAudioTracks()[0];
     if (!nextTrack) { nextStream.getTracks().forEach(track => track.stop()); throw new Error('That microphone did not provide an audio track.'); }
     nextTrack.contentHint = 'speech';
-    nextTrack.enabled = !this.muted;
+    nextTrack.enabled = !this.muted && !this.deafened;
     try {
       const senders = [...this.peers.values()].flatMap(peer => peer.getSenders().filter(sender => sender.track?.kind === 'audio'));
       await Promise.all(senders.map(sender => sender.replaceTrack(nextTrack)));
@@ -111,13 +112,21 @@ export class VoiceClient {
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
     this.muted = false;
+    this.deafened = false;
     this.emit('disconnected', 'Not connected');
   }
 
   toggleMute() {
     this.muted = !this.muted;
-    this.stream?.getAudioTracks().forEach(track => { track.enabled = !this.muted; });
+    this.stream?.getAudioTracks().forEach(track => { track.enabled = !this.muted && !this.deafened; });
     return this.muted;
+  }
+
+  toggleDeafen() {
+    this.deafened = !this.deafened;
+    this.stream?.getAudioTracks().forEach(track => { track.enabled = !this.muted && !this.deafened; });
+    this.audioElements.forEach(audio => { audio.muted = this.deafened; });
+    return this.deafened;
   }
 
   getLocalScreenStream() { return this.screenStream; }
@@ -344,6 +353,7 @@ export class VoiceClient {
         audio = document.createElement('audio');
         audio.autoplay = true;
         audio.volume = 1;
+        audio.muted = this.deafened;
         audio.dataset.voicePeer = id;
         document.body.append(audio);
         this.audioElements.set(id, audio);
