@@ -69,9 +69,9 @@ The `Restart Pulse VPS after push` GitHub Actions workflow calls Pterodactyl's C
 
 - `PTERODACTYL_PANEL_URL`: the panel's HTTPS origin, such as `https://panel.example.com` (no path).
 - `PTERODACTYL_SERVER_ID`: the server identifier shown in the panel URL or server details.
-- `PTERODACTYL_API_KEY`: a Pterodactyl client API key with permission to send server power actions. Store it only in GitHub Actions secrets.
+- `PTERODACTYL_API_KEY`: a Pterodactyl client API key with permission to stop/kill and start the server. Store it only in GitHub Actions secrets.
 
-The workflow sends `restart` to `POST /api/client/servers/{server}/power`. At startup, Pulse fetches `main` and rebuilds if it changed. Open clients retry voice signaling after the restart; audio can pause briefly while both clients reconnect. The workflow can also be started manually from the repository's **Actions** page.
+The workflow checks the server state, sends `kill` if it is online, waits until the panel reports `offline`, then sends `start` and waits for `running`. This handles eggs that do not restart cleanly through a single restart signal. At startup, Pulse fetches `main` and rebuilds if it changed. Open clients retry voice signaling after the restart; audio can pause briefly while both clients reconnect. The workflow can also be started manually from the repository's **Actions** page.
 
 ## Configure the Cloudflare Tunnel
 

@@ -515,7 +515,7 @@ async function serve(req, res) {
         return json(res, 200, { publicKey: target.publicKey });
       }
       if (url.pathname === '/api/friends' && req.method === 'GET') {
-        const friends = db.friendships.filter(f => f.status === 'accepted' && (f.from === user.id || f.to === user.id) && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === (f.from === user.id ? f.to : f.from)))).filter(Boolean);
+        const friends = db.friendships.filter(f => f.status === 'accepted' && (f.from === user.id || f.to === user.id) && !isBlocked(f.from, f.to)).map(f => db.users.find(u => u.id === (f.from === user.id ? f.to : f.from))).filter(Boolean).map(friend => ({ ...publicUser(friend), encryptionReady: !!friend.publicKey }));
         const incoming = db.friendships.filter(f => f.status === 'pending' && f.to === user.id && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === f.from))).filter(Boolean);
         const outgoing = db.friendships.filter(f => f.status === 'pending' && f.from === user.id && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === f.to))).filter(Boolean);
         return json(res, 200, { friends, incoming, outgoing });
@@ -536,18 +536,17 @@ async function serve(req, res) {
         f.status = 'accepted'; f.acceptedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
       if (url.pathname === '/api/groups' && req.method === 'GET') {
-        const groups = db.groups.filter(group => group.members.includes(user.id)).map(group => ({ id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(publicUser) }));
+        const groups = db.groups.filter(group => group.members.includes(user.id)).map(group => ({ id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) }));
         return json(res, 200, { groups });
       }
       if (url.pathname === '/api/groups' && req.method === 'POST') {
         const name = String(body.name || '').trim(); const requested = Array.isArray(body.memberIds) ? [...new Set(body.memberIds.map(String))] : [];
         if (!name || name.length > 60) return json(res, 400, { error: 'Group name must be 1–60 characters.' });
-        if (requested.length < 2 || requested.length > 24 || requested.some(id => id === user.id || friendship(user.id, id)?.status !== 'accepted')) return json(res, 400, { error: 'Choose 2–24 accepted friends for the group.' });
+        if (requested.length < 1 || requested.length > 24 || requested.some(id => id === user.id || friendship(user.id, id)?.status !== 'accepted')) return json(res, 400, { error: 'Choose 1–24 accepted friends for the group.' });
         const members = [user.id, ...requested];
-        if (members.some(id => !db.users.find(candidate => candidate.id === id)?.publicKey)) return json(res, 409, { error: 'Every group member must sign in to an updated Pulse app before group messaging.' });
         const group = { id: randomBytes(16).toString('hex'), name, members, createdBy: user.id, createdAt: new Date().toISOString() };
         db.groups.push(group); persist();
-        return json(res, 201, { group: { id: group.id, name: group.name, members: members.map(id => publicUser(db.users.find(candidate => candidate.id === id))) } });
+        return json(res, 201, { group: { id: group.id, name: group.name, members: members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) } });
       }
       const groupMessages = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})\/messages$/);
       if (groupMessages && req.method === 'GET') {
@@ -560,8 +559,9 @@ async function serve(req, res) {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
         const envelopes = body.envelopes;
-        if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || Object.keys(envelopes).length !== group.members.length) return json(res, 400, { error: 'Encrypted message must include one envelope for every group member.' });
-        for (const memberId of group.members) {
+        const readyMembers = group.members.filter(id => !!db.users.find(candidate => candidate.id === id)?.publicKey);
+        if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Encrypted message must include your own encryption envelope and only updated group members.' });
+        for (const memberId of Object.keys(envelopes)) {
           const envelope = envelopes[memberId];
           if (!envelope || typeof envelope.ciphertext !== 'string' || envelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.ciphertext) || typeof envelope.iv !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.iv) || Buffer.from(envelope.iv, 'base64').length !== 12) return json(res, 400, { error: 'A group message encryption envelope is invalid.' });
         }
@@ -573,9 +573,8 @@ async function serve(req, res) {
         const group = db.groups.find(item => item.id === groupMemberRequest[1] && item.members.includes(user.id));
         const target = db.users.find(candidate => candidate.id === String(body.userId || ''));
         if (!group || !target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted' || isBlocked(user.id, target.id)) return json(res, 403, { error: 'You can add accepted, unblocked friends to this group.' });
-        if (!target.publicKey) return json(res, 409, { error: 'That friend needs to sign in to an updated Pulse app first.' });
         if (!group.members.includes(target.id)) { if (group.members.length >= 25) return json(res, 400, { error: 'This group already has 25 members.' }); group.members.push(target.id); persist(); }
-        return json(res, 200, { group: { id: group.id, name: group.name, members: group.members.map(id => publicUser(db.users.find(candidate => candidate.id === id))) } });
+        return json(res, 200, { group: { id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) } });
       }
       const groupRequest = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})$/);
       if (groupRequest && req.method === 'POST') {

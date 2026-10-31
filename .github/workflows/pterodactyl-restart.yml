@@ -11,7 +11,10 @@ permissions: {}
 jobs:
   restart-pulse:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
+    concurrency:
+      group: pterodactyl-pulse-restart
+      cancel-in-progress: false
     steps:
       - name: Restart Pulse through Pterodactyl
         env:
@@ -33,19 +36,57 @@ jobs:
             exit 1
           fi
           panel_url="${PANEL_URL%/}"
-          response_file="$(mktemp)"
-          status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-            --request POST \
-            --url "$panel_url/api/client/servers/$SERVER_ID/power" \
-            --header "Authorization: Bearer $API_KEY" \
-            --header 'Accept: Application/vnd.pterodactyl.v1+json' \
-            --header 'Content-Type: application/json' \
-            --data '{"signal":"restart"}')"
-          if [[ "$status" != "204" ]]; then
-            echo "Pterodactyl restart request failed with HTTP $status."
-            cat "$response_file"
+          api_headers=(--header "Authorization: Bearer $API_KEY" --header 'Accept: Application/vnd.pterodactyl.v1+json' --header 'Content-Type: application/json')
+          state_url="$panel_url/api/client/servers/$SERVER_ID/resources"
+          power_url="$panel_url/api/client/servers/$SERVER_ID/power"
+          current_state() {
+            curl --fail --silent --show-error --retry 2 --retry-delay 2 --url "$state_url" "${api_headers[@]}" | jq -r '.attributes.current_state'
+          }
+          send_power() {
+            local signal="$1" response_file status
+            response_file="$(mktemp)"
+            status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+              --request POST --url "$power_url" "${api_headers[@]}" --data "{\"signal\":\"$signal\"}")"
+            if [[ "$status" != "204" ]]; then
+              echo "Pterodactyl $signal request failed with HTTP $status."
+              cat "$response_file"
+              rm -f "$response_file"
+              return 1
+            fi
             rm -f "$response_file"
-            exit 1
+          }
+
+          state="$(current_state)"
+          echo "Pulse server state before restart: $state"
+          if [[ "$state" != "offline" ]]; then
+            send_power kill
+            echo "Sent kill; waiting for Pterodactyl to stop or automatically restart..."
+            saw_transition=false
+            for attempt in $(seq 1 60); do
+              state="$(current_state)"
+              if [[ "$state" == "offline" ]]; then break; fi
+              if [[ "$state" == "stopping" || "$state" == "starting" ]]; then saw_transition=true; fi
+              if [[ "$state" == "running" && "$saw_transition" == true ]]; then
+                echo "Pterodactyl already restarted Pulse after the kill."
+                exit 0
+              fi
+              sleep 2
+            done
+            if [[ "$state" != "offline" ]]; then
+              echo "Pulse did not reach offline state within 120 seconds (state: $state)."
+              exit 1
+            fi
           fi
-          rm -f "$response_file"
-          echo "Pterodactyl accepted the Pulse server restart."
+
+          send_power start
+          echo "Sent start; waiting for Pterodactyl to report running..."
+          for attempt in $(seq 1 60); do
+            state="$(current_state)"
+            if [[ "$state" == "running" ]]; then
+              echo "Pulse is running after the forced restart."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Pulse did not reach running state within 120 seconds (state: $state)."
+          exit 1
