@@ -38,6 +38,7 @@ db.groups ||= [];
 db.suggestions ||= [];
 const requestWindows = new Map();
 const suggestionWindows = new Map();
+const callInvites = new Map();
 const signupReservations = new Set();
 const emailReservations = new Set();
 const emailChallenges = new Map();
@@ -381,6 +382,43 @@ async function serve(req, res) {
       const user = sessionUser(req);
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: accountUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (url.pathname === '/api/calls/incoming' && req.method === 'GET') {
+        const now = Date.now();
+        for (const [id, invite] of callInvites) if (invite.expiresAt <= now) callInvites.delete(id);
+        const invites = [...callInvites.values()].filter(invite => invite.to === user.id).map(invite => {
+          const caller = db.users.find(candidate => candidate.id === invite.from);
+          return caller && !isBlocked(user.id, caller.id) && friendship(user.id, caller.id)?.status === 'accepted' ? { id: invite.id, room: invite.room, expiresAt: invite.expiresAt, caller: { ...publicUser(caller), ...profileData(caller) } } : undefined;
+        }).filter(Boolean);
+        return json(res, 200, { invites });
+      }
+      if (url.pathname === '/api/calls/invite' && req.method === 'POST') {
+        const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
+        if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
+        if (!user.publicKey || !target.publicKey) return json(res, 409, { error: 'Both people need to sign in with an updated Pulse client before calling.' });
+        const now = Date.now();
+        for (const [id, invite] of callInvites) if (invite.expiresAt <= now || (invite.from === user.id && invite.to === target.id)) callInvites.delete(id);
+        if ([...callInvites.values()].filter(invite => invite.from === user.id).length >= 5) return json(res, 429, { error: 'You already have several calls ringing. End one before calling another friend.' });
+        const id = randomBytes(16).toString('hex');
+        const invite = { id, from: user.id, to: target.id, room: `dm-${[user.id, target.id].sort().join('-')}`, expiresAt: Date.now() + 60_000 };
+        callInvites.set(id, invite);
+        return json(res, 201, { id, expiresAt: invite.expiresAt });
+      }
+      const callInviteAction = url.pathname.match(/^\/api\/calls\/invites\/([a-f0-9]{32})(?:\/(accept))?$/);
+      if (callInviteAction) {
+        const invite = callInvites.get(callInviteAction[1]);
+        if (!invite || invite.expiresAt <= Date.now()) { callInvites.delete(callInviteAction[1]); return json(res, 404, { error: 'That call has ended.' }); }
+        if (req.method === 'POST' && callInviteAction[2] === 'accept') {
+          if (invite.to !== user.id) return json(res, 403, { error: 'This call invitation is for another account.' });
+          const caller = db.users.find(candidate => candidate.id === invite.from);
+          if (!caller || isBlocked(user.id, caller.id) || friendship(user.id, caller.id)?.status !== 'accepted') { callInvites.delete(invite.id); return json(res, 404, { error: 'That call is no longer available.' }); }
+          callInvites.delete(invite.id);
+          return json(res, 200, { id: invite.id, room: invite.room, caller: { ...publicUser(caller), ...profileData(caller) } });
+        }
+        if (req.method === 'DELETE') {
+          if (invite.from !== user.id && invite.to !== user.id) return json(res, 403, { error: 'This call invitation is for another account.' });
+          callInvites.delete(invite.id); return json(res, 200, { ok: true });
+        }
+      }
       if (url.pathname === '/api/attachments' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to));
         const id = String(body.id || ''); const size = Number(body.size); const ivPrefix = String(body.ivPrefix || '');

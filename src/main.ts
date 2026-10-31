@@ -8,6 +8,7 @@ type User = { id: string; username: string; email?: string; emailVerified?: bool
 type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 type GroupChat = { id: string; name: string; members: User[] };
+type IncomingCall = { id: string; room: string; expiresAt: number; caller: User };
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const appVersion = packageInfo.version;
 app.addEventListener('contextmenu', event => event.preventDefault());
@@ -30,7 +31,6 @@ let blockedProfiles: User[] = [];
 let activeGroup: GroupChat | undefined;
 let creatingGroup = false;
 let groupPreselectedMemberIds: string[] = [];
-let showingGroupAddMenu = false;
 let noticeTimer: number | undefined;
 let voiceState: VoiceState = 'disconnected';
 let voiceMessage = 'Not connected';
@@ -42,6 +42,8 @@ let screenQualityOpen = false;
 let voiceRoom = '';
 let callFriend: User | undefined;
 let callGroup: GroupChat | undefined;
+let incomingCall: IncomingCall | undefined;
+let outgoingCallInviteId = '';
 let voiceMuted = false;
 let unreadCounts: Record<string, number> = {};
 let authMode: 'login' | 'signup' = 'signup';
@@ -76,7 +78,7 @@ const attachmentUrlCache = new Map<string, string>();
 const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
 const autoPreviewStarted = new Set<string>();
-const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; screenQualityOpen = false; } render(); });
+const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -240,23 +242,57 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { showingGroupAddMenu = false; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
-function openGroup(group: GroupChat) { showingGroupAddMenu = false; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
 
-async function toggleCall() {
-  if (voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting') { voiceRoom = ''; voiceMuted = false; voice.leave(); return; }
+async function cancelOutgoingCallInvite() {
+  const id = outgoingCallInviteId; outgoingCallInviteId = '';
+  if (id && token) try { await api(`/calls/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }); } catch {}
+}
+async function refreshIncomingCall() {
+  if (!me) return;
+  if (callActiveState()) { incomingCall = undefined; return; }
+  const result = await api<{ invites: IncomingCall[] }>('/calls/incoming');
+  incomingCall = result.invites[0];
+}
+function callActiveState() { return voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting'; }
+function callRailMarkup() {
+  if (callActiveState() && (callFriend || callGroup)) return `<button type="button" class="rail-call-user" data-call-return title="Return to active call" aria-label="Return to active call">${callGroup ? '<span class="group-chat-icon">✦</span>' : avatar(callFriend!, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>`;
+  if (incomingCall) return `<button type="button" class="incoming-call-rail" data-join-call title="Join ${esc(displayName(incomingCall.caller))}'s call" aria-label="Join call with ${esc(displayName(incomingCall.caller))}"><span class="incoming-call-avatar">${avatar(incomingCall.caller, 'rail-call-avatar')}<span class="incoming-call-speaker" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12"/></svg></span></span><small>JOIN CALL</small></button>`;
+  return '';
+}
+async function joinIncomingCall() {
+  const invite = incomingCall;
+  if (!invite || !me) return;
+  try {
+    const result = await api<{ caller: User }>(`/calls/invites/${encodeURIComponent(invite.id)}/accept`, { method: 'POST', body: '{}' });
+    incomingCall = undefined;
+    activeFriend = { ...invite.caller, ...result.caller }; activeGroup = undefined; messages = []; messageSearch = '';
+    settingsOpen = false; friendsPanel = 'friends';
+    await refreshMessages(activeFriend);
+    render();
+    await toggleCall(false);
+  } catch (error) { incomingCall = undefined; showError(error); }
+}
+
+async function toggleCall(invitePeer = true) {
+  if (callActiveState()) { voiceRoom = ''; voiceMuted = false; voice.leave(); return; }
   if (!me || !activeFriend) return;
   if (!cryptoReady) { showError(new Error('This device’s encryption key is not ready. Sign out and back in, then retry.')); return; }
   const endpoint = signalUrl();
   try {
     const target = activeFriend;
     const key = await voiceEncryptionKey(me.id, target.id, fetchFriendKey);
+    if (invitePeer) {
+      const invite = await api<{ id: string }>('/calls/invite', { method: 'POST', body: JSON.stringify({ friendId: target.id }) });
+      outgoingCallInviteId = invite.id;
+    }
     callFriend = target;
     voiceRoom = chatRoom(target);
     callGroup = undefined;
     await voice.join(endpoint, voiceRoom, target.id, token, key, 'dm', async peerId => voiceEncryptionKey(me!.id, peerId, fetchFriendKey));
-  } catch (error) { showError(error); }
+  } catch (error) { await cancelOutgoingCallInvite(); showError(error); }
 }
 async function toggleGroupCall(group: GroupChat) {
   if (voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting') { voiceRoom = ''; voiceMuted = false; voice.leave(); return; }
@@ -271,7 +307,7 @@ async function toggleGroupCall(group: GroupChat) {
     await voice.join(endpoint, voiceRoom, group.id, token, key, 'group', peerId => voiceEncryptionKey(me!.id, peerId, fetchFriendKey));
   } catch (error) { showError(error); }
 }
-function leaveCall() { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; voice.leave(); }
+function leaveCall() { void cancelOutgoingCallInvite(); voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; voice.leave(); }
 
 const maxAttachmentBytes = 750_000_000;
 const attachmentChunkBytes = 8 * 1024 * 1024;
@@ -414,7 +450,7 @@ function render() {
   const callAvatars = activeCallUsers.slice(0, 5).map((member, index) => avatar(member, `active-call-avatar ${index === 0 ? 'call-self-avatar' : `call-peer-avatar ${voiceState === 'connected' ? 'connected' : ''}`}`)).join('');
   const callBar = callVisible ? `<section class="active-call-bar" aria-label="Voice call controls"><div class="active-call-info"><div class="active-call-avatars">${callAvatars}${activeCallUsers.length > 5 ? `<span class="call-avatar-overflow">+${activeCallUsers.length - 5}</span>` : ''}</div><div class="active-call-copy"><span class="call-context">${callGroup ? 'GROUP VOICE CALL' : 'DIRECT VOICE CALL'}</span><strong>${esc(callTitle)}</strong><span class="call-connection"><span class="call-live-dot ${voiceState === 'connected' ? 'connected' : ''}"></span>${esc(voiceState === 'connected' ? `${callParticipants.length + 1} in call` : voiceState === 'reconnecting' ? 'Reconnecting…' : voiceState === 'connecting' ? 'Connecting…' : callParticipants.length ? 'Connecting to group…' : 'Waiting for someone to join…')}</span></div></div><div class="active-call-actions"><div class="stream-menu-wrap"><div class="stream-split"><button type="button" id="screen-share-button" class="call-control compact screen-share-button ${screenSharing ? 'sharing' : ''}" aria-label="${screenSharing ? 'Stop screen share' : 'Share screen'}" title="${screenSharing ? 'Stop sharing' : 'Share screen'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4m-2-8 2-2 2 2m-2-2v5"/></svg><span>${screenSharing ? 'Stop sharing' : 'Share screen'}</span></button><button type="button" id="screen-quality-toggle" class="stream-quality-toggle" aria-label="Stream quality settings" aria-expanded="${screenQualityOpen}" title="Stream settings"><span>⌄</span></button></div>${screenQualityOpen ? `<div class="screen-quality-menu" role="group" aria-label="Stream quality settings"><strong>Stream quality</strong><label><span>Resolution</span><select id="screen-resolution" aria-label="Screen resolution">${resolutionOptions}</select></label><label><span>Frame rate</span><select id="screen-fps" aria-label="Screen frame rate">${fpsOptions}</select></label></div>` : ''}</div><button type="button" id="call-mute" class="call-control compact call-mute-button ${voiceMuted ? 'muted' : ''}" aria-label="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}" title="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4m-4 0h8"/>${voiceMuted ? '<path d="m4 4 16 16"/>' : ''}</svg><span>${voiceMuted ? 'Unmute' : 'Mute'}</span></button><span class="call-action-divider"></span><button type="button" id="call-leave" class="call-control compact leave-call" aria-label="Leave call" title="Leave call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15.5c4.9-4.4 13.1-4.4 18 0l-2.3 3.2a1.5 1.5 0 0 1-1.8.5l-2.4-1a1.5 1.5 0 0 1-.9-1.4v-1.1a11 11 0 0 0-3.2 0v1.1a1.5 1.5 0 0 1-.9 1.4l-2.4 1a1.5 1.5 0 0 1-1.8-.5L3 15.5Z"/></svg><span>Leave</span></button></div></section>` : '';
   const callScreenStage = callVisible && (screenSharing || voiceVideoPeers.length) ? `<section class="call-screen-stage" aria-label="Call screen shares">${screenSharing ? `<figure class="call-screen-tile local"><video autoplay muted playsinline data-local-screen></video><figcaption>You · sharing screen</figcaption></figure>` : ''}${voiceVideoPeers.map(peerId => `<figure class="call-screen-tile"><video autoplay playsinline data-screen-peer="${esc(peerId)}"></video><figcaption>${esc(callParticipants.find(peer => peer.id === peerId)?.name || 'Group member')} · shared screen</figcaption></figure>`).join('')}</section>` : '';
-  const railCall = callActive && (callFriend || callGroup) ? `<button type="button" class="rail-call-user" data-call-return title="Return to ${callGroup ? 'group call' : `call with ${esc(displayName(callFriend!))}`}" aria-label="Return to active call">${callGroup ? '<span class="group-chat-icon">✦</span>' : avatar(callFriend!, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>` : '';
+  const railCall = callRailMarkup();
   const friendProfile = friend ? `<div class="profile-banner" ${friend.banner ? `style="background-image:url('${esc(friend.banner)}')"` : ''}></div><div class="profile-detail-avatar">${avatar(friend, 'profile-detail-pic')}</div><section class="profile-detail-copy"><h2>${esc(displayName(friend))}</h2><span>@${esc(friend.username)}</span><p>${esc(friend.bio || 'No bio yet.')}</p></section><div class="profile-divider"></div><div class="profile-detail-meta"><strong>Pulse member</strong><span>Direct message</span></div>` : group ? `<div class="profilebar-empty group-profile"><div class="welcome-icon">✦</div><strong>${esc(group.name)}</strong><p>${group.members.length} members</p>${group.members.map(member => `<button class="group-member" type="button" data-user-context="${esc(member.id)}">${avatar(member, 'tiny')}<span>${esc(displayName(member))}${member.id === me!.id ? ' · you' : member.encryptionReady === false ? ' · update needed' : ''}</span></button>`).join('')}</div>` : `<div class="profilebar-empty"><div class="welcome-icon">✦</div><strong>Your conversation</strong><p>Choose a friend or group to start chatting.</p></div>`;
   const friendsTitle = friendsPanel === 'requests' ? 'Friend requests' : friendsPanel === 'add' ? 'Add a friend' : 'Friends';
   const friendPanelContent = friendsPanel === 'friends'
@@ -427,7 +463,7 @@ function render() {
     ${friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
     <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
-  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend ? `<div class="add-to-group-wrap"><button type="button" id="add-to-group-button" class="call-button" aria-expanded="${showingGroupAddMenu}">Add to group</button>${showingGroupAddMenu ? `<div class="add-to-group-menu" role="menu">${groups.filter(item => !item.members.some(member => member.id === friend.id)).map(item => `<button type="button" role="menuitem" data-add-current-group="${esc(item.id)}">${esc(item.name)}</button>`).join('')}<button type="button" role="menuitem" class="create-group-option" id="create-group-with-friend">＋ Create group with ${esc(displayName(friend))}</button></div>` : ''}</div>` : ''}${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
+  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>${incomingCall?.caller.id === friend.id ? 'Join call' : 'Call'}</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
     ${callBar}${callScreenStage}${conversation ? `<label class="chat-search"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files here to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
     ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : `🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}`}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
@@ -450,6 +486,7 @@ function render() {
     catch (error) { showError(error); }
   });
   app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callGroup) openGroup(callGroup); });
+  app.querySelector<HTMLButtonElement>('[data-join-call]')?.addEventListener('click', () => { void joinIncomingCall(); });
   app.querySelectorAll<HTMLButtonElement>('[data-accept]').forEach(button => button.onclick = async () => { try { await api(`/friends/${button.dataset.accept}/accept`, { method: 'POST', body: '{}' }); await refreshFriends(); render(); } catch (e) { showError(e); } });
   app.querySelector<HTMLFormElement>('#add-friend')?.addEventListener('submit', async e => { e.preventDefault(); const form = new FormData(e.currentTarget as HTMLFormElement); try { await api('/friends', { method: 'POST', body: JSON.stringify({ username: form.get('username') }) }); await refreshFriends(); notice = 'Friend request sent.'; friendsPanel = 'requests'; render(); } catch (error) { showError(error); } });
   app.querySelectorAll<HTMLButtonElement>('[data-friends-panel]').forEach(button => button.onclick = () => { friendsPanel = button.dataset.friendsPanel as typeof friendsPanel; if (friendsPanel !== 'friends') { activeFriend = undefined; activeGroup = undefined; messages = []; } render(); });
@@ -574,10 +611,7 @@ function render() {
       catch (error) { showError(error); }
     });
   }
-  app.querySelector<HTMLButtonElement>('#call-button')?.addEventListener('click', () => { if (friend) void toggleCall(); else if (group) void toggleGroupCall(group); });
-  app.querySelector<HTMLButtonElement>('#add-to-group-button')?.addEventListener('click', () => { showingGroupAddMenu = !showingGroupAddMenu; render(); });
-  app.querySelectorAll<HTMLButtonElement>('[data-add-current-group]').forEach(button => button.addEventListener('click', () => { showingGroupAddMenu = false; if (friend) void addFriendToGroup(button.dataset.addCurrentGroup!, friend.id); }));
-  app.querySelector<HTMLButtonElement>('#create-group-with-friend')?.addEventListener('click', () => { showingGroupAddMenu = false; if (friend) void createGroupWithFriend(friend); });
+  app.querySelector<HTMLButtonElement>('#call-button')?.addEventListener('click', () => { if (friend) { if (incomingCall?.caller.id === friend.id) void joinIncomingCall(); else void toggleCall(); } else if (group) void toggleGroupCall(group); });
   app.querySelector<HTMLButtonElement>('#call-mute')?.addEventListener('click', () => { voiceMuted = voice.toggleMute(); render(); });
   app.querySelector<HTMLButtonElement>('#call-leave')?.addEventListener('click', leaveCall);
   app.querySelector<HTMLButtonElement>('#screen-quality-toggle')?.addEventListener('click', () => { screenQualityOpen = !screenQualityOpen; render(); });
@@ -645,7 +679,7 @@ async function createGroupWithFriend(friend: User) {
   const name = `${displayName(me)} & ${displayName(friend)}`.slice(0, 60);
   try {
     const result = await api<{ group: GroupChat }>('/groups', { method: 'POST', body: JSON.stringify({ name, memberIds: [friend.id] }) });
-    groups = [...groups, result.group]; showingGroupAddMenu = false; openGroup(result.group); notice = `Group chat created with ${displayName(friend)}.`; render();
+    groups = [...groups, result.group]; openGroup(result.group); notice = `Group chat created with ${displayName(friend)}.`; render();
   } catch (error) { showError(error); }
 }
 app.addEventListener('contextmenu', event => {
@@ -684,12 +718,12 @@ app.addEventListener('contextmenu', event => {
 app.addEventListener('click', event => {
   const target = event.target as HTMLElement;
   const menu = app.querySelector('.pulse-context-menu'); if (menu && !menu.contains(target)) menu.remove();
-  const addMenu = app.querySelector('.add-to-group-menu'); if (showingGroupAddMenu && addMenu && !addMenu.contains(target) && !target.closest('#add-to-group-button')) { showingGroupAddMenu = false; addMenu.remove(); }
 });
 
 async function signOut() {
+  await cancelOutgoingCallInvite();
   try { await api('/logout', { method: 'POST', body: '{}' }); } catch {}
-  token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; groups = []; settingsOpen = false;
+  token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; groups = []; incomingCall = undefined; settingsOpen = false;
   localStorage.removeItem('pulse.authToken'); voice.leave(); renderAuth();
 }
 
@@ -721,7 +755,7 @@ function renderSettings() {
   if (!me) return;
   app.classList.add('settings-view');
   const callActive = voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting';
-  const railCall = callActive && (callFriend || callGroup) ? `<button type="button" class="rail-call-user" data-call-return title="Return to active ${callGroup ? 'group call' : `call with ${esc(displayName(callFriend!))}`}" aria-label="Return to active call">${callGroup ? '<span class="group-chat-icon">✦</span>' : avatar(callFriend!, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>` : '';
+  const railCall = callRailMarkup();
   const profileSettings = `<form id="profile-form" class="settings-form"><section class="settings-section"><div class="settings-section-heading"><div><h2>Profile appearance</h2><p>Choose how friends see you.</p></div></div>
     <div class="banner-tools"><label class="banner-preview" id="banner-preview" style="${me.banner ? `background-image:url('${esc(me.banner)}')` : ''}"><span>Click to choose a banner</span><input type="file" id="banner-file" accept="image/png,image/jpeg,image/webp" aria-label="Choose banner image"></label><button type="button" class="text-button" id="clear-banner" ${me.banner ? '' : 'hidden'}>Remove banner</button></div>
     <div class="avatar-editor"><label class="profile-avatar-picker" title="Choose profile picture">${avatar(me, 'profile-large')}<span>Change</span><input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Choose profile picture"></label><button type="button" class="text-button" id="clear-avatar" ${me.avatar ? '' : 'hidden'}>Remove</button></div>
@@ -764,6 +798,7 @@ function renderSettings() {
   let clearBanner = false;
   app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; activeGroup = undefined; messages = []; render(); };
   app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callGroup) openGroup(callGroup); });
+  app.querySelector<HTMLButtonElement>('[data-join-call]')?.addEventListener('click', () => { void joinIncomingCall(); });
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
   app.querySelectorAll<HTMLButtonElement>('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab as typeof settingsTab; renderSettings(); if (settingsTab === 'calls') void refreshAudioDevices(); });
@@ -858,7 +893,7 @@ async function start() {
   } else renderAuth();
   window.setInterval(async () => {
     if (!me) return;
-    try { const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join(); const previousUnread = JSON.stringify(unreadCounts); const previousGroups = groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join(); await refreshFriends(); await refreshUnread(); if (previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join() || previousUnread !== JSON.stringify(unreadCounts) || previousGroups !== groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join()) render(); if (activeFriend || activeGroup) await refreshMessages(); }
+    try { const previousCallInvite = incomingCall?.id || ''; const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join(); const previousUnread = JSON.stringify(unreadCounts); const previousGroups = groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join(); await refreshIncomingCall(); await refreshFriends(); await refreshUnread(); if (previousCallInvite !== (incomingCall?.id || '') || previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join() || previousUnread !== JSON.stringify(unreadCounts) || previousGroups !== groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join()) render(); if (activeFriend || activeGroup) await refreshMessages(); }
     catch (error) { if (error instanceof Error && error.message === 'Sign in to continue.') { token = ''; me = undefined; localStorage.removeItem('pulse.authToken'); renderAuth(); } }
   }, 3000);
 }
