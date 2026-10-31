@@ -80,6 +80,7 @@ const attachmentUrlCache = new Map<string, string>();
 const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
 const autoPreviewStarted = new Set<string>();
+const senderEnvelopeMigrations = new Set<string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; voiceDeafened = false; screenViewOpen = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -234,6 +235,13 @@ async function refreshMessages(target: User | GroupChat | undefined = activeGrou
       const decryptionPeerId = !isGroup && message.from.id === me!.id && !message.selfCopy ? target.id : message.from.id;
       const text = await decryptMessage(me!.id, decryptionPeerId, message.iv, message.ciphertext, fetchFriendKey);
       decryptedCache.set(message.id, text);
+      if (!isGroup && message.from.id === me!.id && !message.selfCopy && message.iv && message.ciphertext && !senderEnvelopeMigrations.has(message.id)) {
+        senderEnvelopeMigrations.add(message.id);
+        void encryptMessage(me!.id, me!.id, text, fetchFriendKey)
+          .then(selfEnvelope => api(`/messages/${encodeURIComponent(message.id)}`, { method: 'PATCH', body: JSON.stringify({ iv: message.iv, ciphertext: message.ciphertext, selfEnvelope }) }))
+          .catch(() => undefined)
+          .finally(() => senderEnvelopeMigrations.delete(message.id));
+      }
       return { ...message, text };
     } catch (error) { return { ...message, text: error instanceof Error ? error.message : 'Could not decrypt this message.' }; }
   }));
