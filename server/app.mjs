@@ -28,14 +28,16 @@ function loadTotpKey() {
   catch (error) { if (error.code !== 'EEXIST') throw error; return readFileSync(totpKeyPath); }
 }
 const totpEncryptionKey = loadTotpKey();
-let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [], groups: [] };
+let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [], groups: [], suggestions: [] };
 if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
   catch { console.error(`Could not parse ${dbPath}; refusing to overwrite it.`); process.exit(1); }
 }
 for (const user of db.users) if (!user.key && user.username) user.key = String(user.username).trim().toLowerCase();
 db.groups ||= [];
+db.suggestions ||= [];
 const requestWindows = new Map();
+const suggestionWindows = new Map();
 const signupReservations = new Set();
 const emailReservations = new Set();
 const emailChallenges = new Map();
@@ -471,6 +473,17 @@ async function serve(req, res) {
         return json(res, 200, { profile: profileData(target) });
       }
       if (url.pathname === '/api/blocks' && req.method === 'GET') return json(res, 200, { blockedUsers: user.blockedUsers || [], users: (user.blockedUsers || []).map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(publicUser) });
+      if (url.pathname === '/api/suggestions' && req.method === 'POST') {
+        const text = String(body.text || '').trim();
+        if (text.length < 5 || text.length > 2000) return json(res, 400, { error: 'Suggestions must be 5–2,000 characters.' });
+        const now = Date.now(); const window = suggestionWindows.get(user.id) || { startedAt: now, count: 0 };
+        if (now - window.startedAt >= 60 * 60_000) { window.startedAt = now; window.count = 0; }
+        if (window.count >= 3) return json(res, 429, { error: 'You’ve sent several suggestions recently. Please try again later.' });
+        window.count += 1; suggestionWindows.set(user.id, window);
+        db.suggestions.push({ id: randomBytes(12).toString('hex'), userId: user.id, text, createdAt: new Date(now).toISOString() });
+        if (db.suggestions.length > 5000) db.suggestions.splice(0, db.suggestions.length - 5000);
+        persist(); return json(res, 201, { ok: true });
+      }
       const blockRequest = url.pathname.match(/^\/api\/users\/([a-f0-9]+)\/block$/);
       if (blockRequest && ['POST', 'DELETE'].includes(req.method)) {
         const targetId = blockRequest[1];
