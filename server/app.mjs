@@ -28,12 +28,13 @@ function loadTotpKey() {
   catch (error) { if (error.code !== 'EEXIST') throw error; return readFileSync(totpKeyPath); }
 }
 const totpEncryptionKey = loadTotpKey();
-let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [] };
+let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [], groups: [] };
 if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
   catch { console.error(`Could not parse ${dbPath}; refusing to overwrite it.`); process.exit(1); }
 }
 for (const user of db.users) if (!user.key && user.username) user.key = String(user.username).trim().toLowerCase();
+db.groups ||= [];
 const requestWindows = new Map();
 const signupReservations = new Set();
 const emailReservations = new Set();
@@ -53,7 +54,7 @@ function persist() {
   renameSync(temp, dbPath);
 }
 function json(res, status, value) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' });
   res.end(JSON.stringify(value));
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
@@ -73,6 +74,7 @@ function sessionUser(req) {
   return session ? db.users.find(u => u.id === session.userId) : undefined;
 }
 function friendship(a, b) { return db.friendships.find(f => (f.from === a && f.to === b) || (f.from === b && f.to === a)); }
+function isBlocked(a, b) { return db.users.some(candidate => candidate.id === a && (candidate.blockedUsers || []).includes(b)) || db.users.some(candidate => candidate.id === b && (candidate.blockedUsers || []).includes(a)); }
 function usernameKey(value) { return String(value || '').trim().toLowerCase(); }
 function usernameTaken(key) { return db.users.some(user => usernameKey(user.username || user.key) === key); }
 const emailKey = value => String(value || '').trim().toLowerCase();
@@ -223,7 +225,7 @@ async function sendEmailCode(email, purpose, userId = '') {
 }
 async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS' }); res.end(); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
     if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
@@ -380,7 +382,7 @@ async function serve(req, res) {
       if (url.pathname === '/api/attachments' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to));
         const id = String(body.id || ''); const size = Number(body.size); const ivPrefix = String(body.ivPrefix || '');
-        if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
+        if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
         if (!/^[a-f0-9]{32}$/.test(id) || db.attachments.some(item => item.id === id)) return json(res, 400, { error: 'Attachment ID is invalid.' });
         const prefix = Buffer.from(ivPrefix, 'base64');
         if (!Number.isSafeInteger(size) || size <= 0 || size > maxAttachmentBytes || prefix.length !== 8 || prefix.toString('base64') !== ivPrefix) return json(res, 400, { error: 'Attachment is invalid or larger than 750 MB.' });
@@ -464,13 +466,24 @@ async function serve(req, res) {
       const profileRequest = url.pathname.match(/^\/api\/profile\/([a-f0-9]+)$/);
       if (profileRequest && req.method === 'GET') {
         const target = db.users.find(candidate => candidate.id === profileRequest[1]);
-        if (!target || (target.id !== user.id && friendship(user.id, target.id)?.status !== 'accepted')) return json(res, 403, { error: 'Profile details are available to you and your friends.' });
+        const sharesGroup = db.groups.some(group => group.members.includes(user.id) && group.members.includes(target?.id));
+        if (!target || (target.id !== user.id && !sharesGroup && friendship(user.id, target.id)?.status !== 'accepted') || isBlocked(user.id, target.id)) return json(res, 403, { error: 'Profile details are available to you and your friends.' });
         return json(res, 200, { profile: profileData(target) });
+      }
+      if (url.pathname === '/api/blocks' && req.method === 'GET') return json(res, 200, { blockedUsers: user.blockedUsers || [], users: (user.blockedUsers || []).map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(publicUser) });
+      const blockRequest = url.pathname.match(/^\/api\/users\/([a-f0-9]+)\/block$/);
+      if (blockRequest && ['POST', 'DELETE'].includes(req.method)) {
+        const targetId = blockRequest[1];
+        if (targetId === user.id || !db.users.some(candidate => candidate.id === targetId)) return json(res, 404, { error: 'That account is unavailable.' });
+        user.blockedUsers ||= [];
+        if (req.method === 'POST' && !user.blockedUsers.includes(targetId)) user.blockedUsers.push(targetId);
+        if (req.method === 'DELETE') user.blockedUsers = user.blockedUsers.filter(id => id !== targetId);
+        persist(); return json(res, 200, { blockedUsers: user.blockedUsers });
       }
       if (url.pathname === '/api/logout' && req.method === 'POST') { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); db.sessions = db.sessions.filter(s => s.token !== token); persist(); return json(res, 200, { ok: true }); }
       if (url.pathname === '/api/voice/authorize' && req.method === 'POST') {
         const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
-        if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
+        if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
         const expectedRoom = `dm-${[user.id, target.id].sort().join('-')}`;
         if (body.room !== expectedRoom) return json(res, 403, { error: 'This voice room is not authorized.' });
         return json(res, 200, { user: publicUser(user) });
@@ -484,19 +497,19 @@ async function serve(req, res) {
       const publicKeyRequest = url.pathname.match(/^\/api\/keys\/([a-f0-9]+)$/);
       if (publicKeyRequest && req.method === 'GET') {
         const target = db.users.find(u => u.id === publicKeyRequest[1]);
-        if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Encryption keys are available to friends only.' });
+        if (!target || isBlocked(user.id, target.id) || (target.id !== user.id && friendship(user.id, target.id)?.status !== 'accepted')) return json(res, 403, { error: 'Encryption keys are available to you and your friends only.' });
         if (!target.publicKey) return json(res, 404, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
         return json(res, 200, { publicKey: target.publicKey });
       }
       if (url.pathname === '/api/friends' && req.method === 'GET') {
-        const friends = db.friendships.filter(f => f.status === 'accepted' && (f.from === user.id || f.to === user.id)).map(f => publicUser(db.users.find(u => u.id === (f.from === user.id ? f.to : f.from)))).filter(Boolean);
-        const incoming = db.friendships.filter(f => f.status === 'pending' && f.to === user.id).map(f => publicUser(db.users.find(u => u.id === f.from))).filter(Boolean);
-        const outgoing = db.friendships.filter(f => f.status === 'pending' && f.from === user.id).map(f => publicUser(db.users.find(u => u.id === f.to))).filter(Boolean);
+        const friends = db.friendships.filter(f => f.status === 'accepted' && (f.from === user.id || f.to === user.id) && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === (f.from === user.id ? f.to : f.from)))).filter(Boolean);
+        const incoming = db.friendships.filter(f => f.status === 'pending' && f.to === user.id && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === f.from))).filter(Boolean);
+        const outgoing = db.friendships.filter(f => f.status === 'pending' && f.from === user.id && !isBlocked(f.from, f.to)).map(f => publicUser(db.users.find(u => u.id === f.to))).filter(Boolean);
         return json(res, 200, { friends, incoming, outgoing });
       }
       if (url.pathname === '/api/friends' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.username));
-        if (!target) return json(res, 404, { error: 'No Pulse account has that username.' });
+        if (!target || isBlocked(user.id, target.id)) return json(res, 404, { error: 'No Pulse account has that username.' });
         if (target.id === user.id) return json(res, 400, { error: 'You cannot add yourself.' });
         const existing = friendship(user.id, target.id);
         if (existing) return json(res, 409, { error: existing.status === 'accepted' ? 'You are already friends.' : existing.to === user.id ? 'Accept the incoming request below.' : 'Friend request already sent.' });
@@ -509,6 +522,63 @@ async function serve(req, res) {
         if (!f) return json(res, 404, { error: 'That friend request is no longer available.' });
         f.status = 'accepted'; f.acceptedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
+      if (url.pathname === '/api/groups' && req.method === 'GET') {
+        const groups = db.groups.filter(group => group.members.includes(user.id)).map(group => ({ id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(publicUser) }));
+        return json(res, 200, { groups });
+      }
+      if (url.pathname === '/api/groups' && req.method === 'POST') {
+        const name = String(body.name || '').trim(); const requested = Array.isArray(body.memberIds) ? [...new Set(body.memberIds.map(String))] : [];
+        if (!name || name.length > 60) return json(res, 400, { error: 'Group name must be 1–60 characters.' });
+        if (requested.length < 2 || requested.length > 24 || requested.some(id => id === user.id || friendship(user.id, id)?.status !== 'accepted')) return json(res, 400, { error: 'Choose 2–24 accepted friends for the group.' });
+        const members = [user.id, ...requested];
+        if (members.some(id => !db.users.find(candidate => candidate.id === id)?.publicKey)) return json(res, 409, { error: 'Every group member must sign in to an updated Pulse app before group messaging.' });
+        const group = { id: randomBytes(16).toString('hex'), name, members, createdBy: user.id, createdAt: new Date().toISOString() };
+        db.groups.push(group); persist();
+        return json(res, 201, { group: { id: group.id, name: group.name, members: members.map(id => publicUser(db.users.find(candidate => candidate.id === id))) } });
+      }
+      const groupMessages = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})\/messages$/);
+      if (groupMessages && req.method === 'GET') {
+        const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
+        if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        const items = db.messages.filter(message => message.groupId === group.id).slice(-200);
+        return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, encryptionVersion: 1 } : { encryptionVersion: 2 }), createdAt: message.createdAt }; }) });
+      }
+      if (groupMessages && req.method === 'POST') {
+        const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
+        if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        const envelopes = body.envelopes;
+        if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || Object.keys(envelopes).length !== group.members.length) return json(res, 400, { error: 'Encrypted message must include one envelope for every group member.' });
+        for (const memberId of group.members) {
+          const envelope = envelopes[memberId];
+          if (!envelope || typeof envelope.ciphertext !== 'string' || envelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.ciphertext) || typeof envelope.iv !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.iv) || Buffer.from(envelope.iv, 'base64').length !== 12) return json(res, 400, { error: 'A group message encryption envelope is invalid.' });
+        }
+        const message = { id: randomBytes(12).toString('hex'), groupId: group.id, from: user.id, envelopes, createdAt: new Date().toISOString() }; db.messages.push(message); persist();
+        return json(res, 201, { ok: true });
+      }
+      const groupMemberRequest = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})\/members$/);
+      if (groupMemberRequest && req.method === 'POST') {
+        const group = db.groups.find(item => item.id === groupMemberRequest[1] && item.members.includes(user.id));
+        const target = db.users.find(candidate => candidate.id === String(body.userId || ''));
+        if (!group || !target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted' || isBlocked(user.id, target.id)) return json(res, 403, { error: 'You can add accepted, unblocked friends to this group.' });
+        if (!target.publicKey) return json(res, 409, { error: 'That friend needs to sign in to an updated Pulse app first.' });
+        if (!group.members.includes(target.id)) { if (group.members.length >= 25) return json(res, 400, { error: 'This group already has 25 members.' }); group.members.push(target.id); persist(); }
+        return json(res, 200, { group: { id: group.id, name: group.name, members: group.members.map(id => publicUser(db.users.find(candidate => candidate.id === id))) } });
+      }
+      const groupRequest = url.pathname.match(/^\/api\/groups\/([a-f0-9]{32})$/);
+      if (groupRequest && req.method === 'POST') {
+        const group = db.groups.find(item => item.id === groupRequest[1] && item.members.includes(user.id));
+        const name = String(body.name || '').trim();
+        if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        if (!name || name.length > 60) return json(res, 400, { error: 'Group name must be 1–60 characters.' });
+        group.name = name; persist(); return json(res, 200, { ok: true });
+      }
+      if (groupRequest && req.method === 'DELETE') {
+        const groupIndex = db.groups.findIndex(item => item.id === groupRequest[1] && item.members.includes(user.id));
+        if (groupIndex < 0) return json(res, 404, { error: 'Group chat not found.' });
+        const group = db.groups[groupIndex]; group.members = group.members.filter(id => id !== user.id);
+        if (!group.members.length) db.groups.splice(groupIndex, 1);
+        persist(); return json(res, 200, { ok: true });
+      }
       if (url.pathname === '/api/messages/unread' && req.method === 'GET') {
         const unread = {};
         for (const message of db.messages) {
@@ -520,7 +590,7 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/messages' && req.method === 'GET') {
         const target = db.users.find(u => u.key === usernameKey(url.searchParams.get('with')));
-        if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
+        if (!target || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
         let markedRead = false;
         for (const message of db.messages) {
           if (message.from !== target.id || message.to !== user.id || message.readBy?.includes(user.id)) continue;
@@ -532,7 +602,7 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/messages' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
-        if (!target || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
+        if (!target || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
         if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
         if (!ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
         const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, createdAt: new Date().toISOString() }; db.messages.push(message); persist();

@@ -6,7 +6,9 @@ import { VoiceClient, type ScreenShareSettings, type VoiceState, type VoiceUpdat
 type User = { id: string; username: string; email?: string; emailVerified?: boolean; twoFactorEnabled?: boolean; authenticatorEnabled?: boolean; displayName?: string; bio?: string; profileVersion?: string; avatar?: string; banner?: string };
 type ChatMessage = { id: string; from: User; text: string; createdAt: string; iv?: string; ciphertext?: string; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
+type GroupChat = { id: string; name: string; members: User[] };
 const app = document.querySelector<HTMLDivElement>('#app')!;
+app.addEventListener('contextmenu', event => event.preventDefault());
 const runningInTauri = window.location.protocol === 'tauri:' || '__TAURI_INTERNALS__' in window;
 const apiBase = (import.meta.env.VITE_PULSE_API_URL || (runningInTauri ? 'https://pulse.overclockd.shop' : window.location.origin)).replace(/\/$/, '');
 let token = localStorage.getItem('pulse.authToken') || '';
@@ -15,6 +17,11 @@ let me: User | undefined;
 let friends: Friends = { friends: [], incoming: [], outgoing: [] };
 let messages: ChatMessage[] = [];
 let activeFriend: User | undefined;
+let groups: GroupChat[] = [];
+let blockedUsers: string[] = [];
+let blockedProfiles: User[] = [];
+let activeGroup: GroupChat | undefined;
+let creatingGroup = false;
 let voiceState: VoiceState = 'disconnected';
 let voiceMessage = 'Not connected';
 let voicePeers: string[] = [];
@@ -135,8 +142,18 @@ async function refreshFriends() {
     return cached && cached.profileVersion === friend.profileVersion ? { ...friend, avatar: cached.avatar, banner: cached.banner } : hydrateProfile(friend);
   }));
   friends = updated;
+  try { const result = await api<{ blockedUsers: string[]; users: User[] }>('/blocks'); blockedUsers = result.blockedUsers || []; blockedProfiles = result.users || []; } catch { blockedUsers = []; blockedProfiles = []; }
   if (activeFriend) activeFriend = friends.friends.find(friend => friend.id === activeFriend!.id) || activeFriend;
   if (callFriend) callFriend = friends.friends.find(friend => friend.id === callFriend!.id) || callFriend;
+  await refreshGroups();
+}
+async function refreshGroups() {
+  try {
+    const previous = new Map(groups.flatMap(group => group.members.map(member => [member.id, member] as const)));
+    const result = await api<{ groups: GroupChat[] }>('/groups');
+    groups = await Promise.all(result.groups.map(async group => ({ ...group, members: await Promise.all(group.members.map(async member => { if (member.id === me?.id) return me; const cached = previous.get(member.id); return cached && cached.profileVersion === member.profileVersion ? { ...member, avatar: cached.avatar, banner: cached.banner, bio: cached.bio } : hydrateProfile(member); })) })));
+    if (activeGroup) activeGroup = groups.find(group => group.id === activeGroup!.id) || activeGroup;
+  } catch { groups = []; }
 }
 const displayName = (user: User) => user.displayName?.trim() || user.username;
 const avatar = (user: User, className = '') => `<span class="avatar ${className}"${user.avatar ? ` style="background-image:url('${esc(user.avatar)}');background-size:cover;background-position:center;color:transparent"` : ''}>${user.avatar ? '' : esc(displayName(user)[0]?.toUpperCase() || '?')}</span>`;
@@ -176,24 +193,25 @@ async function initializeAccountCrypto(user: User) {
   await initializeIdentity(user.id, async publicKey => { await api('/keys', { method: 'POST', body: JSON.stringify({ publicKey }) }); });
   cryptoReady = true;
 }
-async function refreshMessages(target = activeFriend) {
+async function refreshMessages(target: User | GroupChat | undefined = activeGroup || activeFriend) {
   if (!target) { messages = []; return; }
-  const result = await api<{ messages: ChatMessage[] }>(`/messages?with=${encodeURIComponent(target.username)}`);
-  await refreshUnread();
-  const friendId = target.id;
+  const isGroup = 'members' in target;
+  const result = await api<{ messages: ChatMessage[] }>(isGroup ? `/groups/${encodeURIComponent(target.id)}/messages` : `/messages?with=${encodeURIComponent(target.username)}`);
+  if (!isGroup) await refreshUnread();
   const decrypted = await Promise.all(result.messages.map(async message => {
-    const senderProfile = message.from.id === me!.id ? me! : target;
+    const senderProfile = message.from.id === me!.id ? me! : isGroup ? target.members.find(member => member.id === message.from.id) || message.from : target;
     const from = { ...message.from, displayName: senderProfile.displayName || message.from.displayName, avatar: senderProfile.avatar, banner: senderProfile.banner, bio: senderProfile.bio };
     message = { ...message, from };
+    if (message.encryptionVersion === 2) return { ...message, text: 'This message was sent before you joined the group.' };
     if (message.encryptionVersion !== 1 || !message.ciphertext || !message.iv) return { ...message, text: 'This older message was sent before encryption was enabled.' };
     if (decryptedCache.has(message.id)) return { ...message, text: decryptedCache.get(message.id)! };
     try {
-      const text = await decryptMessage(me!.id, friendId, message.iv, message.ciphertext, fetchFriendKey);
+      const text = await decryptMessage(me!.id, message.from.id, message.iv, message.ciphertext, fetchFriendKey);
       decryptedCache.set(message.id, text);
       return { ...message, text };
     } catch (error) { return { ...message, text: error instanceof Error ? error.message : 'Could not decrypt this message.' }; }
   }));
-  if (activeFriend?.id !== target.id) return;
+  if (isGroup ? activeGroup?.id !== target.id : activeFriend?.id !== target.id) return;
   const changed = decrypted.length !== messages.length || decrypted.at(-1)?.id !== messages.at(-1)?.id || decrypted.at(-1)?.text !== messages.at(-1)?.text;
   messages = decrypted;
   if (changed && me) render();
@@ -203,7 +221,8 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { activeFriend = friend; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { activeGroup = undefined; activeFriend = friend; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { activeFriend = undefined; activeGroup = group; messages = []; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
 
 async function toggleCall() {
@@ -264,6 +283,8 @@ function render() {
   const draft = app.querySelector<HTMLInputElement>('#message-input')?.value || '';
   const wasComposing = document.activeElement === app.querySelector<HTMLInputElement>('#message-input');
   const friend = activeFriend;
+  const group = activeGroup;
+  const conversation = friend || group;
   const callActive = voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting';
   const callVisible = callActive && !!friend && friend.id === callFriend?.id;
   const screenSize = screenResolution === '720' ? { width: 1280, height: 720 } : screenResolution === '1440' ? { width: 2560, height: 1440 } : { width: 1920, height: 1080 };
@@ -273,10 +294,10 @@ function render() {
   const callBar = callVisible ? `<section class="active-call-bar" aria-label="Voice call controls"><div class="active-call-info"><div class="active-call-avatars">${avatar(me!, 'active-call-avatar call-self-avatar')}${avatar(callFriend!, `active-call-avatar call-peer-avatar ${voiceState === 'connected' ? 'connected' : ''}`)}</div><div class="active-call-copy"><span class="call-context">DIRECT VOICE CALL</span><strong>${esc(displayName(callFriend!))}</strong><span class="call-connection"><span class="call-live-dot ${voiceState === 'connected' ? 'connected' : ''}"></span>${esc(voiceState === 'connected' ? 'Voice connected' : voiceState === 'reconnecting' ? 'Reconnecting…' : voiceState === 'connecting' ? 'Connecting…' : 'Waiting for them to join…')}</span></div></div><div class="screen-share-settings"><label title="Shared screen resolution"><span>Resolution</span><select id="screen-resolution" aria-label="Screen resolution">${resolutionOptions}</select></label><label title="Shared screen frame rate"><span>Frame rate</span><select id="screen-fps" aria-label="Screen frame rate">${fpsOptions}</select></label></div><div class="active-call-actions"><button type="button" id="screen-share-button" class="call-control compact screen-share-button ${screenSharing ? 'sharing' : ''}" aria-label="${screenSharing ? 'Stop screen share' : 'Choose a monitor or app to share'}" title="${screenSharing ? 'Stop screen share' : 'Choose a monitor or app window'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4m-2-8 2-2 2 2m-2-2v5"/></svg><span>${screenSharing ? 'Stop sharing' : 'Share screen'}</span></button><button type="button" id="call-mute" class="call-control compact call-mute-button ${voiceMuted ? 'muted' : ''}" aria-label="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}" title="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4m-4 0h8"/>${voiceMuted ? '<path d="m4 4 16 16"/>' : ''}</svg><span>${voiceMuted ? 'Unmute' : 'Mute'}</span></button><span class="call-action-divider"></span><button type="button" id="call-leave" class="call-control compact leave-call" aria-label="Leave call" title="Leave call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15.5c4.9-4.4 13.1-4.4 18 0l-2.3 3.2a1.5 1.5 0 0 1-1.8.5l-2.4-1a1.5 1.5 0 0 1-.9-1.4v-1.1a11 11 0 0 0-3.2 0v1.1a1.5 1.5 0 0 1-.9 1.4l-2.4 1a1.5 1.5 0 0 1-1.8-.5L3 15.5Z"/></svg><span>Leave</span></button></div></section>` : '';
   const callScreenStage = callVisible && (screenSharing || voiceVideoPeers.length) ? `<section class="call-screen-stage" aria-label="Call screen shares">${screenSharing ? `<figure class="call-screen-tile local"><video autoplay muted playsinline data-local-screen></video><figcaption>You · sharing screen</figcaption></figure>` : ''}${voiceVideoPeers.map(peerId => `<figure class="call-screen-tile"><video autoplay playsinline data-screen-peer="${esc(peerId)}"></video><figcaption>${esc(displayName(callFriend!))} · shared screen</figcaption></figure>`).join('')}</section>` : '';
   const railCall = callActive && callFriend ? `<button type="button" class="rail-call-user" data-call-return title="Return to call with ${esc(displayName(callFriend))}" aria-label="Return to call with ${esc(displayName(callFriend))}">${avatar(callFriend, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>` : '';
-  const friendProfile = friend ? `<div class="profile-banner" ${friend.banner ? `style="background-image:url('${esc(friend.banner)}')"` : ''}></div><div class="profile-detail-avatar">${avatar(friend, 'profile-detail-pic')}</div><section class="profile-detail-copy"><h2>${esc(displayName(friend))}</h2><span>@${esc(friend.username)}</span><p>${esc(friend.bio || 'No bio yet.')}</p></section><div class="profile-divider"></div><div class="profile-detail-meta"><strong>Pulse member</strong><span>Direct message</span></div>` : `<div class="profilebar-empty"><div class="welcome-icon">✦</div><strong>Your conversation</strong><p>Choose a friend to see their profile here.</p></div>`;
+  const friendProfile = friend ? `<div class="profile-banner" ${friend.banner ? `style="background-image:url('${esc(friend.banner)}')"` : ''}></div><div class="profile-detail-avatar">${avatar(friend, 'profile-detail-pic')}</div><section class="profile-detail-copy"><h2>${esc(displayName(friend))}</h2><span>@${esc(friend.username)}</span><p>${esc(friend.bio || 'No bio yet.')}</p></section><div class="profile-divider"></div><div class="profile-detail-meta"><strong>Pulse member</strong><span>Direct message</span></div>` : group ? `<div class="profilebar-empty group-profile"><div class="welcome-icon">✦</div><strong>${esc(group.name)}</strong><p>${group.members.length} members</p>${group.members.map(member => `<button class="group-member" type="button" data-user-context="${esc(member.id)}">${avatar(member, 'tiny')}<span>${esc(displayName(member))}${member.id === me!.id ? ' · you' : ''}</span></button>`).join('')}</div>` : `<div class="profilebar-empty"><div class="welcome-icon">✦</div><strong>Your conversation</strong><p>Choose a friend or group to start chatting.</p></div>`;
   const friendsTitle = friendsPanel === 'requests' ? 'Friend requests' : friendsPanel === 'add' ? 'Add a friend' : 'Friends';
   const friendPanelContent = friendsPanel === 'friends'
-    ? `<div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<div class="friend-list-row"><button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}">${avatar(f, 'tiny')}<span>${esc(displayName(f))}</span>${unreadCounts[f.id] ? `<span class="unread-count" aria-label="${unreadCounts[f.id]} unread messages">${unreadCounts[f.id] > 99 ? '99+' : unreadCounts[f.id]}</span>` : ''}</button><button class="friend-call" data-call-friend="${esc(f.id)}" title="Call ${esc(displayName(f))}" aria-label="Call ${esc(displayName(f))}">☎</button></div>`).join('') || '<p class="side-empty">Your friends will show up here.</p>'}`
+    ? `<div class="section-title">GROUP CHATS <button type="button" class="mini-add" id="new-group" title="Create group chat" aria-label="Create group chat">＋</button></div>${groups.map(item => `<button type="button" class="nav-item dm-item group-chat-item ${group?.id === item.id ? 'selected' : ''}" data-group="${esc(item.id)}"><span class="group-chat-icon">✦</span><span>${esc(item.name)}</span></button>`).join('') || '<p class="side-empty">No group chats yet.</p>'}${creatingGroup ? `<form id="create-group" class="group-create"><label>Group name<input name="name" required maxlength="60" placeholder="e.g. Game night"></label><small>Choose at least 2 friends</small>${friends.friends.map(member => `<label class="group-choice"><input type="checkbox" name="members" value="${esc(member.id)}">${esc(displayName(member))}</label>`).join('')}<div class="group-create-actions"><button type="button" class="secondary-button" id="cancel-group">Cancel</button><button type="submit" class="primary-button">Create group</button></div></form>` : ''}<div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<div class="friend-list-row"><button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}" data-user-context="${esc(f.id)}">${avatar(f, 'tiny')}<span>${esc(displayName(f))}</span>${unreadCounts[f.id] ? `<span class="unread-count" aria-label="${unreadCounts[f.id]} unread messages">${unreadCounts[f.id] > 99 ? '99+' : unreadCounts[f.id]}</span>` : ''}</button><button class="friend-call" data-call-friend="${esc(f.id)}" title="Call ${esc(displayName(f))}" aria-label="Call ${esc(displayName(f))}">☎</button></div>`).join('') || '<p class="side-empty">Your friends will show up here.</p>'}`
     : friendsPanel === 'requests'
       ? `<div class="section-title">INCOMING <span>${friends.incoming.length}</span></div>${friends.incoming.map(f => `<div class="request-row"><span>${esc(f.username)}</span><button class="accept-button" data-accept="${esc(f.id)}">Accept</button></div>`).join('') || '<p class="side-empty">No new requests.</p>'}<div class="section-title">SENT</div>${friends.outgoing.map(f => `<p class="side-empty">Request sent to ${esc(f.username)}</p>`).join('') || '<p class="side-empty">No pending requests.</p>'}`
       : `<p class="side-empty add-friend-help">Add someone by their Pulse username. They’ll appear in Friends after they accept.</p><form id="add-friend" class="add-friend"><input name="username" required minlength="3" maxlength="24" placeholder="Pulse username"/><button title="Send friend request" aria-label="Send friend request">＋</button></form>`;
@@ -285,15 +306,23 @@ function render() {
     ${friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
     <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
     <div class="side-scroll"><section>${friendPanelContent}</section></div><div class="sidebar-settings"><button class="settings-open" id="settings-open-sidebar"><span>⚙</span> Settings</button></div></aside>
-  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : '✦'}</span><div><h1>${friend ? esc(displayName(friend)) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
-    ${callBar}${callScreenStage}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${friend ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>Say hello to ${esc(displayName(friend))}</h2><p>Messages in this conversation will appear here.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend to start chatting, or send a request to someone new.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
-    ${friend ? `<form id="composer" class="composer"><button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/><input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend.username)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint" id="attachment-status">🔒 E2E encrypted · drop files here · 750 MB max</div></form>` : ''}
+  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
+    ${callBar}${callScreenStage}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time></div>${messageBody(m.text)}</div></article>`).join('') : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
+    ${conversation ? `<form id="composer" class="composer">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="Message ${esc(friend ? friend.username : group!.name)}"/><button class="send" type="submit" title="Send encrypted message" ${cryptoReady ? '' : 'disabled'}>↑</button><div class="composer-hint" id="attachment-status">🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
 
   const localScreenVideo = app.querySelector<HTMLVideoElement>('[data-local-screen]');
   if (localScreenVideo) { localScreenVideo.srcObject = voice.getLocalScreenStream() || null; void localScreenVideo.play().catch(() => undefined); }
   app.querySelectorAll<HTMLVideoElement>('[data-screen-peer]').forEach(video => { video.srcObject = voice.getRemoteScreenStream(video.dataset.screenPeer || '') || null; void video.play().catch(() => undefined); });
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
+  app.querySelectorAll<HTMLButtonElement>('[data-group]').forEach(button => button.onclick = () => { const selected = groups.find(item => item.id === button.dataset.group); if (selected) openGroup(selected); });
+  app.querySelector<HTMLButtonElement>('#new-group')?.addEventListener('click', () => { creatingGroup = !creatingGroup; render(); });
+  app.querySelector<HTMLButtonElement>('#cancel-group')?.addEventListener('click', () => { creatingGroup = false; render(); });
+  app.querySelector<HTMLFormElement>('#create-group')?.addEventListener('submit', async event => {
+    event.preventDefault(); const form = new FormData(event.currentTarget as HTMLFormElement); const memberIds = form.getAll('members').map(String);
+    try { const result = await api<{ group: GroupChat }>('/groups', { method: 'POST', body: JSON.stringify({ name: form.get('name'), memberIds }) }); groups = [...groups, result.group]; creatingGroup = false; openGroup(result.group); }
+    catch (error) { showError(error); }
+  });
   app.querySelectorAll<HTMLButtonElement>('[data-call-friend]').forEach(button => button.onclick = () => {
     const selected = friends.friends.find(f => f.id === button.dataset.callFriend);
     if (!selected) return;
@@ -303,20 +332,24 @@ function render() {
       else showError(new Error(`Leave your call with ${displayName(callFriend!)} before calling someone else.`));
       return;
     }
-    activeFriend = selected; messages = []; render(); void toggleCall();
+    activeFriend = selected; activeGroup = undefined; messages = []; render(); void toggleCall();
   });
   app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { if (!callFriend) return; settingsOpen = false; friendsPanel = 'friends'; openFriend(callFriend); });
   app.querySelectorAll<HTMLButtonElement>('[data-accept]').forEach(button => button.onclick = async () => { try { await api(`/friends/${button.dataset.accept}/accept`, { method: 'POST', body: '{}' }); await refreshFriends(); render(); } catch (e) { showError(e); } });
   app.querySelector<HTMLFormElement>('#add-friend')?.addEventListener('submit', async e => { e.preventDefault(); const form = new FormData(e.currentTarget as HTMLFormElement); try { await api('/friends', { method: 'POST', body: JSON.stringify({ username: form.get('username') }) }); await refreshFriends(); notice = 'Friend request sent.'; friendsPanel = 'requests'; render(); } catch (error) { showError(error); } });
-  app.querySelectorAll<HTMLButtonElement>('[data-friends-panel]').forEach(button => button.onclick = () => { friendsPanel = button.dataset.friendsPanel as typeof friendsPanel; if (friendsPanel !== 'friends') { activeFriend = undefined; messages = []; } render(); });
-  app.querySelector<HTMLButtonElement>('#friends-home')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; messages = []; render(); });
+  app.querySelectorAll<HTMLButtonElement>('[data-friends-panel]').forEach(button => button.onclick = () => { friendsPanel = button.dataset.friendsPanel as typeof friendsPanel; if (friendsPanel !== 'friends') { activeFriend = undefined; activeGroup = undefined; messages = []; } render(); });
+  app.querySelector<HTMLButtonElement>('#friends-home')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; activeGroup = undefined; messages = []; render(); });
   const openSettings = () => { settingsOpen = true; settingsTab = 'profile'; render(); };
   app.querySelector<HTMLButtonElement>('#settings-open')?.addEventListener('click', openSettings);
   app.querySelector<HTMLButtonElement>('#settings-open-sidebar')?.addEventListener('click', openSettings);
   const friendSearch = app.querySelector<HTMLInputElement>('#friend-search');
   friendSearch?.addEventListener('input', () => { const query = friendSearch.value.trim().toLowerCase(); app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => { button.hidden = !button.textContent?.toLowerCase().includes(query); }); });
   const composer = app.querySelector<HTMLFormElement>('#composer');
-  if (composer && friend) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); if (!text) return; input.disabled = true; try { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); input.value = ''; await refreshMessages(); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus(); } catch (error) { showError(error); input.disabled = false; } };
+  if (composer && conversation) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); if (!text) return; input.disabled = true; try {
+    if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope }) }); }
+    else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members) envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); await api(`/groups/${encodeURIComponent(group.id)}/messages`, { method: 'POST', body: JSON.stringify({ envelopes }) }); }
+    input.value = ''; await refreshMessages(conversation); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus();
+  } catch (error) { showError(error); input.disabled = false; } };
   app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => app.querySelector<HTMLInputElement>('#attachment-input')?.click());
   app.querySelector<HTMLInputElement>('#attachment-input')?.addEventListener('change', async event => {
     const picker = event.currentTarget as HTMLInputElement; const files = Array.from(picker.files || []); picker.value = ''; if (!files.length || !friend) return;
@@ -385,9 +418,76 @@ function render() {
 
 function showError(error: unknown) { notice = error instanceof Error ? error.message : 'Something went wrong.'; render(); window.setTimeout(() => { notice = ''; app.querySelector('.toast')?.classList.remove('show'); }, 3500); }
 
+function closeUserPopup() { app.querySelector('.user-popup-layer')?.remove(); }
+function userForId(userId: string): User | undefined { return [me, ...friends.friends, ...friends.incoming, ...friends.outgoing, ...(activeGroup?.members || [])].find(candidate => candidate?.id === userId); }
+async function openProfileCard(userId: string) {
+  const known = userForId(userId); if (!known) return;
+  try {
+    const profile = await api<{ profile: Pick<User, 'displayName' | 'bio' | 'avatar' | 'banner'> }>(`/profile/${encodeURIComponent(userId)}`);
+    const person = { ...known, ...profile.profile };
+    closeUserPopup();
+    app.insertAdjacentHTML('beforeend', `<div class="user-popup-layer profile-card-layer" data-popup-dismiss><section class="profile-card" role="dialog" aria-modal="true" aria-label="${esc(displayName(person))}'s profile"><button type="button" class="profile-card-close" data-popup-close aria-label="Close">×</button><div class="profile-card-banner" ${person.banner ? `style="background-image:url('${esc(person.banner)}')"` : ''}></div><div class="profile-card-avatar">${avatar(person, 'profile-large')}</div><div class="profile-card-content"><h2>${esc(displayName(person))}</h2><span>@${esc(person.username)}</span><p>${esc(person.bio || 'No bio yet.')}</p><div class="profile-card-actions"><button type="button" class="secondary-button" data-profile-message="${esc(person.id)}">Message</button>${person.id !== me?.id ? `<button type="button" class="secondary-button" data-profile-block="${esc(person.id)}">${blockedUsers.includes(person.id) ? 'Unblock' : 'Block'}</button>` : ''}</div></div></section></div>`);
+    app.querySelector('[data-popup-dismiss]')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeUserPopup(); });
+    app.querySelector('[data-popup-close]')?.addEventListener('click', closeUserPopup);
+    app.querySelector<HTMLButtonElement>('[data-profile-message]')?.addEventListener('click', () => { const target = friends.friends.find(item => item.id === person.id); if (target) { closeUserPopup(); openFriend(target); } });
+    app.querySelector<HTMLButtonElement>('[data-profile-block]')?.addEventListener('click', () => void toggleBlock(person.id));
+  } catch (error) { showError(error); }
+}
+async function toggleBlock(userId: string) {
+  const blocked = blockedUsers.includes(userId);
+  try {
+    const result = await api<{ blockedUsers: string[] }>(`/users/${encodeURIComponent(userId)}/block`, { method: blocked ? 'DELETE' : 'POST', body: '{}' });
+    blockedUsers = result.blockedUsers; closeUserPopup(); await refreshFriends();
+    if (activeFriend?.id === userId && !blocked) { activeFriend = undefined; messages = []; }
+    notice = blocked ? 'Account unblocked.' : 'Account blocked.'; render();
+  } catch (error) { showError(error); }
+}
+async function addFriendToGroup(groupId: string, userId: string) {
+  try {
+    const result = await api<{ group: GroupChat }>(`/groups/${encodeURIComponent(groupId)}/members`, { method: 'POST', body: JSON.stringify({ userId }) });
+    groups = groups.map(group => group.id === result.group.id ? result.group : group);
+    groups = await Promise.all(groups.map(async group => ({ ...group, members: await Promise.all(group.members.map(async member => member.id === me?.id ? me : hydrateProfile(member))) })));
+    if (activeGroup?.id === groupId) activeGroup = groups.find(group => group.id === groupId);
+    closeUserPopup(); render(); notice = 'Friend added to the group.'; render();
+  } catch (error) { showError(error); }
+}
+app.addEventListener('contextmenu', event => {
+  const element = (event.target as HTMLElement).closest<HTMLElement>('[data-user-context], [data-friend], [data-call-friend], [data-group]');
+  if (element?.dataset.group && !element.dataset.userContext) {
+    const item = groups.find(group => group.id === element.dataset.group); if (!item) return;
+    event.preventDefault(); closeUserPopup();
+    const menu = document.createElement('div'); menu.className = 'pulse-context-menu'; menu.style.left = `${Math.min(event.clientX, window.innerWidth - 220)}px`; menu.style.top = `${Math.min(event.clientY, window.innerHeight - 120)}px`;
+    menu.innerHTML = '<button type="button" data-group-action="open">Open group</button><button type="button" data-group-action="rename">Rename group</button><button type="button" class="danger" data-group-action="leave">Leave group</button>'; app.append(menu);
+    menu.querySelector('[data-group-action="open"]')?.addEventListener('click', () => { menu.remove(); openGroup(item); });
+    menu.querySelector('[data-group-action="rename"]')?.addEventListener('click', async () => { const name = window.prompt('New group name', item.name)?.trim(); menu.remove(); if (!name) return; try { await api(`/groups/${encodeURIComponent(item.id)}`, { method: 'POST', body: JSON.stringify({ name }) }); item.name = name; if (activeGroup?.id === item.id) activeGroup.name = name; render(); } catch (error) { showError(error); } });
+    menu.querySelector('[data-group-action="leave"]')?.addEventListener('click', async () => { menu.remove(); if (!window.confirm(`Leave ${item.name}?`)) return; try { await api(`/groups/${encodeURIComponent(item.id)}`, { method: 'DELETE' }); groups = groups.filter(group => group.id !== item.id); if (activeGroup?.id === item.id) { activeGroup = undefined; messages = []; } render(); } catch (error) { showError(error); } });
+    const closeGroupMenu = (outside: Event) => { if (!menu.contains(outside.target as Node)) { menu.remove(); document.removeEventListener('pointerdown', closeGroupMenu); } };
+    window.setTimeout(() => document.addEventListener('pointerdown', closeGroupMenu), 0); return;
+  }
+  const target = element;
+  const userId = target?.dataset.userContext || target?.dataset.friend || target?.dataset.callFriend;
+  const person = userId ? userForId(userId) : undefined;
+  if (!person || person.id === me?.id) return;
+  event.preventDefault(); closeUserPopup();
+  const friend = friends.friends.find(item => item.id === person.id);
+  const canAdd = !!friend && groups.some(item => !item.members.some(member => member.id === person.id));
+  const menu = document.createElement('div'); menu.className = 'pulse-context-menu'; menu.setAttribute('role', 'menu');
+  menu.style.left = `${Math.min(event.clientX, window.innerWidth - 220)}px`; menu.style.top = `${Math.min(event.clientY, window.innerHeight - 245)}px`;
+  menu.innerHTML = `<button type="button" role="menuitem" data-context-action="profile">View profile</button>${friend ? '<button type="button" role="menuitem" data-context-action="message">Message</button>' : ''}${canAdd ? `<button type="button" role="menuitem" data-context-action="groups">Add to group…</button><div class="context-submenu" hidden>${groups.filter(item => !item.members.some(member => member.id === person.id)).map(item => `<button type="button" role="menuitem" data-add-group="${esc(item.id)}">${esc(item.name)}</button>`).join('')}</div>` : ''}<button type="button" role="menuitem" class="danger" data-context-action="block">${blockedUsers.includes(person.id) ? 'Unblock' : 'Block'} @${esc(person.username)}</button>`;
+  app.append(menu);
+  const closeMenu = (outside: Event) => { if (!menu.contains(outside.target as Node)) { menu.remove(); document.removeEventListener('pointerdown', closeMenu); } };
+  window.setTimeout(() => document.addEventListener('pointerdown', closeMenu), 0);
+  menu.querySelector('[data-context-action="profile"]')?.addEventListener('click', () => { menu.remove(); void openProfileCard(person.id); });
+  menu.querySelector('[data-context-action="message"]')?.addEventListener('click', () => { menu.remove(); if (friend) openFriend(friend); });
+  menu.querySelector('[data-context-action="groups"]')?.addEventListener('click', () => { const submenu = menu.querySelector<HTMLElement>('.context-submenu'); if (submenu) submenu.hidden = !submenu.hidden; });
+  menu.querySelectorAll<HTMLButtonElement>('[data-add-group]').forEach(button => button.addEventListener('click', () => { menu.remove(); void addFriendToGroup(button.dataset.addGroup!, person.id); }));
+  menu.querySelector('[data-context-action="block"]')?.addEventListener('click', () => { menu.remove(); void toggleBlock(person.id); });
+});
+app.addEventListener('click', event => { const menu = app.querySelector('.pulse-context-menu'); if (menu && !menu.contains(event.target as Node)) menu.remove(); });
+
 async function signOut() {
   try { await api('/logout', { method: 'POST', body: '{}' }); } catch {}
-  token = ''; me = undefined; activeFriend = undefined; settingsOpen = false;
+  token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; groups = []; settingsOpen = false;
   localStorage.removeItem('pulse.authToken'); voice.leave(); renderAuth();
 }
 
@@ -438,7 +538,7 @@ function renderSettings() {
     <label class="field-label">Email address<input id="security-email" type="email" maxlength="254" value="${esc(me.email || '')}" placeholder="you@example.com" autocomplete="email"></label><div class="security-status ${me.emailVerified ? 'verified' : ''}">${me.emailVerified ? 'Verified · email can be used to sign in' : me.email ? 'Not verified yet' : 'Add and verify an email to enable email sign-in'}</div><button type="button" class="secondary-button" id="verify-email-button">${me.emailVerified ? 'Change or re-verify email' : 'Send verification code'}</button>
     <div class="twofactor-row"><div><strong>Email two-factor</strong><p>${me.twoFactorEnabled ? 'An email code is required when no authenticator is configured.' : 'Require an email code after your password.'}</p></div><button type="button" class="secondary-button" id="twofactor-button" ${me.emailVerified ? '' : 'disabled'}>${me.twoFactorEnabled ? 'Turn off' : 'Turn on'}</button></div>
     ${authenticatorSettings}
-    ${securityChallenge ? `<label class="field-label">Code sent to ${esc(securityChallenge.email)}<input id="security-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code"></label><button type="button" class="primary-button security-verify" id="security-verify">Verify code</button>` : ''}<div class="settings-form-error" role="alert">${esc(securityError)}</div>
+    ${securityChallenge ? `<label class="field-label">Code sent to ${esc(securityChallenge.email)}<input id="security-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code"></label><button type="button" class="primary-button security-verify" id="security-verify">Verify code</button>` : ''}<div class="blocked-settings"><strong>Blocked accounts</strong>${blockedProfiles.map(person => `<div class="blocked-account"><span>@${esc(person.username)}</span><button type="button" class="secondary-button" data-unblock="${esc(person.id)}">Unblock</button></div>`).join('') || '<small>No blocked accounts.</small>'}</div><div class="settings-form-error" role="alert">${esc(securityError)}</div>
   </section>`;
   const callSettings = `<section class="settings-section"><div class="settings-section-heading"><div><h2>Call audio</h2><p>Choose the microphone and speaker Pulse uses for calls.</p></div></div>
     <label class="field-label">Microphone<select id="audio-input" ${audioDevicesLoading ? 'disabled' : ''}>${audioDeviceOptions('audioinput', audioInputDeviceId)}</select><small class="field-hint">Windows default follows your current Windows input device.</small></label>
@@ -459,7 +559,7 @@ function renderSettings() {
   }
   let avatarData: string | undefined; let bannerData: string | undefined; let clearAvatar = false;
   let clearBanner = false;
-  app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; messages = []; render(); };
+  app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; activeGroup = undefined; messages = []; render(); };
   app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { if (!callFriend) return; settingsOpen = false; friendsPanel = 'friends'; openFriend(callFriend); });
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
@@ -522,6 +622,7 @@ function renderSettings() {
     try { const result = await api<{ user?: User }>('/auth/verify-code', { method: 'POST', body: JSON.stringify({ challengeId: securityChallenge.challengeId, code: app.querySelector<HTMLInputElement>('#security-code')!.value }) }); if (result.user) me = { ...me!, ...result.user }; securityChallenge = undefined; securityError = ''; notice = 'Sign-in security updated.'; renderSettings(); }
     catch (error) { securityError = error instanceof Error ? error.message : 'Could not verify code.'; renderSettings(); }
   });
+  app.querySelectorAll<HTMLButtonElement>('[data-unblock]').forEach(button => button.addEventListener('click', () => void toggleBlock(button.dataset.unblock!)));
   app.querySelector<HTMLInputElement>('#avatar-file')?.addEventListener('change', async event => {
     try { avatarData = await readImage((event.currentTarget as HTMLInputElement).files?.[0], 512 * 1024, 'Profile picture', true); clearAvatar = false; const preview = app.querySelector('.profile-large') as HTMLElement; if (avatarData) { preview.style.backgroundImage = `url('${avatarData}')`; preview.style.backgroundSize = 'cover'; preview.textContent = ''; app.querySelector<HTMLButtonElement>('#clear-avatar')!.hidden = false; } }
     catch (error) { app.querySelector('#profile-error')!.textContent = error instanceof Error ? error.message : 'Could not read picture.'; }
@@ -548,7 +649,7 @@ async function start() {
   } else renderAuth();
   window.setInterval(async () => {
     if (!me) return;
-    try { const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join(); const previousUnread = JSON.stringify(unreadCounts); await refreshFriends(); await refreshUnread(); if (previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join() || previousUnread !== JSON.stringify(unreadCounts)) render(); if (activeFriend) await refreshMessages(); }
+    try { const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join(); const previousUnread = JSON.stringify(unreadCounts); const previousGroups = groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join(); await refreshFriends(); await refreshUnread(); if (previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}`).join() || previousUnread !== JSON.stringify(unreadCounts) || previousGroups !== groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join()) render(); if (activeFriend || activeGroup) await refreshMessages(); }
     catch (error) { if (error instanceof Error && error.message === 'Sign in to continue.') { token = ''; me = undefined; localStorage.removeItem('pulse.authToken'); renderAuth(); } }
   }, 3000);
 }
