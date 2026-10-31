@@ -68,6 +68,7 @@ let totpError = '';
 let cryptoReady = false;
 const decryptedCache = new Map<string, string>();
 const attachmentUrlCache = new Map<string, string>();
+const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
 const autoPreviewStarted = new Set<string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voiceMuted = false; screenQualityOpen = false; } render(); });
@@ -172,13 +173,13 @@ const attachmentV2Prefix = 'PULSE_ATTACHMENT_V2:';
 function messageBody(text: string) {
   if (text.startsWith(attachmentV2Prefix)) {
     try {
-      const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number; chunkCount?: number; ivPrefix?: string };
+      const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[] };
       const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
       if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isSafeInteger(file.size) || file.size! <= 0 || file.size! > maxAttachmentBytes || (file.chunkCount !== undefined && (!Number.isSafeInteger(file.chunkCount) || file.chunkCount !== Math.ceil(file.size! / attachmentChunkBytes) || !file.ivPrefix || bytesFromBase64(file.ivPrefix).length !== 8))) throw new Error('invalid attachment');
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
       if (!url && type.startsWith('video/')) return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play loading" data-attachment-load="${esc(file.id)}" aria-label="Preparing video preview" title="Preparing video" disabled>▶</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}">${formatFileSize(file.size!)} · preparing preview…</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
       if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
-      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell"><video class="message-attachment-video" data-video-file="${esc(file.id)}" controls preload="metadata" playsinline webkit-playsinline aria-label="${name}" src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video">▶</button></div><p class="video-playback-error" hidden></p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
+      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">▶</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">🔊</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">⛶</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
       if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
       return `<div class="message-attachment-file"><span class="attachment-file-icon">${type === 'application/pdf' ? 'PDF' : 'TXT'}</span><a href="${esc(url)}" download="${name}">${name}</a></div>`;
     } catch { return '<p>Could not display this attachment.</p>'; }
@@ -287,18 +288,21 @@ async function sendAttachment(file: File, target: User, onProgress?: (uploaded: 
   const chunkCount = Math.ceil(file.size / attachmentChunkBytes);
   await api('/attachments', { method: 'POST', body: JSON.stringify({ to: target.username, id, size: file.size, ivPrefix: ivPrefixBase64 }) });
   const cipher = await createAttachmentCipher(me!.id, target.id, fetchFriendKey);
+  const chunkHashes: string[] = new Array(chunkCount);
   let nextIndex = 0; let uploaded = 0;
   const uploadWorker = async () => {
     while (nextIndex < chunkCount) {
       const index = nextIndex++;
       const start = index * attachmentChunkBytes;
-      const encrypted = await cipher.encrypt(id, ivPrefix, index, await file.slice(start, Math.min(start + attachmentChunkBytes, file.size)).arrayBuffer());
+      const plaintext = await file.slice(start, Math.min(start + attachmentChunkBytes, file.size)).arrayBuffer();
+      chunkHashes[index] = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', plaintext)), byte => byte.toString(16).padStart(2, '0')).join('');
+      const encrypted = await cipher.encrypt(id, ivPrefix, index, plaintext);
       await rawAttachmentRequest(`/attachments/${id}/${index}`, 'PUT', encrypted);
       uploaded += Math.min(attachmentChunkBytes, file.size - start); onProgress?.(uploaded, file.size);
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, chunkCount) }, uploadWorker));
-  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64 });
+  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64, chunkHashes });
   const envelope = await encryptMessage(me!.id, target.id, content, fetchFriendKey);
   await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope }) });
 }
@@ -306,7 +310,7 @@ async function sendAttachment(file: File, target: User, onProgress?: (uploaded: 
 async function loadAttachment(id: string, target: User, onProgress?: (percent: number) => void) {
   const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
   if (!message) throw new Error('Attachment details are missing from this chat.');
-  const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { name: string; type: string; size: number; chunkCount?: number; ivPrefix?: string };
+  const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { name: string; type: string; size: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[] };
   const cached = attachmentUrlCache.get(id);
   if (cached) return { url: cached, name: meta.name };
   const pending = pendingAttachmentLoads.get(id);
@@ -318,7 +322,14 @@ async function loadAttachment(id: string, target: User, onProgress?: (percent: n
       for (let start = 0; start < meta.chunkCount; start += 3) {
         const batch = Array.from({ length: Math.min(3, meta.chunkCount - start) }, (_, offset) => start + offset);
         const encryptedChunks = await Promise.all(batch.map(index => rawAttachmentRequest(`/attachments/${id}/${index}`, 'GET')));
-        for (let offset = 0; offset < batch.length; offset++) parts.push(new Uint8Array(await cipher.decrypt(id, ivPrefix, batch[offset], encryptedChunks[offset])));
+        for (let offset = 0; offset < batch.length; offset++) {
+          const plaintext = await cipher.decrypt(id, ivPrefix, batch[offset], encryptedChunks[offset]);
+          if (meta.chunkHashes) {
+            const actualHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', plaintext)), byte => byte.toString(16).padStart(2, '0')).join('');
+            if (actualHash !== meta.chunkHashes[batch[offset]]) throw new Error(`Attachment data failed its integrity check at chunk ${batch[offset] + 1}. Download it again or resend the original.`);
+          }
+          parts.push(new Uint8Array(plaintext));
+        }
         onProgress?.(Math.min(100, Math.round((start + batch.length) / meta.chunkCount * 100)));
       }
       const actualSize = parts.reduce((total, part) => total + part.byteLength, 0);
@@ -330,6 +341,14 @@ async function loadAttachment(id: string, target: User, onProgress?: (percent: n
       blob = new Blob([bytes], { type: meta.type });
       onProgress?.(100);
     }
+    if (meta.type === 'video/mp4' || meta.type === 'video/webm') {
+      const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+      const signature = meta.type === 'video/mp4'
+        ? String.fromCharCode(...header.slice(4, 8)) === 'ftyp' || String.fromCharCode(...header.slice(4, 8)) === 'styp'
+        : header.length >= 4 && header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3;
+      if (!signature) videoValidationErrors.set(id, `The decrypted bytes do not have a ${meta.type === 'video/mp4' ? 'MP4' : 'WebM'} container signature. The original file may be damaged or mislabeled; you can still download it to inspect.`);
+      else videoValidationErrors.delete(id);
+    }
     const url = URL.createObjectURL(blob);
     attachmentUrlCache.set(id, url);
     return { url, name: meta.name };
@@ -340,6 +359,32 @@ async function loadAttachment(id: string, target: User, onProgress?: (percent: n
 }
 function downloadLocalFile(url: string, name: string) {
   const link = document.createElement('a'); link.href = url; link.download = name; link.style.display = 'none'; document.body.append(link); link.click(); link.remove();
+}
+function formatVideoTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
+  const total = Math.floor(seconds); const minutes = Math.floor(total / 60); const remainder = String(total % 60).padStart(2, '0');
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
+}
+function reportInlineVideoError(video: HTMLVideoElement, error?: unknown) {
+  const status = video.closest('.message-attachment')?.querySelector<HTMLElement>('.video-playback-error');
+  if (!status) return;
+  const validation = videoValidationErrors.get(video.dataset.videoFile || '');
+  const mediaCode = video.error?.code;
+  const detail = error instanceof Error ? error.name : '';
+  status.textContent = validation || (mediaCode === MediaError.MEDIA_ERR_NETWORK
+    ? 'The video data could not be read. Try Download video and compare the saved file size.'
+    : mediaCode === MediaError.MEDIA_ERR_DECODE || mediaCode === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED || detail === 'NotSupportedError'
+      ? 'The file passed its container check, but Windows could not decode its video codec. Download it and open it in a player that supports this codec.'
+      : detail === 'NotAllowedError'
+        ? 'Playback was blocked by the app. Press the play button again.'
+        : 'Pulse could not play this file. The download button is available below.');
+  status.hidden = false;
+}
+async function playInlineVideo(video: HTMLVideoElement) {
+  const play = video.closest('.video-player-shell')?.querySelector<HTMLButtonElement>('[data-video-play]');
+  if (video.ended) video.currentTime = 0;
+  try { await video.play(); if (play) { play.textContent = '▶'; play.setAttribute('aria-label', 'Play video'); } }
+  catch (error) { reportInlineVideoError(video, error); }
 }
 
 function render() {
@@ -445,7 +490,30 @@ function render() {
   app.querySelectorAll<HTMLButtonElement>('[data-video-play]').forEach(button => button.addEventListener('click', async () => {
     const video = button.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');
     if (!video) return;
-    try { await video.play(); } catch { const status = button.closest('.message-attachment')?.querySelector<HTMLElement>('.video-playback-error'); if (status) { status.hidden = false; status.textContent = 'Pulse could not start this video. Use Download video to open it with another player.'; } }
+    await playInlineVideo(video);
+  }));
+  app.querySelectorAll<HTMLButtonElement>('[data-video-toggle]').forEach(button => button.addEventListener('click', () => {
+    const shell = button.closest('.video-player-shell'); const video = shell?.querySelector<HTMLVideoElement>('video');
+    if (!video) return;
+    if (video.paused) void playInlineVideo(video); else video.pause();
+  }));
+  app.querySelectorAll<HTMLInputElement>('[data-video-seek]').forEach(input => input.addEventListener('input', () => {
+    const video = input.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');
+    if (video && Number.isFinite(video.duration)) video.currentTime = Number(input.value) / 1000 * video.duration;
+  }));
+  app.querySelectorAll<HTMLInputElement>('[data-video-volume]').forEach(input => input.addEventListener('input', () => {
+    const video = input.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');
+    if (video) { video.volume = Number(input.value); video.muted = video.volume === 0; }
+  }));
+  app.querySelectorAll<HTMLButtonElement>('[data-video-volume-toggle]').forEach(button => button.addEventListener('click', () => {
+    const shell = button.closest('.video-player-shell'); const video = shell?.querySelector<HTMLVideoElement>('video'); const volume = shell?.querySelector<HTMLInputElement>('[data-video-volume]');
+    if (video) { video.muted = !video.muted; button.textContent = video.muted ? '🔇' : '🔊'; button.setAttribute('aria-label', video.muted ? 'Unmute video' : 'Mute video'); if (volume && !video.muted && Number(volume.value) === 0) { volume.value = '0.7'; video.volume = 0.7; } }
+  }));
+  app.querySelectorAll<HTMLButtonElement>('[data-video-fullscreen]').forEach(button => button.addEventListener('click', () => {
+    const shell = button.closest('.video-player-shell');
+    if (!shell) return;
+    if (document.fullscreenElement === shell) void document.exitFullscreen().catch(() => undefined);
+    else void shell.requestFullscreen().catch(() => { const video = shell.querySelector<HTMLVideoElement>('video'); if (video) void playInlineVideo(video); });
   }));
   app.querySelectorAll<HTMLElement>('[data-video-preview]').forEach(card => {
     const id = card.dataset.videoPreview; const target = friend;
@@ -459,13 +527,31 @@ function render() {
   });
   app.querySelectorAll<HTMLVideoElement>('.message-attachment-video').forEach(video => {
     const play = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-play]');
+    const toggle = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-toggle]');
+    const seek = video.parentElement?.querySelector<HTMLInputElement>('[data-video-seek]');
+    const time = video.parentElement?.querySelector<HTMLElement>('[data-video-time]');
     const previous = videoPlayback.get(video.dataset.videoFile || '');
-    video.addEventListener('playing', () => { if (play) play.hidden = true; });
-    video.addEventListener('pause', () => { if (play && video.currentTime < video.duration) play.hidden = false; });
+    const updateControls = () => {
+      if (toggle) { toggle.textContent = video.paused ? '▶' : 'Ⅱ'; toggle.setAttribute('aria-label', video.paused ? 'Play video' : 'Pause video'); }
+      if (time) time.textContent = `${formatVideoTime(video.currentTime)} / ${formatVideoTime(video.duration)}`;
+      if (seek && Number.isFinite(video.duration) && video.duration > 0) seek.value = String(Math.round(video.currentTime / video.duration * 1000));
+    };
+    video.addEventListener('playing', () => { if (play) play.hidden = true; updateControls(); });
+    video.addEventListener('pause', () => { if (play && video.currentTime < video.duration) play.hidden = false; updateControls(); });
+    video.addEventListener('ended', () => { if (play) { play.hidden = false; play.textContent = '↻'; play.setAttribute('aria-label', 'Replay video'); } updateControls(); });
+    video.addEventListener('timeupdate', updateControls);
+    video.addEventListener('loadedmetadata', updateControls);
+    video.addEventListener('click', event => { if ((event.target as HTMLElement).closest('.pulse-video-controls')) return; if (video.paused) void playInlineVideo(video); else video.pause(); });
+    video.addEventListener('keydown', event => {
+      if (event.key === ' ' || event.key === 'k') { event.preventDefault(); if (video.paused) void playInlineVideo(video); else video.pause(); }
+      else if (event.key === 'ArrowLeft' && Number.isFinite(video.duration)) video.currentTime = Math.max(0, video.currentTime - 5);
+      else if (event.key === 'ArrowRight' && Number.isFinite(video.duration)) video.currentTime = Math.min(video.duration, video.currentTime + 5);
+      else if (event.key === 'ArrowUp') video.volume = Math.min(1, video.volume + 0.1);
+      else if (event.key === 'ArrowDown') video.volume = Math.max(0, video.volume - 0.1);
+    });
     if (previous) video.addEventListener('loadedmetadata', () => { video.currentTime = Math.min(previous.currentTime, Number.isFinite(video.duration) ? video.duration : previous.currentTime); if (!previous.paused) void video.play().catch(() => undefined); }, { once: true });
     video.addEventListener('error', () => {
-      const status = video.parentElement?.querySelector<HTMLElement>('.video-playback-error');
-      if (status) { status.hidden = false; status.textContent = video.error?.code === MediaError.MEDIA_ERR_DECODE ? 'Pulse could not decode this video. Download it and try a different player.' : 'Pulse could not play this video. Download it to try another player.'; }
+      reportInlineVideoError(video);
     }, { once: true });
     video.load();
   });
