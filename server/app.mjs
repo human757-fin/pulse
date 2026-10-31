@@ -60,7 +60,12 @@ function json(res, status, value) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
   res.end(JSON.stringify(value));
 }
-function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt }; }
+function presenceState(user) {
+  if (!user.lastHeartbeatAt || Date.now() - user.lastHeartbeatAt > 45_000) return 'offline';
+  if (user.presence === 'dnd' || user.presence === 'away' || user.presence === 'idle') return user.presence;
+  return !user.lastActivityAt || Date.now() - user.lastActivityAt > 5 * 60_000 ? 'idle' : 'online';
+}
+function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt, presence: presenceState(user), presencePreference: user.presence || 'online', customStatus: user.customStatus || '' }; }
 function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
 function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
 function readBody(req, maxBytes = 2_000_000) {
@@ -382,6 +387,34 @@ async function serve(req, res) {
       const user = sessionUser(req);
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: accountUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (url.pathname === '/api/presence' && req.method === 'POST') {
+        const allowed = ['online', 'idle', 'away', 'dnd'];
+        if (body.presence !== undefined && !allowed.includes(body.presence)) return json(res, 400, { error: 'Choose Online, Idle, Away, or Do Not Disturb.' });
+        const customStatus = body.customStatus === undefined ? user.customStatus || '' : String(body.customStatus).trim();
+        if (customStatus.length > 80) return json(res, 400, { error: 'Status must be 80 characters or fewer.' });
+        const changed = (body.presence !== undefined && body.presence !== user.presence) || customStatus !== (user.customStatus || '');
+        if (body.presence !== undefined) user.presence = body.presence;
+        user.customStatus = customStatus;
+        const now = Date.now();
+        user.lastHeartbeatAt = now;
+        if (body.active !== false) user.lastActivityAt = now;
+        if (changed) persist();
+        return json(res, 200, { user: accountUser(user) });
+      }
+      if (url.pathname === '/api/admin/suggestions' && req.method === 'GET') {
+        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Pulse administrator.' });
+        const suggestions = [...db.suggestions].reverse().map(item => ({ id: item.id, text: item.text, createdAt: item.createdAt, status: item.status || '', user: publicUser(db.users.find(candidate => candidate.id === item.userId) || { id: '', username: 'unknown' }) }));
+        return json(res, 200, { suggestions });
+      }
+      const adminSuggestion = url.pathname.match(/^\/api\/admin\/suggestions\/([a-f0-9]{24})$/);
+      if (adminSuggestion && req.method === 'PATCH') {
+        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Pulse administrator.' });
+        const status = String(body.status || '');
+        if (!['started', 'not-doing', 'will-do', 'done'].includes(status)) return json(res, 400, { error: 'Choose Started, Not doing, Will do, or Done.' });
+        const suggestion = db.suggestions.find(item => item.id === adminSuggestion[1]);
+        if (!suggestion) return json(res, 404, { error: 'Suggestion not found.' });
+        suggestion.status = status; persist(); return json(res, 200, { ok: true, status });
+      }
       if (url.pathname === '/api/calls/incoming' && req.method === 'GET') {
         const now = Date.now();
         for (const [id, invite] of callInvites) if (invite.expiresAt <= now) callInvites.delete(id);
@@ -518,7 +551,7 @@ async function serve(req, res) {
         if (now - window.startedAt >= 60 * 60_000) { window.startedAt = now; window.count = 0; }
         if (window.count >= 3) return json(res, 429, { error: 'You’ve sent several suggestions recently. Please try again later.' });
         window.count += 1; suggestionWindows.set(user.id, window);
-        db.suggestions.push({ id: randomBytes(12).toString('hex'), userId: user.id, text, createdAt: new Date(now).toISOString() });
+        db.suggestions.push({ id: randomBytes(12).toString('hex'), userId: user.id, text, createdAt: new Date(now).toISOString(), status: '' });
         if (db.suggestions.length > 5000) db.suggestions.splice(0, db.suggestions.length - 5000);
         persist(); return json(res, 201, { ok: true });
       }
