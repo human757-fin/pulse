@@ -4,7 +4,7 @@ export type VoiceUpdate = { state: VoiceState; message: string; peers: string[];
 export type ScreenShareSettings = { width: number; height: number; fps: number };
 
 type Signal = { type: string; [key: string]: unknown };
-const voiceProtocol = 'pulse-dtls-srtp-screen-v2';
+const voiceProtocol = 'pulse-dtls-srtp-screen-audio-v3';
 type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey?: ArrayBuffer; roomType: 'dm' | 'group' | 'server'; getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer> };
 
 export class VoiceClient {
@@ -13,6 +13,10 @@ export class VoiceClient {
   private peers = new Map<string, RTCPeerConnection>();
   private audioElements = new Map<string, HTMLAudioElement>();
   private videoSenders = new Map<string, RTCRtpSender>();
+  private screenAudioSenders = new Map<string, RTCRtpSender>();
+  private audioGraphs = new Map<string, { context: AudioContext; destination: MediaStreamAudioDestinationNode; voiceGain: GainNode; streamGain: GainNode; sources: Map<string, MediaStreamAudioSourceNode> }>();
+  private participantVoiceVolumes = new Map<string, number>();
+  private participantStreamVolumes = new Map<string, number>();
   private remoteVideos = new Map<string, MediaStream>();
   private screenStream?: MediaStream;
   private stopped = false;
@@ -51,7 +55,8 @@ export class VoiceClient {
     nextTrack.contentHint = 'speech';
     nextTrack.enabled = !this.muted && !this.deafened;
     try {
-      const senders = [...this.peers.values()].flatMap(peer => peer.getSenders().filter(sender => sender.track?.kind === 'audio'));
+      const screenSenders = new Set(this.screenAudioSenders.values());
+      const senders = [...this.peers.values()].flatMap(peer => peer.getSenders().filter(sender => sender.track?.kind === 'audio' && !screenSenders.has(sender)));
       await Promise.all(senders.map(sender => sender.replaceTrack(nextTrack)));
       const previousStream = this.stream;
       this.stream = nextStream;
@@ -127,18 +132,30 @@ export class VoiceClient {
     return this.deafened;
   }
 
+  setParticipantVolume(userId: string, percent: number, stream = false) {
+    const value = Math.min(3, Math.max(0, percent / 100));
+    (stream ? this.participantStreamVolumes : this.participantVoiceVolumes).set(userId, value);
+    for (const [peerId, graph] of this.audioGraphs) if (this.peerUsers.get(peerId) === userId) (stream ? graph.streamGain : graph.voiceGain).gain.value = value;
+  }
+
+  getParticipantVolume(userId: string, stream = false) {
+    return Math.round(((stream ? this.participantStreamVolumes : this.participantVoiceVolumes).get(userId) ?? 1) * 100);
+  }
+
   getLocalScreenStream() { return this.screenStream; }
   getRemoteScreenStream(peerId: string) { return this.remoteVideos.get(peerId); }
 
   async startScreenShare(settings: ScreenShareSettings) {
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen sharing is unavailable. Update Pulse and Microsoft Edge WebView2.');
     if (this.screenStream) return;
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } }, audio: false });
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } }, audio: true });
     const track = stream.getVideoTracks()[0];
+    const audioTrack = stream.getAudioTracks()[0];
     if (!track) { stream.getTracks().forEach(item => item.stop()); throw new Error('The selected screen did not provide a video track.'); }
     try {
       await track.applyConstraints({ width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } });
       await Promise.all([...this.videoSenders.values()].map(sender => sender.replaceTrack(track)));
+      await Promise.all([...this.screenAudioSenders.values()].map(sender => sender.replaceTrack(audioTrack || null)));
       this.screenStream = stream;
       track.onended = () => { void this.stopScreenShare(); };
       this.emitCurrent();
@@ -159,6 +176,7 @@ export class VoiceClient {
     const track = stream.getVideoTracks()[0]; if (track) track.onended = null;
     this.screenStream = undefined;
     await Promise.all([...this.videoSenders.values()].map(sender => sender.replaceTrack(null).catch(() => undefined)));
+    await Promise.all([...this.screenAudioSenders.values()].map(sender => sender.replaceTrack(null).catch(() => undefined)));
     stream.getTracks().forEach(item => item.stop());
     this.emitCurrent();
   }
@@ -190,9 +208,14 @@ export class VoiceClient {
       this.peers.delete(id);
       const audio = this.audioElements.get(id);
       audio?.pause();
+      audio?.remove();
       this.audioElements.delete(id);
+      const graph = this.audioGraphs.get(id);
+      void graph?.context.close().catch(() => undefined);
+      this.audioGraphs.delete(id);
       this.remoteVideos.delete(id);
       this.videoSenders.delete(id);
+      this.screenAudioSenders.delete(id);
       this.peerNames.delete(id);
       this.peerUsers.delete(id);
       this.emit('waiting', 'They left voice. Waiting for someone to join…');
@@ -315,8 +338,11 @@ export class VoiceClient {
     this.peers.clear();
     this.audioElements.forEach(audio => { audio.pause(); audio.srcObject = null; audio.remove(); });
     this.audioElements.clear();
+    this.audioGraphs.forEach(graph => { void graph.context.close().catch(() => undefined); });
+    this.audioGraphs.clear();
     this.remoteVideos.clear();
     this.videoSenders.clear();
+    this.screenAudioSenders.clear();
     this.peerNames.clear();
     this.peerUsers.clear();
     this.pendingIce.clear();
@@ -338,6 +364,8 @@ export class VoiceClient {
     this.stream?.getAudioTracks().forEach(track => {
       pc.addTrack(track, this.stream!);
     });
+    const screenAudioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    this.screenAudioSenders.set(id, screenAudioTransceiver.sender);
     pc.onicecandidate = event => { if (event.candidate) this.send({ type: 'ice', to: id, candidate: event.candidate }); };
     pc.ontrack = event => {
       if (event.track.kind === 'video') {
@@ -346,6 +374,25 @@ export class VoiceClient {
         this.emitCurrent();
         return;
       }
+      let graph = this.audioGraphs.get(id);
+      if (!graph) {
+        const context = new AudioContext();
+        const destination = context.createMediaStreamDestination();
+        const voiceGain = context.createGain(); const streamGain = context.createGain();
+        const userId = this.peerUsers.get(id) || '';
+        voiceGain.gain.value = this.participantVoiceVolumes.get(userId) ?? 1;
+        streamGain.gain.value = this.participantStreamVolumes.get(userId) ?? 1;
+        voiceGain.connect(destination); streamGain.connect(destination);
+        graph = { context, destination, voiceGain, streamGain, sources: new Map() };
+        this.audioGraphs.set(id, graph);
+      }
+      if (!graph.sources.has(event.track.id)) {
+        const source = graph.context.createMediaStreamSource(new MediaStream([event.track]));
+        source.connect(event.transceiver === screenAudioTransceiver ? graph.streamGain : graph.voiceGain);
+        graph.sources.set(event.track.id, source);
+        event.track.onended = () => { graph?.sources.get(event.track.id)?.disconnect(); graph?.sources.delete(event.track.id); };
+      }
+      void graph.context.resume().catch(() => undefined);
       let audio = this.audioElements.get(id);
       if (!audio) {
         audio = document.createElement('audio');
@@ -358,7 +405,7 @@ export class VoiceClient {
         const media = audio as HTMLAudioElement & { setSinkId?: (deviceId: string) => Promise<void> };
         if (media.setSinkId) void media.setSinkId(this.outputDeviceId).catch(error => this.emit('connected', error instanceof Error ? `Could not select speaker: ${error.message}` : 'Could not select speaker.'));
       }
-      audio.srcObject = event.streams[0];
+      audio.srcObject = graph.destination.stream;
       void audio.play().catch(() => this.emit('connected', 'Voice connected · click Pulse to hear audio'));
       this.emit('connected', `In voice with ${this.peerNames.get(id) || 'a friend'}`);
     };
@@ -371,7 +418,9 @@ export class VoiceClient {
 
   private async preparePeerVideo(id: string) {
     const track = this.screenStream?.getVideoTracks()[0]; const sender = this.videoSenders.get(id);
+    const audioTrack = this.screenStream?.getAudioTracks()[0]; const audioSender = this.screenAudioSenders.get(id);
     if (track && sender && sender.track !== track) await sender.replaceTrack(track);
+    if (audioTrack && audioSender && audioSender.track !== audioTrack) await audioSender.replaceTrack(audioTrack);
   }
 
   private send(message: object) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
