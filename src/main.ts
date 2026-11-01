@@ -10,10 +10,10 @@ type User = { id: string; username: string; email?: string; emailVerified?: bool
 type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; selfCopy?: boolean; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 type GroupChat = { id: string; name: string; members: User[] };
-type ServerChannel = { id: string; name: string; type: 'text' | 'voice' };
+type ServerChannel = { id: string; name: string; categoryId?: string; private?: boolean; allowedUserIds?: string[]; allowedRoleIds?: string[]; accessible?: boolean; type: 'text' | 'voice' };
 type ServerPermission = 'manage_channels' | 'invite_members' | 'manage_roles' | 'send_messages' | 'connect_voice';
 type ServerRole = { id: string; name: string; color: string; permissions: ServerPermission[] };
-type PulseServer = { id: string; name: string; ownerId: string; inviteCode: string; members: User[]; channels: ServerChannel[]; roles: ServerRole[]; memberRoles: Record<string, string[]>; defaultPermissions: ServerPermission[]; currentPermissions: ServerPermission[] };
+type PulseServer = { id: string; name: string; ownerId: string; categories?: { id: string; name: string }[]; inviteCode: string; members: User[]; channels: ServerChannel[]; roles: ServerRole[]; memberRoles: Record<string, string[]>; defaultPermissions: ServerPermission[]; currentPermissions: ServerPermission[] };
 type IncomingCall = { id: string; room: string; expiresAt: number; caller: User };
 type SuggestionStatus = '' | 'started' | 'not-doing' | 'will-do' | 'done';
 type AdminSuggestion = { id: string; text: string; createdAt: string; status: SuggestionStatus; user: User };
@@ -72,6 +72,13 @@ let authError = '';
 let notice = '';
 let busy = false;
 let settingsOpen = false;
+let serverSettingsOpen = false;
+const collapsedChannelGroups = new Set<string>();
+const pendingServerInvite = new URLSearchParams(window.location.search).get('invite');
+let serverInviteHandled = false;
+function channelMembers(server: PulseServer, channel: ServerChannel) {
+  return server.members.filter(member => !channel.private || member.id === server.ownerId || (channel.allowedUserIds || []).includes(member.id) || (channel.allowedRoleIds || []).some(role => (server.memberRoles[member.id] || []).includes(role)));
+}
 let presenceMenuOpen = false;
 let presenceSaveError = '';
 let lastPresencePing = 0;
@@ -215,6 +222,7 @@ async function refreshGroups() {
 }
 async function refreshServers() {
   try {
+    const previousLayout = JSON.stringify(servers.map(server => [server.id, server.name, server.categories, server.channels, server.memberRoles]));
     const result = await api<{ servers: PulseServer[] }>('/servers');
     servers = await Promise.all(result.servers.map(async server => ({
       ...server,
@@ -225,13 +233,16 @@ async function refreshServers() {
       if (!activeServer) { activeGroup = undefined; messages = []; }
       else if (activeGroup) {
         const channel = activeServer.channels.find(item => item.id === activeGroup!.id) || activeServer.channels[0];
-        activeGroup = channel ? { id: channel.id, name: channel.name, members: activeServer.members } : undefined;
+        activeGroup = channel && channel.accessible !== false ? { id: channel.id, name: channel.name, members: channelMembers(activeServer, channel) } : undefined;
+        if (!activeGroup) messages = [];
       }
     }
     if (callServer) {
       callServer = servers.find(server => server.id === callServer!.id) || callServer;
-      if (callGroup) callGroup = { ...callGroup, members: callServer.members };
+      if (!callServer.channels.some(channel => channel.id === callServerChannel?.id && channel.accessible !== false)) leaveCall();
+      if (callGroup && callServer) callGroup = { ...callGroup, members: callServer.members };
     }
+    if (previousLayout !== JSON.stringify(servers.map(server => [server.id, server.name, server.categories, server.channels, server.memberRoles])) && activeServer && !serverSettingsOpen) render();
   } catch { servers = []; }
 }
 const displayName = (user: User) => user.displayName?.trim() || user.username;
@@ -315,10 +326,10 @@ async function refreshUnread() {
 }
 function openFriend(friend: User) { activeServer = undefined; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
 function openGroup(group: GroupChat) { activeServer = undefined; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
-function openServer(server: PulseServer, channelId = server.channels[0]?.id) {
-  const channel = server.channels.find(item => item.id === channelId) || server.channels[0];
+function openServer(server: PulseServer, channelId = server.channels.find(item => item.type === 'text' && item.accessible !== false)?.id) {
+  const channel = server.channels.find(item => item.id === channelId && item.accessible !== false) || server.channels.find(item => item.type === 'text' && item.accessible !== false);
   if (activeServer?.id !== server.id) managingServerRoles = false;
-  activeServer = server; activeFriend = undefined; activeGroup = channel ? { id: channel.id, name: channel.name, members: server.members } : undefined;
+  activeServer = server; activeFriend = undefined; activeGroup = channel && channel.accessible !== false ? { id: channel.id, name: channel.name, members: channelMembers(server, channel) } : undefined;
   settingsOpen = false; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear();
   if (activeGroup) void refreshMessages(activeGroup).then(render).catch(error => { notice = error.message; render(); }); else render();
 }
@@ -397,6 +408,68 @@ async function joinServerVoice(server: PulseServer, channel: ServerChannel) {
   } catch (error) { showError(error); }
 }
 function leaveCall() { void cancelOutgoingCallInvite(); voiceRoom = ''; callFriend = undefined; callGroup = undefined; callServer = undefined; callServerChannel = undefined; callParticipants = []; voice.leave(); }
+
+function setupServerPanels() {
+  if (pendingServerInvite && me && !serverInviteHandled) {
+    serverInviteHandled = true;
+    void api<{ server: PulseServer }>('/servers/join', { method: 'POST', body: JSON.stringify({ code: pendingServerInvite }) }).then(result => { if (!servers.some(item => item.id === result.server.id)) servers.push(result.server); openServer(result.server); }).catch(showError);
+  }
+  const server = activeServer; if (!server) return;
+  const canManage = server.currentPermissions.includes('manage_channels');
+  const categories = server.categories || [];
+  const options = (selected = '') => `<option value="">No group</option>${categories.map(item => `<option value="${esc(item.id)}" ${item.id === selected ? 'selected' : ''}>${esc(item.name)}</option>`).join('')}`;
+  const update = (next: PulseServer) => { servers = servers.map(item => item.id === next.id ? next : item); activeServer = next; render(); };
+  const request = async (path: string, body: unknown, method = 'PATCH') => {
+    const result = await api<{ server: PulseServer }>(`/servers/${server.id}${path}`, { method, body: JSON.stringify(body) }); update(result.server);
+  };
+  app.querySelector('.server-sidebar-actions')?.remove();
+  app.querySelector('#server-invite-form')?.remove();
+  app.querySelector<HTMLButtonElement>('#server-menu-invite')?.addEventListener('click', () => { invitingServerMember = true; serverSettingsOpen = false; render(); });
+  app.querySelector<HTMLButtonElement>('#server-menu-settings')?.addEventListener('click', () => { serverSettingsOpen = true; invitingServerMember = false; render(); });
+  const channelForm = app.querySelector('#create-server-channel');
+  channelForm?.insertAdjacentHTML('afterbegin', `<label>Channel group<select name="categoryId">${options()}</select></label>`);
+  channelForm?.querySelector('.creation-form-actions')?.insertAdjacentHTML('beforebegin', `<label class="role-permission"><input name="private" type="checkbox">Private channel</label><fieldset><legend>Allow roles (private channels)</legend>${server.roles.map(role => `<label class="role-permission"><input type="checkbox" name="roles" value="${role.id}">${esc(role.name)}</label>`).join('') || '<small>No roles yet.</small>'}</fieldset><fieldset><legend>Allow members (private channels)</legend>${server.members.filter(member => member.id !== server.ownerId).map(member => `<label class="role-permission"><input type="checkbox" name="users" value="${member.id}">${esc(displayName(member))}</label>`).join('')}</fieldset>`);
+  const channelContainer = app.querySelector('.server-channel-group')?.parentElement;
+  if (channelContainer && !managingServerRoles) {
+    const rows = new Map(server.channels.map(channel => [channel.id, app.querySelector<HTMLElement>(`[data-server-${channel.type === 'voice' ? 'voice' : 'channel'}="${channel.id}"]`)]));
+    const grouped = document.createElement('div'); grouped.className = 'channel-categories';
+    for (const category of [{ id: '', name: 'Channels' }, ...categories]) {
+      const section = document.createElement('section');
+      section.innerHTML = `<button type="button" class="channel-category-toggle" aria-expanded="${!collapsedChannelGroups.has(category.id)}"><span>${collapsedChannelGroups.has(category.id) ? '›' : '⌄'}</span>${esc(category.name)}</button>`;
+      section.querySelector('button')!.onclick = () => { if (collapsedChannelGroups.has(category.id)) collapsedChannelGroups.delete(category.id); else collapsedChannelGroups.add(category.id); render(); };
+      for (const channel of server.channels.filter(item => (item.categoryId || '') === category.id)) {
+        const row = rows.get(channel.id); if (!row) continue;
+        const members: Element[] = []; let next = row.nextElementSibling;
+        while (next?.classList.contains('voice-channel-member')) { members.push(next); next = next.nextElementSibling; }
+        if (channel.private) row.querySelector('strong')?.insertAdjacentHTML('beforeend', ' <small title="Private channel">· private</small>');
+        if (channel.accessible === false) (row as HTMLButtonElement).disabled = true;
+        row.hidden = collapsedChannelGroups.has(category.id); section.append(row);
+        members.forEach(member => { (member as HTMLElement).hidden = row.hidden; section.append(member); });
+      }
+      grouped.append(section);
+    }
+    channelContainer.querySelectorAll('.server-channel-group, .section-title').forEach(element => element.remove());
+    channelContainer.append(grouped);
+    if (canManage) { const button = document.createElement('button'); button.type = 'button'; button.className = 'create-role-trigger'; button.textContent = '+ Create channel'; button.onclick = () => { creatingServerChannel = true; render(); }; channelContainer.append(button); }
+  }
+  if (!serverSettingsOpen && !invitingServerMember) return;
+  const inviteLink = `https://pulse.overclockd.shop/?invite=${encodeURIComponent(server.inviteCode)}`;
+  const inviteBody = `<label class="invite-search">Search friends<input id="invite-friend-search" type="search" placeholder="Search your friends" autocomplete="off"></label><div class="invite-friend-list">${friends.friends.map(friend => {
+    const joined = server.members.some(member => member.id === friend.id);
+    return `<div class="invite-friend-row" data-invite-name="${esc(`${displayName(friend)} ${friend.username}`.toLowerCase())}">${avatarWithPresence(friend, 'tiny')}<span><strong>${esc(displayName(friend))}</strong><small>${esc(friend.customStatus || presenceLabel(friend.presence))}</small></span><button type="button" data-invite-friend="${esc(friend.id)}" ${joined ? 'disabled' : ''}>${joined ? 'Joined' : 'Invite'}</button></div>`;
+  }).join('') || '<p>No friends yet. Share the invite link below.</p>'}</div><p id="invite-empty" hidden>No matching friends.</p><div class="invite-link-box"><label>Or send a server invite link<input readonly value="${esc(inviteLink)}" aria-label="Server invite link"></label><button type="button" id="copy-invite-link">Copy</button></div>`;
+  const accessForms = canManage ? server.channels.map(channel => `<details class="channel-settings"><summary>${channel.type === 'voice' ? 'Voice' : '#'} ${esc(channel.name)}</summary><form data-channel-access="${channel.id}" class="creation-form"><label>Channel group<select name="categoryId">${options(channel.categoryId)}</select></label><label class="role-permission"><input type="checkbox" name="private" ${channel.private ? 'checked' : ''}>Private channel</label><p>Private channels are only available to the owner and the selected members or roles. Server permissions still apply.</p><fieldset><legend>Allowed roles</legend>${server.roles.map(role => `<label class="role-permission"><input type="checkbox" name="roles" value="${role.id}" ${(channel.allowedRoleIds || []).includes(role.id) ? 'checked' : ''}>${esc(role.name)}</label>`).join('') || '<small>No roles yet.</small>'}</fieldset><fieldset><legend>Allowed members</legend>${server.members.filter(member => member.id !== server.ownerId).map(member => `<label class="role-permission"><input type="checkbox" name="users" value="${member.id}" ${(channel.allowedUserIds || []).includes(member.id) ? 'checked' : ''}>${esc(displayName(member))}</label>`).join('')}</fieldset><button type="submit" class="primary-button">Save channel</button></form></details>`).join('') : '';
+  const settingsBody = `${server.ownerId === me?.id ? `<form id="server-overview" class="creation-form"><label>Server name<input name="name" value="${esc(server.name)}" maxlength="60" required></label><button class="primary-button">Save server</button></form>` : `<p>${server.members.length} members · Server settings are managed by the owner.</p>`}${server.currentPermissions.includes('manage_roles') ? '<button type="button" class="create-role-trigger" id="settings-server-roles">Manage roles and permissions</button>' : ''}${canManage ? `<form id="create-channel-category" class="creation-form"><label>New channel group<input name="name" required maxlength="60" placeholder="e.g. Community"></label><button class="primary-button">Create group</button></form><h3>Channels and access</h3>${accessForms}` : ''}`;
+  app.insertAdjacentHTML('beforeend', `<div class="creation-modal-layer"><section class="creation-modal server-dialog" role="dialog" aria-modal="true" aria-labelledby="creation-modal-title"><header><div><h2 id="creation-modal-title">${invitingServerMember ? `Invite friends to ${esc(server.name)}` : 'Server settings'}</h2><p>${invitingServerMember ? 'Invite your friends or share a link.' : esc(server.name)}</p></div><button type="button" id="creation-modal-close" aria-label="Close">×</button></header><div class="creation-modal-scroll">${invitingServerMember ? inviteBody : settingsBody}<p id="server-panel-error" role="alert"></p></div></section></div>`);
+  const report = (error: unknown) => { const element = app.querySelector('#server-panel-error'); if (element) element.textContent = error instanceof Error ? error.message : 'Could not save changes.'; };
+  app.querySelector<HTMLInputElement>('#invite-friend-search')?.addEventListener('input', event => { const query = (event.target as HTMLInputElement).value.toLowerCase(); let visible = 0; app.querySelectorAll<HTMLElement>('[data-invite-name]').forEach(row => { row.hidden = !row.dataset.inviteName!.includes(query); if (!row.hidden) visible++; }); app.querySelector<HTMLElement>('#invite-empty')!.hidden = visible > 0; });
+  app.querySelector<HTMLButtonElement>('#copy-invite-link')?.addEventListener('click', async event => { try { await navigator.clipboard.writeText(inviteLink); (event.target as HTMLButtonElement).textContent = 'Copied!'; } catch (error) { report(error); } });
+  app.querySelectorAll<HTMLButtonElement>('[data-invite-friend]').forEach(button => button.onclick = async () => { button.disabled = true; try { await request('/members', { userId: button.dataset.inviteFriend }, 'POST'); } catch (error) { button.disabled = false; report(error); } });
+  app.querySelector('#settings-server-roles')?.addEventListener('click', () => { serverSettingsOpen = false; managingServerRoles = true; render(); });
+  app.querySelector<HTMLFormElement>('#server-overview')?.addEventListener('submit', async event => { event.preventDefault(); try { await request('', { name: new FormData(event.currentTarget as HTMLFormElement).get('name') }); } catch (error) { report(error); } });
+  app.querySelector<HTMLFormElement>('#create-channel-category')?.addEventListener('submit', async event => { event.preventDefault(); try { await request('/categories', { name: new FormData(event.currentTarget as HTMLFormElement).get('name') }, 'POST'); } catch (error) { report(error); } });
+  app.querySelectorAll<HTMLFormElement>('[data-channel-access]').forEach(form => form.onsubmit = async event => { event.preventDefault(); const data = new FormData(form); try { await api(`/servers/${server.id}/channel-group`, { method: 'PATCH', body: JSON.stringify({ channelId: form.dataset.channelAccess, categoryId: data.get('categoryId') }) }); await request(`/channels/${form.dataset.channelAccess}/access`, { private: data.has('private'), allowedUserIds: data.getAll('users'), allowedRoleIds: data.getAll('roles') }); } catch (error) { report(error); } });
+}
 
 const maxAttachmentBytes = 750_000_000;
 const attachmentChunkBytes = 8 * 1024 * 1024;
@@ -581,7 +654,7 @@ function render() {
   const sidebarTitle = activeServer?.name || friendsTitle;
   const sidebarContent = activeServer ? serverPanelContent : friendPanelContent;
   app.innerHTML = `<aside class="rail"><button class="brand-mark brand-tab ${!activeServer && !creatingServer ? 'active' : ''}" id="friends-home" title="Friends" aria-label="Friends"><img class="app-mark" src="/pulse-mark.svg" alt=""></button>${railCall}<div class="rail-divider"></div><div class="server-rail-list">${serverRail}</div><button type="button" class="server-rail-button server-add-button ${creatingServer ? 'active' : ''}" id="new-server" title="Create server" aria-label="Create server">＋</button></aside>
-  <aside class="sidebar ${activeServer ? 'server-sidebar' : ''}"><header class="side-header"><div><div class="eyebrow">${activeServer ? 'SERVER' : 'PULSE'}</div><div class="space-title">${esc(sidebarTitle)}</div></div></header>
+  <aside class="sidebar ${activeServer ? 'server-sidebar' : ''}"><header class="side-header"><div><div class="eyebrow">${activeServer ? 'SERVER' : 'PULSE'}</div>${activeServer ? `<details class="server-name-menu"><summary>${esc(sidebarTitle)}<span>⌄</span></summary><div>${activeServer.currentPermissions.includes('invite_members') ? '<button type="button" id="server-menu-invite">Invite to server</button>' : ''}<button type="button" id="server-menu-settings">Server settings</button></div></details>` : `<div class="space-title">${esc(sidebarTitle)}</div>`}</div></header>
     ${!activeServer && friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
     ${!activeServer ? `<nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>` : ''}
     <div class="side-scroll"><section>${sidebarContent}</section></div>${accountFooter}</aside>
@@ -590,6 +663,7 @@ function render() {
     ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : `🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}`}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (creationModal) app.insertAdjacentHTML('beforeend', creationModal);
+  setupServerPanels();
   if (notice) {
     window.clearTimeout(noticeTimer);
     const message = notice;
@@ -609,7 +683,7 @@ function render() {
   app.querySelectorAll<HTMLButtonElement>('[data-server]').forEach(button => button.onclick = () => { const selected = servers.find(item => item.id === button.dataset.server); if (selected) openServer(selected); });
   app.querySelectorAll<HTMLButtonElement>('[data-server-channel]').forEach(button => button.onclick = () => { if (activeServer) openServer(activeServer, button.dataset.serverChannel); });
   app.querySelectorAll<HTMLButtonElement>('[data-server-voice]').forEach(button => button.onclick = () => { const channel = activeServer?.channels.find(item => item.id === button.dataset.serverVoice && item.type === 'voice'); if (activeServer && channel) void joinServerVoice(activeServer, channel); });
-  const closeCreationModal = () => { creatingServer = false; creatingServerChannel = false; creatingServerRole = false; creatingGroup = false; groupPreselectedMemberIds = []; render(); };
+  const closeCreationModal = () => { serverSettingsOpen = false; invitingServerMember = false; creatingServer = false; creatingServerChannel = false; creatingServerRole = false; creatingGroup = false; groupPreselectedMemberIds = []; render(); };
   const modalLayer = app.querySelector<HTMLElement>('.creation-modal-layer');
   modalLayer?.addEventListener('click', event => { if (event.target === modalLayer) closeCreationModal(); });
   modalLayer?.addEventListener('keydown', event => {
@@ -639,7 +713,7 @@ function render() {
   app.querySelector<HTMLButtonElement>('#cancel-server-channel')?.addEventListener('click', () => { creatingServerChannel = false; render(); });
   app.querySelector<HTMLFormElement>('#create-server-channel')?.addEventListener('submit', async event => {
     event.preventDefault(); if (!activeServer) return; const form = new FormData(event.currentTarget as HTMLFormElement);
-    try { const result = await api<{ server: PulseServer; channel: ServerChannel }>(`/servers/${encodeURIComponent(activeServer.id)}/channels`, { method: 'POST', body: JSON.stringify({ name: form.get('name'), type: form.get('type') }) }); servers = servers.map(server => server.id === result.server.id ? result.server : server); creatingServerChannel = false; if (result.channel.type === 'voice') { activeServer = result.server; render(); } else openServer(result.server, result.channel.id); }
+    try { const result = await api<{ server: PulseServer; channel: ServerChannel }>(`/servers/${encodeURIComponent(activeServer.id)}/channels`, { method: 'POST', body: JSON.stringify({ name: form.get('name'), type: form.get('type'), categoryId: form.get('categoryId'), private: form.has('private'), allowedUserIds: form.getAll('users'), allowedRoleIds: form.getAll('roles') }) }); servers = servers.map(server => server.id === result.server.id ? result.server : server); creatingServerChannel = false; if (result.channel.type === 'voice') { activeServer = result.server; render(); } else openServer(result.server, result.channel.id); }
     catch (error) { showError(error); }
   });
   app.querySelector<HTMLButtonElement>('#server-invite-toggle')?.addEventListener('click', () => { invitingServerMember = !invitingServerMember; creatingServerChannel = false; render(); });

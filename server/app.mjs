@@ -102,14 +102,23 @@ function serverPermissions(server, userId) {
   return [...permissions];
 }
 function hasServerPermission(server, userId, permission) { return server.members.includes(userId) && serverPermissions(server, userId).includes(permission); }
+function canAccessChannel(server, channel, userId) {
+  return !!server && !!channel && server.members.includes(userId) && (server.ownerId === userId || !channel.private || (channel.allowedUserIds || []).includes(userId) || (channel.allowedRoleIds || []).some(id => (server.memberRoles?.[userId] || []).includes(id)));
+}
+function canAccessGroup(group, userId) {
+  if (!group?.serverId) return !!group;
+  const server = db.servers.find(item => item.id === group.serverId);
+  return canAccessChannel(server, server?.channels.find(item => item.id === group.id), userId);
+}
 function serverData(server, viewerId) {
   return {
     id: server.id,
     name: server.name,
     ownerId: server.ownerId,
+    categories: server.categories || [],
     inviteCode: hasServerPermission(server, viewerId, 'invite_members') ? server.inviteCode : '',
     members: server.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })),
-    channels: server.channels.map(channel => ({ id: channel.id, name: channel.name, type: channel.type === 'voice' ? 'voice' : 'text' })),
+    channels: server.channels.filter(channel => canAccessChannel(server, channel, viewerId) || hasServerPermission(server, viewerId, 'manage_channels')).map(channel => ({ id: channel.id, name: channel.name, categoryId: channel.categoryId || '', private: !!channel.private, allowedUserIds: channel.allowedUserIds || [], allowedRoleIds: channel.allowedRoleIds || [], accessible: canAccessChannel(server, channel, viewerId), type: channel.type === 'voice' ? 'voice' : 'text' })),
     roles: (server.roles || []).map(role => ({ id: role.id, name: role.name, color: role.color, permissions: (role.permissions || []).filter(permission => serverPermissionNames.includes(permission)) })),
     memberRoles: server.memberRoles || {},
     defaultPermissions: Array.isArray(server.defaultPermissions) ? server.defaultPermissions.filter(permission => serverPermissionNames.includes(permission)) : ['send_messages', 'connect_voice'],
@@ -338,7 +347,7 @@ async function serve(req, res) {
       if (url.pathname === '/api/auth/verify-code' && req.method === 'POST') {
         const challenge = emailChallenges.get(String(body.challengeId || ''));
         if (!challenge || challenge.expiresAt <= Date.now()) return json(res, 400, { error: 'That code expired. Request a new one.' });
-        const code = String(body.code || '').trim();
+        const code = String(body.code || '').trim().split('/').pop()?.split(/[?#]/)[0];
         if (!/^\d{6}$/.test(code) || !timingSafeEqual(Buffer.from(hashCode(challenge.id, code), 'hex'), Buffer.from(challenge.codeHash, 'hex'))) {
           challenge.attempts += 1;
           if (challenge.attempts >= 5) emailChallenges.delete(challenge.id);
@@ -602,11 +611,11 @@ async function serve(req, res) {
         if (body.roomType === 'server') {
           const channelId = String(body.friendId || '');
           const server = db.servers.find(candidate => candidate.members.includes(user.id) && candidate.channels.some(channel => channel.id === channelId && channel.type === 'voice'));
-          if (!server || !hasServerPermission(server, user.id, 'connect_voice') || body.room !== `server-${server.id}-${channelId}` || server.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This server voice channel is not available to your account.' });
+          if (!server || !canAccessChannel(server, server.channels.find(item => item.id === channelId), user.id) || !hasServerPermission(server, user.id, 'connect_voice') || body.room !== `server-${server.id}-${channelId}` || server.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This server voice channel is not available to your account.' });
           return json(res, 200, { user: publicUser(user) });
         }
         if (body.roomType === 'group') {
-          const group = db.groups.find(candidate => candidate.id === String(body.friendId || '') && candidate.members.includes(user.id));
+          const group = db.groups.find(candidate => !candidate.serverId && candidate.id === String(body.friendId || '') && candidate.members.includes(user.id));
           if (!user.publicKey || !group || body.room !== `group-${group.id}` || group.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This group voice room is not available to your account. Update Pulse and sign in again to enable voice encryption.' });
           return json(res, 200, { user: publicUser(user) });
         }
@@ -683,6 +692,44 @@ async function serve(req, res) {
         }
         return json(res, 200, { server: serverData(server, user.id) });
       }
+      const serverSettingsRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})(?:\/(categories|channel-group))?$/);
+      if (serverSettingsRequest && ['PATCH', 'POST'].includes(req.method)) {
+        const server = db.servers.find(item => item.id === serverSettingsRequest[1] && item.members.includes(user.id));
+        if (!server) return json(res, 404, { error: 'Server not found.' });
+        const action = serverSettingsRequest[2];
+        if (!action) {
+          if (req.method !== 'PATCH' || server.ownerId !== user.id) return json(res, 403, { error: 'Only the server owner can edit server settings.' });
+          const name = String(body.name || '').trim();
+          if (!name || name.length > 60) return json(res, 400, { error: 'Server names must be 1–60 characters.' });
+          server.name = name;
+        } else {
+          if (!hasServerPermission(server, user.id, 'manage_channels')) return json(res, 403, { error: 'You do not have permission to manage channels.' });
+          server.categories ||= [];
+          if (action === 'categories' && req.method === 'POST') {
+            const name = String(body.name || '').trim();
+            if (!name || name.length > 60 || server.categories.length >= 25) return json(res, 400, { error: 'Use a group name of 1–60 characters (25 groups maximum).' });
+            server.categories.push({ id: randomBytes(16).toString('hex'), name });
+          } else if (action === 'channel-group' && req.method === 'PATCH') {
+            const channel = server.channels.find(item => item.id === body.channelId);
+            const categoryId = String(body.categoryId || '');
+            if (!channel || (categoryId && !server.categories.some(item => item.id === categoryId))) return json(res, 400, { error: 'Choose an existing channel and group.' });
+            channel.categoryId = categoryId;
+          } else return json(res, 405, { error: 'Method not allowed.' });
+        }
+        persist(); return json(res, 200, { server: serverData(server, user.id) });
+      }
+      const channelAccessRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/channels\/([a-f0-9]{32})\/access$/);
+      if (channelAccessRequest && req.method === 'PATCH') {
+        const server = db.servers.find(item => item.id === channelAccessRequest[1]);
+        if (!server || !hasServerPermission(server, user.id, 'manage_channels')) return json(res, 403, { error: 'You cannot manage this channel.' });
+        const channel = server.channels.find(item => item.id === channelAccessRequest[2]);
+        if (!channel) return json(res, 404, { error: 'Channel not found.' });
+        const users = Array.isArray(body.allowedUserIds) ? [...new Set(body.allowedUserIds.map(String))] : [];
+        const roles = Array.isArray(body.allowedRoleIds) ? [...new Set(body.allowedRoleIds.map(String))] : [];
+        if (users.some(id => !server.members.includes(id)) || roles.some(id => !(server.roles || []).some(role => role.id === id))) return json(res, 400, { error: 'Choose existing members and roles.' });
+        channel.private = body.private === true; channel.allowedUserIds = users; channel.allowedRoleIds = roles;
+        persist(); return json(res, 200, { server: serverData(server, user.id) });
+      }
       const serverChannelRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/channels$/);
       if (serverChannelRequest && req.method === 'POST') {
         const server = db.servers.find(item => item.id === serverChannelRequest[1] && item.members.includes(user.id));
@@ -693,7 +740,12 @@ async function serve(req, res) {
         if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(name)) return json(res, 400, { error: 'Channel names must be 1–32 lowercase letters, numbers, hyphens, or underscores.' });
         if (server.channels.length >= 50) return json(res, 400, { error: 'This server already has 50 channels.' });
         if (server.channels.some(channel => channel.name === name && (channel.type === 'voice' ? 'voice' : 'text') === type)) return json(res, 409, { error: `A ${type} channel with that name already exists.` });
-        const channel = { id: randomBytes(16).toString('hex'), name, type };
+        const categoryId = String(body.categoryId || '');
+        if (categoryId && !(server.categories || []).some(item => item.id === categoryId)) return json(res, 400, { error: 'Channel group not found.' });
+        const allowedUserIds = Array.isArray(body.allowedUserIds) ? [...new Set(body.allowedUserIds.map(String))] : [];
+        const allowedRoleIds = Array.isArray(body.allowedRoleIds) ? [...new Set(body.allowedRoleIds.map(String))] : [];
+        if (allowedUserIds.some(id => !server.members.includes(id)) || allowedRoleIds.some(id => !(server.roles || []).some(role => role.id === id))) return json(res, 400, { error: 'Choose existing members and roles.' });
+        const channel = { id: randomBytes(16).toString('hex'), name, type, categoryId, private: body.private === true, allowedUserIds, allowedRoleIds };
         server.channels.push(channel);
         if (type === 'text') db.groups.push({ id: channel.id, name: channel.name, members: [...server.members], createdBy: user.id, serverId: server.id, createdAt: new Date().toISOString() });
         persist(); return json(res, 201, { server: serverData(server, user.id), channel });
@@ -794,10 +846,11 @@ async function serve(req, res) {
         const group = db.groups.find(item => item.id === groupMessageAction[1] && item.members.includes(user.id));
         const message = db.messages.find(item => item.id === groupMessageAction[2] && item.groupId === groupMessageAction[1]);
         if (!group || !message) return json(res, 404, { error: 'Group message not found.' });
+        if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         if (message.from !== user.id) return json(res, 403, { error: 'You can only edit or delete your own messages.' });
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
         const envelopes = body.envelopes;
-        const readyMembers = group.members.filter(id => !!db.users.find(candidate => candidate.id === id)?.publicKey);
+        const readyMembers = group.members.filter(id => canAccessGroup(group, id) && !!db.users.find(candidate => candidate.id === id)?.publicKey);
         if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Edited message must include your own encryption envelope and only updated group members.' });
         for (const envelope of Object.values(envelopes)) if (!envelope || typeof envelope.ciphertext !== 'string' || envelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.ciphertext) || typeof envelope.iv !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(envelope.iv) || Buffer.from(envelope.iv, 'base64').length !== 12) return json(res, 400, { error: 'An edited message encryption envelope is invalid.' });
         message.envelopes = envelopes; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
@@ -805,18 +858,20 @@ async function serve(req, res) {
       if (groupMessages && req.method === 'GET') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         const items = db.messages.filter(message => message.groupId === group.id).slice(-200);
         return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, encryptionVersion: 1 } : { encryptionVersion: 2 }), createdAt: message.createdAt, ...(message.editedAt ? { editedAt: message.editedAt } : {}) }; }) });
       }
       if (groupMessages && req.method === 'POST') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         if (group.serverId) {
           const server = db.servers.find(item => item.id === group.serverId);
           if (!server || !hasServerPermission(server, user.id, 'send_messages')) return json(res, 403, { error: 'You do not have permission to send messages in this server.' });
         }
         const envelopes = body.envelopes;
-        const readyMembers = group.members.filter(id => !!db.users.find(candidate => candidate.id === id)?.publicKey);
+        const readyMembers = group.members.filter(id => canAccessGroup(group, id) && !!db.users.find(candidate => candidate.id === id)?.publicKey);
         if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Encrypted message must include your own encryption envelope and only updated group members.' });
         for (const memberId of Object.keys(envelopes)) {
           const envelope = envelopes[memberId];
