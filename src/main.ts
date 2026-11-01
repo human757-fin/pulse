@@ -728,6 +728,22 @@ function render() {
     input.value = ''; await refreshMessages(conversation); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus();
   } catch (error) { showError(error); input.disabled = false; } };
   app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => app.querySelector<HTMLInputElement>('#attachment-input')?.click());
+  composer?.addEventListener('paste', async event => {
+    const files = Array.from(event.clipboardData?.items || [])
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsFile()).filter((file): file is File => !!file);
+    if (!files.length) return;
+    event.preventDefault();
+    if (!friend) { showError(new Error('Media attachments are currently available in direct messages.')); return; }
+    const target = friend;
+    try {
+      for (const file of files) await sendAttachment(file, target, (uploaded, total) => {
+        const status = app.querySelector<HTMLElement>('#attachment-status');
+        if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`;
+      });
+      if (activeFriend?.id === target.id) { await refreshMessages(target); render(); }
+    } catch (error) { showError(error); }
+  });
   app.querySelector<HTMLInputElement>('#attachment-input')?.addEventListener('change', async event => {
     const picker = event.currentTarget as HTMLInputElement; const files = Array.from(picker.files || []); picker.value = ''; if (!files.length || !friend) return;
     const target = friend;
