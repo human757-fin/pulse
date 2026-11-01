@@ -89,7 +89,7 @@ export class VoiceClient {
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, ...(this.inputDeviceId ? { deviceId: { exact: this.inputDeviceId } } : {}) },
         video: false,
       });
-      this.stream.getAudioTracks().forEach(track => { track.contentHint = 'speech'; });
+      this.stream.getAudioTracks().forEach(track => { track.contentHint = 'speech'; track.enabled = !this.muted && !this.deafened; });
       if (this.stopped) { this.stream.getTracks().forEach(track => track.stop()); this.stream = undefined; return; }
       await this.openSignaling();
     } catch (error) {
@@ -111,8 +111,6 @@ export class VoiceClient {
     this.voiceKey = undefined;
     this.stream?.getTracks().forEach(track => track.stop());
     this.stream = undefined;
-    this.muted = false;
-    this.deafened = false;
     this.emit('disconnected', 'Not connected');
   }
 
