@@ -5,7 +5,7 @@ export type ScreenShareSettings = { width: number; height: number; fps: number }
 
 type Signal = { type: string; [key: string]: unknown };
 const voiceProtocol = 'pulse-dtls-srtp-screen-v2';
-type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey: ArrayBuffer; roomType: 'dm' | 'group'; getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer> };
+type JoinOptions = { endpoint: string; room: string; friendId: string; authToken: string; voiceKey?: ArrayBuffer; roomType: 'dm' | 'group' | 'server'; getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer> };
 
 export class VoiceClient {
   private socket?: WebSocket;
@@ -75,7 +75,7 @@ export class VoiceClient {
     this.outputDeviceId = deviceId;
   }
 
-  async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer, roomType: 'dm' | 'group' = 'dm', getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer>) {
+  async join(endpoint: string, room: string, friendId: string, authToken: string, voiceKey: ArrayBuffer | undefined, roomType: 'dm' | 'group' | 'server' = 'dm', getPeerVoiceKey?: (userId: string) => Promise<ArrayBuffer>) {
     this.stopped = false;
     this.joinOptions = { endpoint, room, friendId, authToken, voiceKey, roomType, getPeerVoiceKey };
     this.reconnectAttempts = 0;
@@ -202,21 +202,21 @@ export class VoiceClient {
       const from = String(msg.from);
       if (msg.fromUserId) this.peerUsers.set(from, String(msg.fromUserId));
       const description = msg.description as RTCSessionDescriptionInit;
-      if (!await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       const pc = this.makePeer(from);
       await this.preparePeerVideo(from);
       await pc.setRemoteDescription(description);
       await this.flushIce(from, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      this.send({ type: 'answer', to: from, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(from)) });
+      this.send({ type: 'answer', to: from, description: pc.localDescription, ...(this.joinOptions?.roomType === 'server' ? {} : { voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(from)) }) });
       return;
     }
     if (msg.type === 'answer') {
       const from = String(msg.from);
       const pc = this.peers.get(from);
       const description = msg.description as RTCSessionDescriptionInit;
-      if (!await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
       if (pc) { await pc.setRemoteDescription(description); await this.flushIce(from, pc); }
       return;
     }
@@ -243,7 +243,7 @@ export class VoiceClient {
     await this.preparePeerVideo(id);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    this.send({ type: 'offer', to: id, description: pc.localDescription, voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(id)) });
+    this.send({ type: 'offer', to: id, description: pc.localDescription, ...(this.joinOptions?.roomType === 'server' ? {} : { voiceProof: await this.signDescription(pc.localDescription!, await this.keyForPeer(id)) }) });
   }
 
   private descriptionProofData(description: RTCSessionDescriptionInit) {

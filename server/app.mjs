@@ -28,13 +28,14 @@ function loadTotpKey() {
   catch (error) { if (error.code !== 'EEXIST') throw error; return readFileSync(totpKeyPath); }
 }
 const totpEncryptionKey = loadTotpKey();
-let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [], groups: [], suggestions: [] };
+let db = { users: [], sessions: [], friendships: [], messages: [], attachments: [], groups: [], servers: [], suggestions: [] };
 if (existsSync(dbPath)) {
   try { db = { ...db, ...JSON.parse(readFileSync(dbPath, 'utf8')) }; }
   catch { console.error(`Could not parse ${dbPath}; refusing to overwrite it.`); process.exit(1); }
 }
 for (const user of db.users) if (!user.key && user.username) user.key = String(user.username).trim().toLowerCase();
 db.groups ||= [];
+db.servers ||= [];
 db.suggestions ||= [];
 const requestWindows = new Map();
 const suggestionWindows = new Map();
@@ -56,6 +57,15 @@ function persist() {
   writeFileSync(temp, JSON.stringify(db), { mode: 0o600 });
   renameSync(temp, dbPath);
 }
+let serverMigrationNeeded = false;
+for (const server of db.servers) {
+  if (!server.inviteCode) { server.inviteCode = randomBytes(9).toString('base64url'); serverMigrationNeeded = true; }
+  if (!Array.isArray(server.roles)) { server.roles = []; serverMigrationNeeded = true; }
+  if (!server.memberRoles || typeof server.memberRoles !== 'object' || Array.isArray(server.memberRoles)) { server.memberRoles = {}; serverMigrationNeeded = true; }
+  if (!Array.isArray(server.defaultPermissions)) { server.defaultPermissions = ['send_messages', 'connect_voice']; serverMigrationNeeded = true; }
+  for (const channel of server.channels || []) if (channel.type !== 'voice' && channel.type !== 'text') { channel.type = 'text'; serverMigrationNeeded = true; }
+}
+if (serverMigrationNeeded) persist();
 function json(res, status, value) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
   res.end(JSON.stringify(value));
@@ -83,6 +93,29 @@ function sessionUser(req) {
 }
 function friendship(a, b) { return db.friendships.find(f => (f.from === a && f.to === b) || (f.from === b && f.to === a)); }
 function isBlocked(a, b) { return db.users.some(candidate => candidate.id === a && (candidate.blockedUsers || []).includes(b)) || db.users.some(candidate => candidate.id === b && (candidate.blockedUsers || []).includes(a)); }
+const serverPermissionNames = ['manage_channels', 'invite_members', 'manage_roles', 'send_messages', 'connect_voice'];
+function serverPermissions(server, userId) {
+  if (server.ownerId === userId) return [...serverPermissionNames];
+  const permissions = new Set(Array.isArray(server.defaultPermissions) ? server.defaultPermissions.filter(permission => serverPermissionNames.includes(permission)) : ['send_messages', 'connect_voice']);
+  const assignedRoles = server.memberRoles?.[userId] || [];
+  for (const role of server.roles || []) if (assignedRoles.includes(role.id)) for (const permission of role.permissions || []) if (serverPermissionNames.includes(permission)) permissions.add(permission);
+  return [...permissions];
+}
+function hasServerPermission(server, userId, permission) { return server.members.includes(userId) && serverPermissions(server, userId).includes(permission); }
+function serverData(server, viewerId) {
+  return {
+    id: server.id,
+    name: server.name,
+    ownerId: server.ownerId,
+    inviteCode: hasServerPermission(server, viewerId, 'invite_members') ? server.inviteCode : '',
+    members: server.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })),
+    channels: server.channels.map(channel => ({ id: channel.id, name: channel.name, type: channel.type === 'voice' ? 'voice' : 'text' })),
+    roles: (server.roles || []).map(role => ({ id: role.id, name: role.name, color: role.color, permissions: (role.permissions || []).filter(permission => serverPermissionNames.includes(permission)) })),
+    memberRoles: server.memberRoles || {},
+    defaultPermissions: Array.isArray(server.defaultPermissions) ? server.defaultPermissions.filter(permission => serverPermissionNames.includes(permission)) : ['send_messages', 'connect_voice'],
+    currentPermissions: serverPermissions(server, viewerId),
+  };
+}
 function usernameKey(value) { return String(value || '').trim().toLowerCase(); }
 function usernameTaken(key) { return db.users.some(user => usernameKey(user.username || user.key) === key); }
 const emailKey = value => String(value || '').trim().toLowerCase();
@@ -566,6 +599,12 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/logout' && req.method === 'POST') { const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); db.sessions = db.sessions.filter(s => s.token !== token); persist(); return json(res, 200, { ok: true }); }
       if (url.pathname === '/api/voice/authorize' && req.method === 'POST') {
+        if (body.roomType === 'server') {
+          const channelId = String(body.friendId || '');
+          const server = db.servers.find(candidate => candidate.members.includes(user.id) && candidate.channels.some(channel => channel.id === channelId && channel.type === 'voice'));
+          if (!server || !hasServerPermission(server, user.id, 'connect_voice') || body.room !== `server-${server.id}-${channelId}` || server.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This server voice channel is not available to your account.' });
+          return json(res, 200, { user: publicUser(user) });
+        }
         if (body.roomType === 'group') {
           const group = db.groups.find(candidate => candidate.id === String(body.friendId || '') && candidate.members.includes(user.id));
           if (!user.publicKey || !group || body.room !== `group-${group.id}` || group.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This group voice room is not available to your account. Update Pulse and sign in again to enable voice encryption.' });
@@ -612,8 +651,132 @@ async function serve(req, res) {
         if (!f) return json(res, 404, { error: 'That friend request is no longer available.' });
         f.status = 'accepted'; f.acceptedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
       }
+      if (url.pathname === '/api/servers' && req.method === 'GET') {
+        return json(res, 200, { servers: db.servers.filter(server => server.members.includes(user.id)).map(server => serverData(server, user.id)) });
+      }
+      if (url.pathname === '/api/servers' && req.method === 'POST') {
+        const name = String(body.name || '').trim();
+        const requested = Array.isArray(body.memberIds) ? [...new Set(body.memberIds.map(String))] : [];
+        if (!name || name.length > 60) return json(res, 400, { error: 'Server name must be 1–60 characters.' });
+        if (db.servers.filter(server => server.ownerId === user.id).length >= 20) return json(res, 400, { error: 'You already own 20 servers.' });
+        if (requested.length > 24 || requested.some(id => id === user.id || friendship(user.id, id)?.status !== 'accepted' || isBlocked(user.id, id))) return json(res, 400, { error: 'Choose up to 24 accepted, unblocked friends.' });
+        const members = [user.id, ...requested];
+        const serverId = randomBytes(16).toString('hex');
+        const channel = { id: randomBytes(16).toString('hex'), name: 'general', type: 'text' };
+        const server = { id: serverId, name, ownerId: user.id, inviteCode: randomBytes(9).toString('base64url'), members, channels: [channel], roles: [], memberRoles: {}, defaultPermissions: ['send_messages', 'connect_voice'], createdAt: new Date().toISOString() };
+        db.servers.push(server);
+        db.groups.push({ id: channel.id, name: channel.name, members: [...members], createdBy: user.id, serverId, createdAt: server.createdAt });
+        persist(); return json(res, 201, { server: serverData(server, user.id) });
+      }
+      if (url.pathname === '/api/servers/join' && req.method === 'POST') {
+        const code = String(body.code || '').trim();
+        const server = db.servers.find(item => item.inviteCode === code);
+        if (!server || isBlocked(user.id, server.ownerId)) return json(res, 404, { error: 'That server invite is invalid or unavailable.' });
+        if (!server.members.includes(user.id)) {
+          if (server.members.length >= 25) return json(res, 400, { error: 'That server is full.' });
+          server.members.push(user.id);
+          for (const channel of server.channels) {
+            const group = db.groups.find(item => item.id === channel.id && item.serverId === server.id);
+            if (group && !group.members.includes(user.id)) group.members.push(user.id);
+          }
+          persist();
+        }
+        return json(res, 200, { server: serverData(server, user.id) });
+      }
+      const serverChannelRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/channels$/);
+      if (serverChannelRequest && req.method === 'POST') {
+        const server = db.servers.find(item => item.id === serverChannelRequest[1] && item.members.includes(user.id));
+        const name = String(body.name || '').trim().toLowerCase().replace(/\s+/g, '-');
+        const type = body.type === 'voice' ? 'voice' : 'text';
+        if (!server) return json(res, 404, { error: 'Server not found.' });
+        if (!hasServerPermission(server, user.id, 'manage_channels')) return json(res, 403, { error: 'You do not have permission to manage channels.' });
+        if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(name)) return json(res, 400, { error: 'Channel names must be 1–32 lowercase letters, numbers, hyphens, or underscores.' });
+        if (server.channels.length >= 50) return json(res, 400, { error: 'This server already has 50 channels.' });
+        if (server.channels.some(channel => channel.name === name && (channel.type === 'voice' ? 'voice' : 'text') === type)) return json(res, 409, { error: `A ${type} channel with that name already exists.` });
+        const channel = { id: randomBytes(16).toString('hex'), name, type };
+        server.channels.push(channel);
+        if (type === 'text') db.groups.push({ id: channel.id, name: channel.name, members: [...server.members], createdBy: user.id, serverId: server.id, createdAt: new Date().toISOString() });
+        persist(); return json(res, 201, { server: serverData(server, user.id), channel });
+      }
+      const serverMemberRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/members$/);
+      if (serverMemberRequest && req.method === 'POST') {
+        const server = db.servers.find(item => item.id === serverMemberRequest[1] && item.members.includes(user.id));
+        const target = db.users.find(candidate => candidate.id === String(body.userId || ''));
+        if (!server) return json(res, 404, { error: 'Server not found.' });
+        if (!hasServerPermission(server, user.id, 'invite_members')) return json(res, 403, { error: 'You do not have permission to invite members.' });
+        if (!target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted' || isBlocked(user.id, target.id)) return json(res, 403, { error: 'You can invite accepted, unblocked friends.' });
+        if (!server.members.includes(target.id)) {
+          if (server.members.length >= 25) return json(res, 400, { error: 'This server already has 25 members.' });
+          server.members.push(target.id);
+          for (const channel of server.channels) {
+            const group = db.groups.find(item => item.id === channel.id && item.serverId === server.id);
+            if (group && !group.members.includes(target.id)) group.members.push(target.id);
+          }
+          persist();
+        }
+        return json(res, 200, { server: serverData(server, user.id) });
+      }
+      const serverRolesRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/roles$/);
+      const serverPermissionsRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/permissions$/);
+      if (serverPermissionsRequest && req.method === 'PATCH') {
+        const server = db.servers.find(item => item.id === serverPermissionsRequest[1] && item.members.includes(user.id));
+        if (!server) return json(res, 404, { error: 'Server not found.' });
+        if (!hasServerPermission(server, user.id, 'manage_roles')) return json(res, 403, { error: 'You do not have permission to manage roles.' });
+        const permissions = Array.isArray(body.permissions) ? [...new Set(body.permissions.map(String))] : [];
+        const actorPermissions = serverPermissions(server, user.id);
+        if (permissions.some(permission => !serverPermissionNames.includes(permission) || !actorPermissions.includes(permission))) return json(res, 403, { error: 'You cannot grant permissions you do not have.' });
+        server.defaultPermissions = permissions;
+        persist(); return json(res, 200, { server: serverData(server, user.id) });
+      }
+      if (serverRolesRequest && req.method === 'POST') {
+        const server = db.servers.find(item => item.id === serverRolesRequest[1] && item.members.includes(user.id));
+        if (!server) return json(res, 404, { error: 'Server not found.' });
+        if (!hasServerPermission(server, user.id, 'manage_roles')) return json(res, 403, { error: 'You do not have permission to manage roles.' });
+        const name = String(body.name || '').trim(); const color = String(body.color || '').toLowerCase();
+        const permissions = Array.isArray(body.permissions) ? [...new Set(body.permissions.map(String))] : [];
+        const memberIds = Array.isArray(body.memberIds) ? [...new Set(body.memberIds.map(String))] : [];
+        if (!name || name.length > 32) return json(res, 400, { error: 'Role names must be 1–32 characters.' });
+        if (!/^#[0-9a-f]{6}$/.test(color)) return json(res, 400, { error: 'Choose a valid role color.' });
+        if (permissions.some(permission => !serverPermissionNames.includes(permission))) return json(res, 400, { error: 'A role permission is invalid.' });
+        if (permissions.some(permission => !serverPermissions(server, user.id).includes(permission))) return json(res, 403, { error: 'You cannot grant permissions you do not have.' });
+        if (memberIds.some(id => !server.members.includes(id) || id === server.ownerId)) return json(res, 400, { error: 'Roles can only be assigned to server members other than the owner.' });
+        server.roles ||= []; server.memberRoles ||= {};
+        if (server.roles.length >= 50) return json(res, 400, { error: 'This server already has 50 roles.' });
+        const role = { id: randomBytes(12).toString('hex'), name, color, permissions };
+        server.roles.push(role);
+        for (const memberId of memberIds) server.memberRoles[memberId] = [...new Set([...(server.memberRoles[memberId] || []), role.id])];
+        persist(); return json(res, 201, { server: serverData(server, user.id), role });
+      }
+      const serverRoleRequest = url.pathname.match(/^\/api\/servers\/([a-f0-9]{32})\/roles\/([a-f0-9]{24})$/);
+      if (serverRoleRequest && ['PATCH', 'DELETE'].includes(req.method)) {
+        const server = db.servers.find(item => item.id === serverRoleRequest[1] && item.members.includes(user.id));
+        const role = server?.roles?.find(item => item.id === serverRoleRequest[2]);
+        if (!server || !role) return json(res, 404, { error: 'Server role not found.' });
+        if (!hasServerPermission(server, user.id, 'manage_roles')) return json(res, 403, { error: 'You do not have permission to manage roles.' });
+        const actorPermissions = serverPermissions(server, user.id);
+        if ((role.permissions || []).some(permission => !actorPermissions.includes(permission))) return json(res, 403, { error: 'You cannot manage a role above your own permissions.' });
+        server.memberRoles ||= {};
+        if (req.method === 'DELETE') {
+          server.roles = server.roles.filter(item => item.id !== role.id);
+          for (const memberId of Object.keys(server.memberRoles)) server.memberRoles[memberId] = server.memberRoles[memberId].filter(roleId => roleId !== role.id);
+          persist(); return json(res, 200, { server: serverData(server, user.id) });
+        }
+        const name = String(body.name || '').trim(); const color = String(body.color || '').toLowerCase();
+        const permissions = Array.isArray(body.permissions) ? [...new Set(body.permissions.map(String))] : [];
+        const memberIds = Array.isArray(body.memberIds) ? [...new Set(body.memberIds.map(String))] : [];
+        if (!name || name.length > 32) return json(res, 400, { error: 'Role names must be 1–32 characters.' });
+        if (!/^#[0-9a-f]{6}$/.test(color)) return json(res, 400, { error: 'Choose a valid role color.' });
+        if (permissions.some(permission => !serverPermissionNames.includes(permission) || !actorPermissions.includes(permission))) return json(res, 403, { error: 'You cannot grant permissions you do not have.' });
+        if (memberIds.some(id => !server.members.includes(id) || id === server.ownerId)) return json(res, 400, { error: 'Roles can only be assigned to server members other than the owner.' });
+        role.name = name; role.color = color; role.permissions = permissions;
+        for (const memberId of server.members) {
+          const assigned = (server.memberRoles[memberId] || []).filter(roleId => roleId !== role.id);
+          server.memberRoles[memberId] = memberIds.includes(memberId) ? [...assigned, role.id] : assigned;
+        }
+        persist(); return json(res, 200, { server: serverData(server, user.id), role });
+      }
       if (url.pathname === '/api/groups' && req.method === 'GET') {
-        const groups = db.groups.filter(group => group.members.includes(user.id)).map(group => ({ id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) }));
+        const groups = db.groups.filter(group => !group.serverId && group.members.includes(user.id)).map(group => ({ id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) }));
         return json(res, 200, { groups });
       }
       if (url.pathname === '/api/groups' && req.method === 'POST') {
@@ -648,6 +811,10 @@ async function serve(req, res) {
       if (groupMessages && req.method === 'POST') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        if (group.serverId) {
+          const server = db.servers.find(item => item.id === group.serverId);
+          if (!server || !hasServerPermission(server, user.id, 'send_messages')) return json(res, 403, { error: 'You do not have permission to send messages in this server.' });
+        }
         const envelopes = body.envelopes;
         const readyMembers = group.members.filter(id => !!db.users.find(candidate => candidate.id === id)?.publicKey);
         if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Encrypted message must include your own encryption envelope and only updated group members.' });
@@ -662,6 +829,7 @@ async function serve(req, res) {
       if (groupMemberRequest && req.method === 'POST') {
         const group = db.groups.find(item => item.id === groupMemberRequest[1] && item.members.includes(user.id));
         const target = db.users.find(candidate => candidate.id === String(body.userId || ''));
+        if (group?.serverId) return json(res, 403, { error: 'Invite people from the server member list.' });
         if (!group || !target || target.id === user.id || friendship(user.id, target.id)?.status !== 'accepted' || isBlocked(user.id, target.id)) return json(res, 403, { error: 'You can add accepted, unblocked friends to this group.' });
         if (!group.members.includes(target.id)) { if (group.members.length >= 25) return json(res, 400, { error: 'This group already has 25 members.' }); group.members.push(target.id); persist(); }
         return json(res, 200, { group: { id: group.id, name: group.name, members: group.members.map(id => db.users.find(candidate => candidate.id === id)).filter(Boolean).map(member => ({ ...publicUser(member), encryptionReady: !!member.publicKey })) } });
@@ -671,13 +839,16 @@ async function serve(req, res) {
         const group = db.groups.find(item => item.id === groupRequest[1] && item.members.includes(user.id));
         const name = String(body.name || '').trim();
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
+        if (group.serverId) return json(res, 403, { error: 'Server channels are managed from the server.' });
         if (!name || name.length > 60) return json(res, 400, { error: 'Group name must be 1–60 characters.' });
         group.name = name; persist(); return json(res, 200, { ok: true });
       }
       if (groupRequest && req.method === 'DELETE') {
         const groupIndex = db.groups.findIndex(item => item.id === groupRequest[1] && item.members.includes(user.id));
         if (groupIndex < 0) return json(res, 404, { error: 'Group chat not found.' });
-        const group = db.groups[groupIndex]; group.members = group.members.filter(id => id !== user.id);
+        const group = db.groups[groupIndex];
+        if (group.serverId) return json(res, 403, { error: 'Leave the server instead of an individual channel.' });
+        group.members = group.members.filter(id => id !== user.id);
         if (!group.members.length) db.groups.splice(groupIndex, 1);
         persist(); return json(res, 200, { ok: true });
       }

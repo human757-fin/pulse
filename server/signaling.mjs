@@ -51,7 +51,7 @@ async function handle(client, message) {
       leave(client);
       const roomName = String(message.room || '').slice(0, 128);
       const friendId = String(message.friendId || '');
-      const roomType = message.roomType === 'group' ? 'group' : 'dm';
+      const roomType = message.roomType === 'server' ? 'server' : message.roomType === 'group' ? 'group' : 'dm';
       const authToken = String(message.authToken || '').trim();
       if (message.voiceProtocol !== voiceProtocol) { send(client, { type: 'error', message: 'Voice versions do not match. Update Pulse on both devices and restart the Pulse server.' }); return; }
       if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Pulse and select an accepted friend before calling.' }); return; }
@@ -72,7 +72,8 @@ async function handle(client, message) {
       if (!account?.id || !account?.username) { send(client, { type: 'error', message: 'Sign in again and make sure you are friends before calling.' }); return; }
       let room = rooms.get(roomName);
       if (!room) { room = new Map(); rooms.set(roomName, room); }
-      if (room.size >= (roomType === 'group' ? 6 : 2)) { send(client, { type: 'error', message: roomType === 'group' ? 'This group call is full (maximum 6 people).' : 'This direct call is already full.' }); return; }
+      const roomLimit = roomType === 'server' ? 25 : roomType === 'group' ? 6 : 2;
+      if (room.size >= roomLimit) { send(client, { type: 'error', message: roomType === 'server' ? 'This server voice channel is full (maximum 25 people).' : roomType === 'group' ? 'This group call is full (maximum 6 people).' : 'This direct call is already full.' }); return; }
       const peers = [...room.entries()].map(([id, peer]) => ({ id, name: peer.name, userId: peer.userId }));
       client.room = roomName;
       client.id = randomUUID();

@@ -1,4 +1,5 @@
 import './style.css';
+import './servers.css';
 import QRCode from 'qrcode';
 import packageInfo from '../package.json';
 import { createAttachmentCipher, decryptFile, decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
@@ -9,6 +10,10 @@ type User = { id: string; username: string; email?: string; emailVerified?: bool
 type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; selfCopy?: boolean; encryptionVersion: number };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 type GroupChat = { id: string; name: string; members: User[] };
+type ServerChannel = { id: string; name: string; type: 'text' | 'voice' };
+type ServerPermission = 'manage_channels' | 'invite_members' | 'manage_roles' | 'send_messages' | 'connect_voice';
+type ServerRole = { id: string; name: string; color: string; permissions: ServerPermission[] };
+type PulseServer = { id: string; name: string; ownerId: string; inviteCode: string; members: User[]; channels: ServerChannel[]; roles: ServerRole[]; memberRoles: Record<string, string[]>; defaultPermissions: ServerPermission[]; currentPermissions: ServerPermission[] };
 type IncomingCall = { id: string; room: string; expiresAt: number; caller: User };
 type SuggestionStatus = '' | 'started' | 'not-doing' | 'will-do' | 'done';
 type AdminSuggestion = { id: string; text: string; createdAt: string; status: SuggestionStatus; user: User };
@@ -29,6 +34,12 @@ let messageSearch = '';
 let editingMessageId = '';
 let activeFriend: User | undefined;
 let groups: GroupChat[] = [];
+let servers: PulseServer[] = [];
+let activeServer: PulseServer | undefined;
+let creatingServer = false;
+let creatingServerChannel = false;
+let invitingServerMember = false;
+let managingServerRoles = false;
 let blockedUsers: string[] = [];
 let blockedProfiles: User[] = [];
 let activeGroup: GroupChat | undefined;
@@ -46,6 +57,8 @@ let screenQualityOpen = false;
 let voiceRoom = '';
 let callFriend: User | undefined;
 let callGroup: GroupChat | undefined;
+let callServer: PulseServer | undefined;
+let callServerChannel: ServerChannel | undefined;
 let incomingCall: IncomingCall | undefined;
 let outgoingCallInviteId = '';
 let voiceMuted = false;
@@ -92,7 +105,7 @@ const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
 const autoPreviewStarted = new Set<string>();
 const senderEnvelopeMigrations = new Set<string>();
-const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; screenViewOpen = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
+const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callServer = undefined; callServerChannel = undefined; callParticipants = []; screenViewOpen = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const presenceLabel = (presence?: Presence) => ({ online: 'Online', idle: 'Idle', away: 'Away', dnd: 'Do Not Disturb', offline: 'Offline' }[presence || 'offline']);
@@ -181,6 +194,7 @@ async function refreshFriends() {
   if (activeFriend) activeFriend = friends.friends.find(friend => friend.id === activeFriend!.id) || activeFriend;
   if (callFriend) callFriend = friends.friends.find(friend => friend.id === callFriend!.id) || callFriend;
   await refreshGroups();
+  await refreshServers();
 }
 async function syncPresence() {
   if (!me || !token) return;
@@ -197,6 +211,27 @@ async function refreshGroups() {
     groups = await Promise.all(result.groups.map(async group => ({ ...group, members: await Promise.all(group.members.map(async member => { if (member.id === me?.id) return me; const cached = previous.get(member.id); return cached && cached.profileVersion === member.profileVersion ? { ...member, avatar: cached.avatar, banner: cached.banner, bio: cached.bio } : hydrateProfile(member); })) })));
     if (activeGroup) activeGroup = groups.find(group => group.id === activeGroup!.id) || activeGroup;
   } catch { groups = []; }
+}
+async function refreshServers() {
+  try {
+    const result = await api<{ servers: PulseServer[] }>('/servers');
+    servers = await Promise.all(result.servers.map(async server => ({
+      ...server,
+      members: await Promise.all(server.members.map(async member => member.id === me?.id ? me : hydrateProfile(member))),
+    }))) as PulseServer[];
+    if (activeServer) {
+      activeServer = servers.find(server => server.id === activeServer!.id);
+      if (!activeServer) { activeGroup = undefined; messages = []; }
+      else if (activeGroup) {
+        const channel = activeServer.channels.find(item => item.id === activeGroup!.id) || activeServer.channels[0];
+        activeGroup = channel ? { id: channel.id, name: channel.name, members: activeServer.members } : undefined;
+      }
+    }
+    if (callServer) {
+      callServer = servers.find(server => server.id === callServer!.id) || callServer;
+      if (callGroup) callGroup = { ...callGroup, members: callServer.members };
+    }
+  } catch { servers = []; }
 }
 const displayName = (user: User) => user.displayName?.trim() || user.username;
 const avatar = (user: User, className = '') => `<span class="avatar ${className}"${user.avatar ? ` style="background-image:url('${esc(user.avatar)}');background-size:cover;background-position:center;color:transparent"` : ''}>${user.avatar ? '' : esc(displayName(user)[0]?.toUpperCase() || '?')}</span>`;
@@ -277,8 +312,15 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
-function openGroup(group: GroupChat) { activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { activeServer = undefined; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { activeServer = undefined; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openServer(server: PulseServer, channelId = server.channels[0]?.id) {
+  const channel = server.channels.find(item => item.id === channelId) || server.channels[0];
+  if (activeServer?.id !== server.id) managingServerRoles = false;
+  activeServer = server; activeFriend = undefined; activeGroup = channel ? { id: channel.id, name: channel.name, members: server.members } : undefined;
+  settingsOpen = false; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear();
+  if (activeGroup) void refreshMessages(activeGroup).then(render).catch(error => { notice = error.message; render(); }); else render();
+}
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
 
 async function cancelOutgoingCallInvite() {
@@ -325,7 +367,7 @@ async function toggleCall(invitePeer = true) {
     }
     callFriend = target;
     voiceRoom = chatRoom(target);
-    callGroup = undefined;
+    callGroup = undefined; callServer = undefined; callServerChannel = undefined;
     await voice.join(endpoint, voiceRoom, target.id, token, key, 'dm', async peerId => voiceEncryptionKey(me!.id, peerId, fetchFriendKey));
   } catch (error) { await cancelOutgoingCallInvite(); showError(error); }
 }
@@ -338,11 +380,22 @@ async function toggleGroupCall(group: GroupChat) {
     const callReadyMembers = group.members.filter(member => member.id !== me!.id && member.encryptionReady !== false);
     if (!callReadyMembers.length) throw new Error('At least one other group member needs to sign in with an updated Pulse client before you can call.');
     const key = await voiceEncryptionKey(me.id, callReadyMembers[0].id, fetchFriendKey);
-    callFriend = undefined; callGroup = group; voiceRoom = `group-${group.id}`;
+    callFriend = undefined; callGroup = group; callServer = undefined; callServerChannel = undefined; voiceRoom = `group-${group.id}`;
     await voice.join(endpoint, voiceRoom, group.id, token, key, 'group', peerId => voiceEncryptionKey(me!.id, peerId, fetchFriendKey));
   } catch (error) { showError(error); }
 }
-function leaveCall() { void cancelOutgoingCallInvite(); voiceRoom = ''; callFriend = undefined; callGroup = undefined; callParticipants = []; voice.leave(); }
+async function joinServerVoice(server: PulseServer, channel: ServerChannel) {
+  if (!me || channel.type !== 'voice') return;
+  if (callServer?.id === server.id && callServerChannel?.id === channel.id && callActiveState()) { leaveCall(); return; }
+  if (callActiveState()) voice.leave();
+  try {
+    callFriend = undefined; callServer = server; callServerChannel = channel;
+    callGroup = { id: channel.id, name: channel.name, members: server.members };
+    voiceRoom = `server-${server.id}-${channel.id}`;
+    await voice.join(signalUrl(), voiceRoom, channel.id, token, undefined, 'server');
+  } catch (error) { showError(error); }
+}
+function leaveCall() { void cancelOutgoingCallInvite(); voiceRoom = ''; callFriend = undefined; callGroup = undefined; callServer = undefined; callServerChannel = undefined; callParticipants = []; voice.leave(); }
 
 const maxAttachmentBytes = 750_000_000;
 const attachmentChunkBytes = 8 * 1024 * 1024;
@@ -478,14 +531,14 @@ function render() {
   const group = activeGroup;
   const conversation = friend || group;
   const callActive = voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting';
-  const callVisible = callActive && ((!!friend && friend.id === callFriend?.id) || (!!group && group.id === callGroup?.id));
+  const callVisible = callActive && (callServer ? activeServer?.id === callServer.id : ((!!friend && friend.id === callFriend?.id) || (!!group && group.id === callGroup?.id)));
   const screenSize = screenResolution === '720' ? { width: 1280, height: 720 } : screenResolution === '1440' ? { width: 2560, height: 1440 } : { width: 1920, height: 1080 };
   const screenShareSettings: ScreenShareSettings = { ...screenSize, fps: Number(screenFps) };
   const resolutionOptions = [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']].map(([value, label]) => `<option value="${value}" ${screenResolution === value ? 'selected' : ''}>${label}</option>`).join('');
   const fpsOptions = ['15', '30', '60'].map(value => `<option value="${value}" ${screenFps === value ? 'selected' : ''}>${value} FPS</option>`).join('');
   const callMember = (userId: string) => callGroup?.members.find(member => member.id === userId) || (callFriend?.id === userId ? callFriend : undefined);
   const activeCallUsers = callGroup ? [me!, ...callParticipants.map(peer => callMember(peer.userId)).filter((member): member is User => !!member)] : [me!, ...(callFriend ? [callFriend] : [])];
-  const callTitle = callGroup?.name || (callFriend ? displayName(callFriend) : 'Voice call');
+  const callTitle = callServer && callServerChannel ? `${callServer.name} · ${callServerChannel.name}` : callGroup?.name || (callFriend ? displayName(callFriend) : 'Voice call');
   const callAvatars = activeCallUsers.slice(0, 5).map((member, index) => avatar(member, `active-call-avatar ${index === 0 ? 'call-self-avatar' : `call-peer-avatar ${voiceState === 'connected' ? 'connected' : ''}`}`)).join('');
   const callBar = callVisible ? `<section class="active-call-bar" aria-label="Voice call controls"><div class="active-call-info"><div class="active-call-avatars">${callAvatars}${activeCallUsers.length > 5 ? `<span class="call-avatar-overflow">+${activeCallUsers.length - 5}</span>` : ''}</div><div class="active-call-copy"><span class="call-context">${callGroup ? 'GROUP VOICE CALL' : 'DIRECT VOICE CALL'}</span><strong>${esc(callTitle)}</strong><span class="call-connection"><span class="call-live-dot ${voiceState === 'connected' ? 'connected' : ''}"></span>${esc(voiceState === 'connected' ? `${callParticipants.length + 1} in call` : voiceState === 'reconnecting' ? 'Reconnecting…' : voiceState === 'connecting' ? 'Connecting…' : callParticipants.length ? 'Connecting to group…' : 'Waiting for someone to join…')}</span></div></div><div class="active-call-actions"><div class="stream-menu-wrap"><div class="stream-split"><button type="button" id="screen-share-button" class="call-control compact screen-share-button ${screenSharing ? 'sharing' : ''}" aria-label="${screenSharing ? 'Stop screen share' : 'Share screen'}" title="${screenSharing ? 'Stop sharing' : 'Share screen'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4m-2-8 2-2 2 2m-2-2v5"/></svg><span>${screenSharing ? 'Stop sharing' : 'Share screen'}</span></button><button type="button" id="screen-quality-toggle" class="stream-quality-toggle" aria-label="Stream quality settings" aria-expanded="${screenQualityOpen}" title="Stream settings"><span>⌄</span></button></div>${screenQualityOpen ? `<div class="screen-quality-menu" role="group" aria-label="Stream quality settings"><strong>Stream quality</strong><label><span>Resolution</span><select id="screen-resolution" aria-label="Screen resolution">${resolutionOptions}</select></label><label><span>Frame rate</span><select id="screen-fps" aria-label="Screen frame rate">${fpsOptions}</select></label></div>` : ''}</div><button type="button" id="watch-screen-button" class="call-control compact watch-screen-button ${screenViewOpen ? 'active' : ''}" aria-label="${screenViewOpen ? 'Hide screen share' : 'Watch screen share'}" title="${screenViewOpen ? 'Hide screen share' : 'Watch screen share'}"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></svg><span>${screenViewOpen ? 'Hide screen' : 'Watch screen'}</span></button><button type="button" id="call-mute" class="call-control compact call-mute-button ${voiceMuted ? 'muted' : ''}" aria-label="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}" title="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4m-4 0h8"/>${voiceMuted ? '<path d="m4 4 16 16"/>' : ''}</svg><span>${voiceMuted ? 'Unmute' : 'Mute'}</span></button><button type="button" id="call-deafen" class="call-control compact call-deafen-button ${voiceDeafened ? 'deafened' : ''}" aria-label="${voiceDeafened ? 'Undeafen' : 'Deafen'}" title="${voiceDeafened ? 'Turn audio back on' : 'Deafen'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13a9 9 0 0 1 18 0v5h-5v-6h5M3 12h5v6H3v-5"/>${voiceDeafened ? '<path d="m4 4 16 16"/>' : ''}</svg><span>${voiceDeafened ? 'Undeafen' : 'Deafen'}</span></button><span class="call-action-divider"></span><button type="button" id="call-leave" class="call-control compact leave-call" aria-label="Leave call" title="Leave call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15.5c4.9-4.4 13.1-4.4 18 0l-2.3 3.2a1.5 1.5 0 0 1-1.8.5l-2.4-1a1.5 1.5 0 0 1-.9-1.4v-1.1a11 11 0 0 0-3.2 0v1.1a1.5 1.5 0 0 1-.9 1.4l-2.4 1a1.5 1.5 0 0 1-1.8-.5L3 15.5Z"/></svg><span>Leave</span></button></div></section>` : '';
   const callParticipantBar = callVisible ? `<section class="call-participant-bar" aria-label="People in ${esc(callTitle)}"><div class="call-participant-bar-heading"><strong>IN THE CALL</strong><span>${activeCallUsers.length} ${activeCallUsers.length === 1 ? 'person' : 'people'}</span></div><div class="call-participant-list">${activeCallUsers.map(member => { const self = member.id === me!.id; const connected = self || callParticipants.some(peer => peer.userId === member.id); return `<div class="call-person ${connected ? 'connected' : 'waiting'}">${avatar(member, 'call-person-avatar')}<span class="call-person-copy"><strong>${esc(displayName(member))}${self ? ' <small>(you)</small>' : ''}</strong><small>${self ? voiceMuted ? 'Microphone muted' : 'You' : connected ? 'In call' : 'Invited'}</small></span>${self && voiceMuted ? '<span class="call-person-muted" title="Microphone muted">⌁̸</span>' : ''}</div>`; }).join('')}</div></section>` : '';
@@ -499,11 +552,29 @@ function render() {
     : friendsPanel === 'requests'
       ? `<div class="section-title">INCOMING <span>${friends.incoming.length}</span></div>${friends.incoming.map(f => `<div class="request-row"><span>${esc(f.username)}</span><button class="accept-button" data-accept="${esc(f.id)}">Accept</button></div>`).join('') || '<p class="side-empty">No new requests.</p>'}<div class="section-title">SENT</div>${friends.outgoing.map(f => `<p class="side-empty">Request sent to ${esc(f.username)}</p>`).join('') || '<p class="side-empty">No pending requests.</p>'}`
       : `<p class="side-empty add-friend-help">Add someone by their Pulse username. They’ll appear in Friends after they accept.</p><form id="add-friend" class="add-friend"><input name="username" required minlength="3" maxlength="24" placeholder="Pulse username"/><button title="Send friend request" aria-label="Send friend request">＋</button></form>`;
-  app.innerHTML = `<aside class="rail"><button class="brand-mark brand-tab ${!settingsOpen ? 'active' : ''}" id="friends-home" title="Friends" aria-label="Friends"><img class="app-mark" src="/pulse-mark.svg" alt=""></button>${railCall}<div class="rail-divider"></div></aside>
-  <aside class="sidebar"><header class="side-header"><div><div class="eyebrow">PULSE</div><div class="space-title">${friendsTitle}</div></div></header>
-    ${friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
-    <nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>
-    <div class="side-scroll"><section>${friendPanelContent}</section></div>${accountFooter}</aside>
+  const serverRail = servers.map(server => `<button type="button" class="server-rail-button ${activeServer?.id === server.id ? 'active' : ''}" data-server="${esc(server.id)}" title="${esc(server.name)}" aria-label="Open ${esc(server.name)}"><span>${esc(server.name.slice(0, 2).toUpperCase())}</span></button>`).join('');
+  const availableServerFriends = activeServer ? friends.friends.filter(item => !activeServer!.members.some(member => member.id === item.id)) : [];
+  const textServerChannels = activeServer?.channels.filter(channel => channel.type !== 'voice') || [];
+  const voiceServerChannels = activeServer?.channels.filter(channel => channel.type === 'voice') || [];
+  const serverPermissionLabels: Array<[ServerPermission, string]> = [['manage_channels', 'Manage channels'], ['invite_members', 'Invite members'], ['manage_roles', 'Manage roles'], ['send_messages', 'Send messages'], ['connect_voice', 'Join voice']];
+  const rolePermissionChoices = (selected: ServerPermission[]) => serverPermissionLabels.map(([permission, label]) => `<label class="role-permission"><input type="checkbox" name="permissions" value="${permission}" ${selected.includes(permission) ? 'checked' : ''}><span>${label}</span></label>`).join('');
+  const roleServer = activeServer;
+  const roleMemberChoices = (roleId = '') => roleServer?.members.filter(member => member.id !== roleServer.ownerId).map(member => `<label class="role-member-choice"><input type="checkbox" name="members" value="${esc(member.id)}" ${(roleServer.memberRoles[member.id] || []).includes(roleId) ? 'checked' : ''}>${avatar(member, 'tiny')}<span>${esc(displayName(member))}</span></label>`).join('') || '<small>No assignable members yet.</small>';
+  const roleManagerContent = activeServer ? `<div class="role-manager-heading"><button type="button" id="close-server-roles">← Channels</button><div><strong>Roles</strong><span>Permissions are additive</span></div></div><form id="server-everyone-role" class="server-role-form everyone"><div class="everyone-role-title"><span>@</span><strong>everyone</strong></div><fieldset><legend>Default permissions</legend>${rolePermissionChoices(activeServer.defaultPermissions)}</fieldset><button type="submit" class="primary-button">Save defaults</button></form><form id="create-server-role" class="server-role-form"><div class="role-name-row"><input type="color" name="color" value="#8175f5" aria-label="Role color"><input name="name" required maxlength="32" placeholder="New role name"></div><fieldset><legend>Permissions</legend>${rolePermissionChoices([])}</fieldset><fieldset><legend>Members</legend>${roleMemberChoices()}</fieldset><button type="submit" class="primary-button">Create role</button></form>${activeServer.roles.map(role => `<form class="server-role-form existing" style="border-left-color:${esc(role.color)}" data-server-role-form="${esc(role.id)}"><div class="role-name-row"><input type="color" name="color" value="${esc(role.color)}" aria-label="${esc(role.name)} color"><input name="name" required maxlength="32" value="${esc(role.name)}"></div><fieldset><legend>Permissions</legend>${rolePermissionChoices(role.permissions)}</fieldset><fieldset><legend>Members</legend>${roleMemberChoices(role.id)}</fieldset><div class="role-form-actions"><button type="button" class="secondary-button role-delete" data-delete-server-role="${esc(role.id)}">Delete</button><button type="submit" class="primary-button">Save</button></div></form>`).join('') || '<p class="side-empty">No custom roles yet.</p>'}` : '';
+  const serverPanelContent = activeServer ? `<div class="server-sidebar-actions"><div>${activeServer.currentPermissions.includes('invite_members') ? '<button type="button" id="server-invite-toggle">Invite people</button>' : ''}${activeServer.inviteCode ? '<button type="button" id="copy-server-invite">Copy invite</button>' : ''}${activeServer.currentPermissions.includes('manage_roles') ? '<button type="button" id="manage-server-roles">Roles</button>' : ''}</div><span>${activeServer.members.length} members</span></div>
+    ${managingServerRoles ? roleManagerContent : `${invitingServerMember ? `<form id="server-invite-form" class="server-compact-form"><label>Invite a friend<select name="userId" required><option value="">Choose a friend</option>${availableServerFriends.map(member => `<option value="${esc(member.id)}">${esc(displayName(member))}</option>`).join('')}</select></label><div><button type="button" class="secondary-button" id="server-invite-cancel">Cancel</button><button type="submit" class="primary-button" ${availableServerFriends.length ? '' : 'disabled'}>Invite</button></div></form>` : ''}
+    <div class="section-title">CHANNELS ${activeServer.currentPermissions.includes('manage_channels') ? '<button type="button" class="mini-add" id="new-server-channel" title="Create channel" aria-label="Create channel">＋</button>' : ''}</div>
+    ${creatingServerChannel ? '<form id="create-server-channel" class="server-compact-form"><label>Channel type<select name="type"><option value="text">Text channel</option><option value="voice">Voice channel</option></select></label><label>Channel name<input name="name" required maxlength="32" pattern="[A-Za-z0-9_-]+" placeholder="new-channel"></label><div><button type="button" class="secondary-button" id="cancel-server-channel">Cancel</button><button type="submit" class="primary-button">Create</button></div></form>' : ''}
+    <div class="server-channel-group">${textServerChannels.map(channel => `<button type="button" class="nav-item server-channel ${group?.id === channel.id ? 'selected' : ''}" data-server-channel="${esc(channel.id)}"><span>#</span><strong>${esc(channel.name)}</strong></button>`).join('')}</div>
+    ${voiceServerChannels.length ? `<div class="section-title voice-section-title">VOICE CHANNELS</div><div class="server-channel-group">${voiceServerChannels.map(channel => { const joined = callServer?.id === activeServer!.id && callServerChannel?.id === channel.id && callActive; const channelParticipants = joined ? [me!, ...callParticipants.map(participant => activeServer!.members.find(member => member.id === participant.userId)).filter((member): member is User => !!member)] : []; return `<button type="button" class="nav-item server-channel voice-channel ${joined ? 'selected connected' : ''}" data-server-voice="${esc(channel.id)}" ${activeServer!.currentPermissions.includes('connect_voice') ? '' : 'disabled'}><span>◖</span><strong>${esc(channel.name)}</strong>${joined ? '<small>Connected</small>' : ''}</button>${channelParticipants.map(member => `<div class="voice-channel-member">${avatarWithPresence(member, 'tiny')}<span>${esc(displayName(member))}</span></div>`).join('')}`; }).join('')}</div>` : ''}`}` : '';
+  const createServerContent = `<form id="create-server" class="server-create-form"><div class="server-create-badge">＋</div><h2>Create your server</h2><p>Start with a private, encrypted general channel. You can invite friends now or later.</p><label>Server name<input name="name" required maxlength="60" placeholder="My server"></label><fieldset><legend>Invite friends <span>optional</span></legend>${friends.friends.map(member => `<label class="group-choice"><input type="checkbox" name="members" value="${esc(member.id)}">${avatar(member, 'tiny')}<span>${esc(displayName(member))}</span></label>`).join('') || '<small>Add friends first, or create the server just for yourself.</small>'}</fieldset><div class="group-create-actions"><button type="button" class="secondary-button" id="cancel-server">Cancel</button><button type="submit" class="primary-button">Create server</button></div></form><form id="join-server" class="server-join-form"><strong>Have an invite?</strong><p>Paste a Pulse server invite code.</p><div><input name="code" required maxlength="32" autocomplete="off" placeholder="Invite code"><button type="submit">Join</button></div></form>`;
+  const sidebarTitle = creatingServer ? 'Create a server' : activeServer?.name || friendsTitle;
+  const sidebarContent = creatingServer ? createServerContent : activeServer ? serverPanelContent : friendPanelContent;
+  app.innerHTML = `<aside class="rail"><button class="brand-mark brand-tab ${!activeServer && !creatingServer ? 'active' : ''}" id="friends-home" title="Friends" aria-label="Friends"><img class="app-mark" src="/pulse-mark.svg" alt=""></button>${railCall}<div class="rail-divider"></div><div class="server-rail-list">${serverRail}</div><button type="button" class="server-rail-button server-add-button ${creatingServer ? 'active' : ''}" id="new-server" title="Create server" aria-label="Create server">＋</button></aside>
+  <aside class="sidebar ${activeServer || creatingServer ? 'server-sidebar' : ''}"><header class="side-header"><div><div class="eyebrow">${activeServer ? 'SERVER' : 'PULSE'}</div><div class="space-title">${esc(sidebarTitle)}</div></div></header>
+    ${!activeServer && !creatingServer && friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
+    ${!activeServer && !creatingServer ? `<nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests <span>${friends.incoming.length}</span></button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>` : ''}
+    <div class="side-scroll"><section>${sidebarContent}</section></div>${accountFooter}</aside>
   <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>${incomingCall?.caller.id === friend.id ? 'Join call' : 'Call'}</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
     ${callBar}${callParticipantBar}${callScreenStage}${conversation ? `<label class="chat-search ${friend ? 'direct-message-search' : ''}"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files here to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
     ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : `🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}`}</div></form>` : ''}
@@ -515,10 +586,68 @@ function render() {
   }
 
   const localScreenVideo = app.querySelector<HTMLVideoElement>('[data-local-screen]');
+  if (activeServer && !activeServer.currentPermissions.includes('send_messages')) {
+    const input = app.querySelector<HTMLInputElement>('#message-input'); const send = app.querySelector<HTMLButtonElement>('.composer .send');
+    if (input) { input.disabled = true; input.placeholder = 'You do not have permission to send messages'; }
+    if (send) send.disabled = true;
+  }
   if (localScreenVideo) { localScreenVideo.srcObject = voice.getLocalScreenStream() || null; void localScreenVideo.play().catch(() => undefined); }
   app.querySelectorAll<HTMLVideoElement>('[data-screen-peer]').forEach(video => { video.srcObject = voice.getRemoteScreenStream(video.dataset.screenPeer || '') || null; void video.play().catch(() => undefined); });
   app.querySelectorAll<HTMLButtonElement>('[data-friend]').forEach(button => button.onclick = () => { const selected = friends.friends.find(f => f.id === button.dataset.friend); if (selected) openFriend(selected); });
   app.querySelectorAll<HTMLButtonElement>('[data-group]').forEach(button => button.onclick = () => { const selected = groups.find(item => item.id === button.dataset.group); if (selected) openGroup(selected); });
+  app.querySelectorAll<HTMLButtonElement>('[data-server]').forEach(button => button.onclick = () => { const selected = servers.find(item => item.id === button.dataset.server); if (selected) openServer(selected); });
+  app.querySelectorAll<HTMLButtonElement>('[data-server-channel]').forEach(button => button.onclick = () => { if (activeServer) openServer(activeServer, button.dataset.serverChannel); });
+  app.querySelectorAll<HTMLButtonElement>('[data-server-voice]').forEach(button => button.onclick = () => { const channel = activeServer?.channels.find(item => item.id === button.dataset.serverVoice && item.type === 'voice'); if (activeServer && channel) void joinServerVoice(activeServer, channel); });
+  app.querySelector<HTMLButtonElement>('#new-server')?.addEventListener('click', () => { creatingServer = true; activeServer = undefined; activeFriend = undefined; activeGroup = undefined; messages = []; render(); });
+  app.querySelector<HTMLButtonElement>('#cancel-server')?.addEventListener('click', () => { creatingServer = false; render(); });
+  app.querySelector<HTMLFormElement>('#create-server')?.addEventListener('submit', async event => {
+    event.preventDefault(); const form = new FormData(event.currentTarget as HTMLFormElement); const memberIds = form.getAll('members').map(String);
+    try { const result = await api<{ server: PulseServer }>('/servers', { method: 'POST', body: JSON.stringify({ name: form.get('name'), memberIds }) }); servers = [...servers, result.server]; creatingServer = false; openServer(result.server); }
+    catch (error) { showError(error); }
+  });
+  app.querySelector<HTMLFormElement>('#join-server')?.addEventListener('submit', async event => {
+    event.preventDefault(); const form = new FormData(event.currentTarget as HTMLFormElement);
+    try { const result = await api<{ server: PulseServer }>('/servers/join', { method: 'POST', body: JSON.stringify({ code: form.get('code') }) }); if (!servers.some(server => server.id === result.server.id)) servers = [...servers, result.server]; creatingServer = false; openServer(result.server); }
+    catch (error) { showError(error); }
+  });
+  app.querySelector<HTMLButtonElement>('#new-server-channel')?.addEventListener('click', () => { creatingServerChannel = !creatingServerChannel; invitingServerMember = false; render(); });
+  app.querySelector<HTMLButtonElement>('#cancel-server-channel')?.addEventListener('click', () => { creatingServerChannel = false; render(); });
+  app.querySelector<HTMLFormElement>('#create-server-channel')?.addEventListener('submit', async event => {
+    event.preventDefault(); if (!activeServer) return; const form = new FormData(event.currentTarget as HTMLFormElement);
+    try { const result = await api<{ server: PulseServer; channel: ServerChannel }>(`/servers/${encodeURIComponent(activeServer.id)}/channels`, { method: 'POST', body: JSON.stringify({ name: form.get('name'), type: form.get('type') }) }); servers = servers.map(server => server.id === result.server.id ? result.server : server); creatingServerChannel = false; if (result.channel.type === 'voice') { activeServer = result.server; render(); } else openServer(result.server, result.channel.id); }
+    catch (error) { showError(error); }
+  });
+  app.querySelector<HTMLButtonElement>('#server-invite-toggle')?.addEventListener('click', () => { invitingServerMember = !invitingServerMember; creatingServerChannel = false; render(); });
+  app.querySelector<HTMLButtonElement>('#copy-server-invite')?.addEventListener('click', async () => { if (!activeServer) return; try { await navigator.clipboard.writeText(activeServer.inviteCode); notice = 'Server invite code copied.'; render(); } catch { showError(new Error('Could not copy the invite code.')); } });
+  app.querySelector<HTMLButtonElement>('#manage-server-roles')?.addEventListener('click', () => { managingServerRoles = true; invitingServerMember = false; creatingServerChannel = false; render(); });
+  app.querySelector<HTMLButtonElement>('#close-server-roles')?.addEventListener('click', () => { managingServerRoles = false; render(); });
+  const applyServerUpdate = (server: PulseServer) => { servers = servers.map(item => item.id === server.id ? server : item); activeServer = server; if (activeGroup) activeGroup = { ...activeGroup, members: server.members }; render(); };
+  app.querySelector<HTMLFormElement>('#server-everyone-role')?.addEventListener('submit', async event => {
+    event.preventDefault(); if (!activeServer) return; const form = new FormData(event.currentTarget as HTMLFormElement);
+    try { const result = await api<{ server: PulseServer }>(`/servers/${encodeURIComponent(activeServer.id)}/permissions`, { method: 'PATCH', body: JSON.stringify({ permissions: form.getAll('permissions') }) }); notice = 'Default permissions updated.'; applyServerUpdate(result.server); }
+    catch (error) { showError(error); }
+  });
+  app.querySelector<HTMLFormElement>('#create-server-role')?.addEventListener('submit', async event => {
+    event.preventDefault(); if (!activeServer) return; const form = new FormData(event.currentTarget as HTMLFormElement);
+    try { const result = await api<{ server: PulseServer }>(`/servers/${encodeURIComponent(activeServer.id)}/roles`, { method: 'POST', body: JSON.stringify({ name: form.get('name'), color: form.get('color'), permissions: form.getAll('permissions'), memberIds: form.getAll('members') }) }); notice = 'Role created.'; applyServerUpdate(result.server); }
+    catch (error) { showError(error); }
+  });
+  app.querySelectorAll<HTMLFormElement>('[data-server-role-form]').forEach(form => form.addEventListener('submit', async event => {
+    event.preventDefault(); if (!activeServer) return; const roleId = form.dataset.serverRoleForm; if (!roleId) return; const data = new FormData(form);
+    try { const result = await api<{ server: PulseServer }>(`/servers/${encodeURIComponent(activeServer.id)}/roles/${encodeURIComponent(roleId)}`, { method: 'PATCH', body: JSON.stringify({ name: data.get('name'), color: data.get('color'), permissions: data.getAll('permissions'), memberIds: data.getAll('members') }) }); notice = 'Role updated.'; applyServerUpdate(result.server); }
+    catch (error) { showError(error); }
+  }));
+  app.querySelectorAll<HTMLButtonElement>('[data-delete-server-role]').forEach(button => button.addEventListener('click', async () => {
+    if (!activeServer) return; const roleId = button.dataset.deleteServerRole; const role = activeServer.roles.find(item => item.id === roleId); if (!roleId || !role || !window.confirm(`Delete the ${role.name} role?`)) return;
+    try { const result = await api<{ server: PulseServer }>(`/servers/${encodeURIComponent(activeServer.id)}/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' }); notice = 'Role deleted.'; applyServerUpdate(result.server); }
+    catch (error) { showError(error); }
+  }));
+  app.querySelector<HTMLButtonElement>('#server-invite-cancel')?.addEventListener('click', () => { invitingServerMember = false; render(); });
+  app.querySelector<HTMLFormElement>('#server-invite-form')?.addEventListener('submit', async event => {
+    event.preventDefault(); if (!activeServer) return; const form = new FormData(event.currentTarget as HTMLFormElement);
+    try { const result = await api<{ server: PulseServer }>(`/servers/${encodeURIComponent(activeServer.id)}/members`, { method: 'POST', body: JSON.stringify({ userId: form.get('userId') }) }); servers = servers.map(server => server.id === result.server.id ? result.server : server); invitingServerMember = false; openServer(result.server, activeGroup?.id); }
+    catch (error) { showError(error); }
+  });
   app.querySelector<HTMLButtonElement>('#new-group')?.addEventListener('click', () => { creatingGroup = !creatingGroup; groupPreselectedMemberIds = []; render(); });
   app.querySelector<HTMLButtonElement>('#cancel-group')?.addEventListener('click', () => { creatingGroup = false; groupPreselectedMemberIds = []; render(); });
   app.querySelector<HTMLFormElement>('#create-group')?.addEventListener('submit', async event => {
@@ -526,12 +655,12 @@ function render() {
     try { const result = await api<{ group: GroupChat }>('/groups', { method: 'POST', body: JSON.stringify({ name: form.get('name'), memberIds }) }); groups = [...groups, result.group]; creatingGroup = false; groupPreselectedMemberIds = []; openGroup(result.group); }
     catch (error) { showError(error); }
   });
-  app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callGroup) openGroup(callGroup); });
+  app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callServer) openServer(callServer); else if (callGroup) openGroup(callGroup); });
   app.querySelector<HTMLButtonElement>('[data-join-call]')?.addEventListener('click', () => { void joinIncomingCall(); });
   app.querySelectorAll<HTMLButtonElement>('[data-accept]').forEach(button => button.onclick = async () => { try { await api(`/friends/${button.dataset.accept}/accept`, { method: 'POST', body: '{}' }); await refreshFriends(); render(); } catch (e) { showError(e); } });
   app.querySelector<HTMLFormElement>('#add-friend')?.addEventListener('submit', async e => { e.preventDefault(); const form = new FormData(e.currentTarget as HTMLFormElement); try { await api('/friends', { method: 'POST', body: JSON.stringify({ username: form.get('username') }) }); await refreshFriends(); notice = 'Friend request sent.'; friendsPanel = 'requests'; render(); } catch (error) { showError(error); } });
   app.querySelectorAll<HTMLButtonElement>('[data-friends-panel]').forEach(button => button.onclick = () => { friendsPanel = button.dataset.friendsPanel as typeof friendsPanel; if (friendsPanel !== 'friends') { activeFriend = undefined; activeGroup = undefined; messages = []; } render(); });
-  app.querySelector<HTMLButtonElement>('#friends-home')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; activeGroup = undefined; messages = []; render(); });
+  app.querySelector<HTMLButtonElement>('#friends-home')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; activeServer = undefined; creatingServer = false; activeFriend = undefined; activeGroup = undefined; messages = []; render(); });
   const openSettings = () => { settingsOpen = true; settingsTab = 'profile'; render(); };
   app.querySelector<HTMLButtonElement>('#settings-open')?.addEventListener('click', openSettings);
   app.querySelector<HTMLButtonElement>('#settings-open-sidebar')?.addEventListener('click', openSettings);
@@ -673,6 +802,7 @@ function render() {
       catch (error) { showError(error); }
     });
   }
+  if (activeServer) app.querySelector<HTMLButtonElement>('#call-button')?.remove();
   app.querySelector<HTMLButtonElement>('#call-button')?.addEventListener('click', () => { if (friend) { if (incomingCall?.caller.id === friend.id) void joinIncomingCall(); else void toggleCall(); } else if (group) void toggleGroupCall(group); });
   app.querySelector<HTMLButtonElement>('#call-mute')?.addEventListener('click', () => { voiceMuted = voice.toggleMute(); render(); });
   app.querySelector<HTMLButtonElement>('#call-deafen')?.addEventListener('click', () => { voiceDeafened = voice.toggleDeafen(); render(); });
@@ -821,7 +951,7 @@ app.addEventListener('click', event => {
 async function signOut() {
   await cancelOutgoingCallInvite();
   try { await api('/logout', { method: 'POST', body: '{}' }); } catch {}
-  token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; groups = []; incomingCall = undefined; settingsOpen = false;
+  token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; activeServer = undefined; groups = []; servers = []; incomingCall = undefined; settingsOpen = false;
   localStorage.removeItem('pulse.authToken'); voice.leave(); renderAuth();
 }
 
@@ -896,8 +1026,8 @@ function renderSettings() {
   }
   let avatarData: string | undefined; let bannerData: string | undefined; let clearAvatar = false;
   let clearBanner = false;
-  app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeFriend = undefined; activeGroup = undefined; messages = []; render(); };
-  app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callGroup) openGroup(callGroup); });
+  app.querySelector<HTMLButtonElement>('#friends-home')!.onclick = () => { settingsOpen = false; friendsPanel = 'friends'; activeServer = undefined; creatingServer = false; activeFriend = undefined; activeGroup = undefined; messages = []; render(); };
+  app.querySelector<HTMLButtonElement>('[data-call-return]')?.addEventListener('click', () => { settingsOpen = false; friendsPanel = 'friends'; if (callFriend) openFriend(callFriend); else if (callServer) openServer(callServer); else if (callGroup) openGroup(callGroup); });
   app.querySelector<HTMLButtonElement>('[data-join-call]')?.addEventListener('click', () => { void joinIncomingCall(); });
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
@@ -1005,7 +1135,7 @@ async function start() {
   window.setInterval(async () => {
     if (!me) return;
     if (Date.now() - lastPresencePing >= 15_000) void syncPresence();
-    try { const previousCallInvite = incomingCall?.id || ''; const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}:${f.presence}:${f.customStatus}`).join(); const previousUnread = JSON.stringify(unreadCounts); const previousGroups = groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join(); await refreshIncomingCall(); await refreshFriends(); await refreshUnread(); if (previousCallInvite !== (incomingCall?.id || '') || previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}:${f.presence}:${f.customStatus}`).join() || previousUnread !== JSON.stringify(unreadCounts) || previousGroups !== groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join()) render(); if (activeFriend || activeGroup) await refreshMessages(); }
+    try { const previousCallInvite = incomingCall?.id || ''; const previousIncoming = friends.incoming.map(f => `${f.id}:${f.displayName}`).join(); const previousFriends = friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}:${f.presence}:${f.customStatus}`).join(); const previousUnread = JSON.stringify(unreadCounts); const previousGroups = groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join(); const previousServers = servers.map(server => `${server.id}:${server.name}:${server.members.length}:${server.channels.length}`).join(); await refreshIncomingCall(); await refreshFriends(); await refreshUnread(); if (previousCallInvite !== (incomingCall?.id || '') || previousIncoming !== friends.incoming.map(f => `${f.id}:${f.displayName}`).join() || previousFriends !== friends.friends.map(f => `${f.id}:${f.profileVersion}:${f.displayName}:${f.presence}:${f.customStatus}`).join() || previousUnread !== JSON.stringify(unreadCounts) || previousGroups !== groups.map(group => `${group.id}:${group.name}:${group.members.length}`).join() || previousServers !== servers.map(server => `${server.id}:${server.name}:${server.members.length}:${server.channels.length}`).join()) render(); if (activeFriend || activeGroup) await refreshMessages(); }
     catch (error) { if (error instanceof Error && error.message === 'Sign in to continue.') { token = ''; me = undefined; localStorage.removeItem('pulse.authToken'); renderAuth(); } }
   }, 3000);
 }
