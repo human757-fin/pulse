@@ -71,6 +71,8 @@ let pendingAuth: { challengeId: string; email?: string; username?: string; passw
 let authError = '';
 let notice = '';
 let busy = false;
+let attachmentStatus = '';
+function setAttachmentStatus(value: string) { attachmentStatus = value; const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) { status.textContent = value; status.setAttribute('role', 'status'); } }
 let settingsOpen = false;
 let serverSettingsOpen = false;
 const collapsedChannelGroups = new Set<string>();
@@ -253,7 +255,7 @@ function messageBody(text: string) {
   if (text.startsWith(attachmentV2Prefix)) {
     try {
       const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[] };
-      const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
+      const allowed = attachmentTypes;
       if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isSafeInteger(file.size) || file.size! <= 0 || file.size! > maxAttachmentBytes || (file.chunkCount !== undefined && (!Number.isSafeInteger(file.chunkCount) || file.chunkCount !== Math.ceil(file.size! / attachmentChunkBytes) || !file.ivPrefix || bytesFromBase64(file.ivPrefix).length !== 8))) throw new Error('invalid attachment');
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
       if (!url && type.startsWith('video/')) return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play loading" data-attachment-load="${esc(file.id)}" aria-label="Preparing video preview" title="Preparing video" disabled>▶</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}">${formatFileSize(file.size!)} · preparing preview…</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
@@ -481,9 +483,16 @@ async function rawAttachmentRequest(path: string, method: 'GET' | 'PUT', body?: 
   if (!response.ok) { const result = await response.json().catch(() => ({})); throw new Error(result.error || `Attachment transfer failed (${response.status}).`); }
   return response.arrayBuffer();
 }
-const attachmentTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm'];
+const attachmentTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm', 'application/octet-stream'];
+function attachmentMime(file: File) {
+  const extension = file.name.split('.').pop()?.toLowerCase() || '';
+  const known: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain', mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm' };
+  return known[extension] || (attachmentTypes.includes(file.type) ? file.type : 'application/octet-stream');
+}
 async function sendAttachment(file: File, target: User, onProgress?: (uploaded: number, total: number) => void) {
-  if (!attachmentTypes.includes(file.type)) throw new Error('Choose an image, PDF, text file, or MP4/WebM video.');
+  setAttachmentStatus(`Preparing ${file.name}…`);
+  if (!cryptoReady) throw new Error('Encryption is not ready. Sign out and back in before sending files.');
+  const type = attachmentMime(file);
   if (file.size > maxAttachmentBytes) throw new Error(`Attachments must be 750 MB or smaller (${file.name}).`);
   if (!file.size) throw new Error('Empty files cannot be sent.');
   const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -501,13 +510,15 @@ async function sendAttachment(file: File, target: User, onProgress?: (uploaded: 
       chunkHashes[index] = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', plaintext)), byte => byte.toString(16).padStart(2, '0')).join('');
       const encrypted = await cipher.encrypt(id, ivPrefix, index, plaintext);
       await rawAttachmentRequest(`/attachments/${id}/${index}`, 'PUT', encrypted);
-      uploaded += Math.min(attachmentChunkBytes, file.size - start); onProgress?.(uploaded, file.size);
+      uploaded += Math.min(attachmentChunkBytes, file.size - start); setAttachmentStatus(`Uploading ${file.name} · ${Math.floor(uploaded / file.size * 100)}%`); onProgress?.(uploaded, file.size);
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, chunkCount) }, uploadWorker));
-  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type: file.type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64, chunkHashes });
+  const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64, chunkHashes });
   const envelope = await encryptMessage(me!.id, target.id, content, fetchFriendKey);
-  await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope }) });
+  const selfEnvelope = await encryptMessage(me!.id, me!.id, content, fetchFriendKey);
+  await api('/messages', { method: 'POST', body: JSON.stringify({ to: target.username, ...envelope, selfEnvelope }) });
+  setAttachmentStatus(`Sent ${file.name}`);
 }
 
 async function loadAttachment(id: string, target: User, onProgress?: (percent: number) => void) {
@@ -664,6 +675,7 @@ function render() {
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (creationModal) app.insertAdjacentHTML('beforeend', creationModal);
   setupServerPanels();
+  if (attachmentStatus) setAttachmentStatus(attachmentStatus);
   if (notice) {
     window.clearTimeout(noticeTimer);
     const message = notice;
@@ -801,7 +813,20 @@ function render() {
     else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(`/groups/${encodeURIComponent(group.id)}/messages`, { method: 'POST', body: JSON.stringify({ envelopes }) }); }
     input.value = ''; await refreshMessages(conversation); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus();
   } catch (error) { showError(error); input.disabled = false; } };
-  app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => app.querySelector<HTMLInputElement>('#attachment-input')?.click());
+  app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => {
+    if (!friend) return;
+    const target = friend;
+    // Keep the native picker outside the frequently replaced chat DOM.
+    const picker = document.createElement('input'); picker.type = 'file'; picker.multiple = true; picker.hidden = true; document.body.append(picker);
+    picker.addEventListener('cancel', () => picker.remove(), { once: true });
+    picker.addEventListener('change', async () => {
+      const files = Array.from(picker.files || []); picker.remove();
+      try { for (const file of files) await sendAttachment(file, target); if (activeFriend?.id === target.id) { await refreshMessages(target); render(); } }
+      catch (error) { setAttachmentStatus(error instanceof Error ? error.message : 'Upload failed.'); showError(error); }
+    }, { once: true });
+    picker.click();
+  });
+  app.querySelector<HTMLInputElement>('#attachment-input')?.removeAttribute('accept');
   composer?.addEventListener('paste', async event => {
     const files = Array.from(event.clipboardData?.items || [])
       .filter(item => item.kind === 'file')
@@ -828,7 +853,7 @@ function render() {
     const id = button.dataset.attachmentLoad; const target = activeFriend; if (!id || !target || attachmentUrlCache.has(id)) return;
     button.disabled = true; button.textContent = 'Loading preview…';
     try { await loadAttachment(id, target, percent => { button.textContent = `Preparing preview · ${percent}%`; }); render(); }
-    catch (error) { showError(error); }
+    catch (error) { button.disabled = false; button.textContent = 'Retry video'; button.title = error instanceof Error ? error.message : 'Video download failed'; showError(error); }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-download]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentDownload; const target = activeFriend; if (!id || !target) return;
@@ -869,7 +894,12 @@ function render() {
     const id = card.dataset.videoPreview; const target = friend;
     if (!id || !target || autoPreviewStarted.has(id)) return;
     autoPreviewStarted.add(id);
-    const prepare = () => { void loadAttachment(id, target, percent => { const status = app.querySelector<HTMLElement>(`[data-video-progress="${id}"]`); if (status) status.textContent = `Preparing video preview · ${percent}%`; }).then(() => render()).catch(showError); };
+    const prepare = () => { void loadAttachment(id, target, percent => { const status = app.querySelector<HTMLElement>(`[data-video-progress="${id}"]`); if (status) status.textContent = `Preparing video preview · ${percent}%`; }).then(() => render()).catch(error => {
+      const button = card.querySelector<HTMLButtonElement>('[data-attachment-load]');
+      if (button) { button.disabled = false; button.classList.remove('loading'); button.textContent = '↻'; button.setAttribute('aria-label', 'Retry video download'); button.title = 'Retry video download'; }
+      const status = card.querySelector<HTMLElement>('[data-video-progress]');
+      if (status) status.textContent = error instanceof Error ? error.message : 'Video download failed. Try again.';
+    }); };
     if ('IntersectionObserver' in window) {
       const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); prepare(); } }, { root: app.querySelector('#messages'), rootMargin: '320px' });
       observer.observe(card);
