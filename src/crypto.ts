@@ -139,6 +139,20 @@ export async function voiceEncryptionKey(ownId: string, friendId: string, fetchP
   return crypto.subtle.exportKey('raw', key);
 }
 
+export async function createGroupAttachmentCipher(rawKey: Uint8Array, groupId: string) {
+  if (rawKey.length !== 32) throw new Error('Invalid group attachment key.');
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const parameters = (id: string, prefix: Uint8Array, index: number) => {
+    if (prefix.length !== 8 || !Number.isSafeInteger(index) || index < 0 || index > 0xffffffff) throw new Error('Invalid attachment chunk.');
+    const iv = new Uint8Array(12); iv.set(prefix); new DataView(iv.buffer).setUint32(8, index, false);
+    return { name: 'AES-GCM', iv, additionalData: encoder.encode(`pulse-group-file-v1:${groupId}:${id}:${index}`) };
+  };
+  return {
+    encrypt: (id: string, prefix: Uint8Array, index: number, data: ArrayBuffer) => crypto.subtle.encrypt(parameters(id, prefix, index), key, data),
+    decrypt: (id: string, prefix: Uint8Array, index: number, data: ArrayBuffer) => crypto.subtle.decrypt(parameters(id, prefix, index), key, data),
+  };
+}
+
 async function fingerprintCode(key: JsonWebKey): Promise<string> {
   const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(`${key.kty}:${key.crv}:${key.x}:${key.y}`)));
   return Array.from(bytes.subarray(0, 10), byte => byte.toString(16).padStart(2, '0')).join('').toUpperCase().match(/.{1,4}/g)!.join(' ');

@@ -110,6 +110,15 @@ function canAccessGroup(group, userId) {
   const server = db.servers.find(item => item.id === group.serverId);
   return canAccessChannel(server, server?.channels.find(item => item.id === group.id), userId);
 }
+function canAccessAttachment(item, userId, uploading = false) {
+  if (!item) return false;
+  if (!item.groupId) return (uploading ? item.from === userId : item.from === userId || item.to === userId) && !isBlocked(item.from, item.to) && friendship(item.from, item.to)?.status === 'accepted';
+  const group = db.groups.find(group => group.id === item.groupId && group.members.includes(userId));
+  if (!group || !canAccessGroup(group, userId) || !(item.recipients || []).includes(userId)) return false;
+  if (!uploading) return true;
+  const server = group.serverId && db.servers.find(server => server.id === group.serverId);
+  return item.from === userId && (!server || hasServerPermission(server, userId, 'send_messages'));
+}
 function serverData(server, viewerId) {
   return {
     id: server.id,
@@ -303,7 +312,7 @@ async function serve(req, res) {
     if (attachmentChunk && req.method === 'PUT') {
       const user = sessionUser(req); const [, id, rawIndex] = attachmentChunk; const item = db.attachments.find(file => file.id === id);
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
-      if (!item || !Array.isArray(item.chunks) || item.from !== user.id || friendship(user.id, item.to)?.status !== 'accepted') return json(res, 404, { error: 'Attachment upload not found.' });
+      if (!item || !Array.isArray(item.chunks) || !canAccessAttachment(item, user.id, true)) return json(res, 404, { error: 'Attachment upload not found.' });
       const index = Number(rawIndex);
       if (!Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount) return json(res, 400, { error: 'Attachment chunk index is invalid.' });
       if (item.chunks.includes(index)) return json(res, 200, { ok: true });
@@ -496,20 +505,23 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/attachments' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to));
+        const group = body.groupId ? db.groups.find(group => group.id === body.groupId && group.members.includes(user.id)) : undefined;
+        if (body.groupId && (!group || !canAccessGroup(group, user.id))) return json(res, 403, { error: 'You cannot share files in this group.' });
+        if (group?.serverId) { const server = db.servers.find(server => server.id === group.serverId); if (!server || !hasServerPermission(server, user.id, 'send_messages')) return json(res, 403, { error: 'You cannot send files in this channel.' }); }
         const id = String(body.id || ''); const size = Number(body.size); const ivPrefix = String(body.ivPrefix || '');
-        if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
+        if (!group && (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted')) return json(res, 403, { error: 'You can share files with friends after they accept your request.' });
         if (!/^[a-f0-9]{32}$/.test(id) || db.attachments.some(item => item.id === id)) return json(res, 400, { error: 'Attachment ID is invalid.' });
         const prefix = Buffer.from(ivPrefix, 'base64');
         if (!Number.isSafeInteger(size) || size <= 0 || size > maxAttachmentBytes || prefix.length !== 8 || prefix.toString('base64') !== ivPrefix) return json(res, 400, { error: 'Attachment is invalid or larger than 750 MB.' });
         const chunkCount = Math.ceil(size / attachmentChunkBytes);
-        db.attachments.push({ id, from: user.id, to: target.id, size, ivPrefix, chunkSize: attachmentChunkBytes, chunkCount, chunks: [], createdAt: new Date().toISOString() }); persist();
+        db.attachments.push({ id, from: user.id, ...(group ? { groupId: group.id, recipients: group.members.filter(id => canAccessGroup(group, id)) } : { to: target.id }), size, ivPrefix, chunkSize: attachmentChunkBytes, chunkCount, chunks: [], createdAt: new Date().toISOString() }); persist();
         mkdirSync(join(attachmentDir, id), { recursive: true });
         return json(res, 201, { ok: true });
       }
       const attachmentChunkGet = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})\/(\d+)$/);
       if (attachmentChunkGet && req.method === 'GET') {
         const [, id, rawIndex] = attachmentChunkGet; const item = db.attachments.find(file => file.id === id); const index = Number(rawIndex);
-        if (!item || !Array.isArray(item.chunks) || !Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount || !item.chunks.includes(index) || (item.from !== user.id && item.to !== user.id) || friendship(user.id, item.from === user.id ? item.to : item.from)?.status !== 'accepted') return json(res, 404, { error: 'Attachment chunk not found.' });
+        if (!item || !Array.isArray(item.chunks) || !Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount || !item.chunks.includes(index) || !canAccessAttachment(item, user.id)) return json(res, 404, { error: 'Attachment chunk not found.' });
         const filePath = join(attachmentDir, id, `${index}.bin`); const plainSize = Math.min(item.chunkSize, item.size - index * item.chunkSize);
         res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': plainSize + 16, 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'X-Content-Type-Options': 'nosniff' });
         return createReadStream(filePath).on('error', error => { console.error('Failed reading attachment chunk:', error.message); if (!res.headersSent) json(res, 404, { error: 'Attachment chunk not found.' }); else res.destroy(error); }).pipe(res);
@@ -517,7 +529,7 @@ async function serve(req, res) {
       const attachmentRequest = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})$/);
       if (attachmentRequest && req.method === 'GET') {
         const item = db.attachments.find(file => file.id === attachmentRequest[1]);
-        if (!item || (item.from !== user.id && item.to !== user.id) || friendship(user.id, item.from === user.id ? item.to : item.from)?.status !== 'accepted') return json(res, 404, { error: 'Attachment not found.' });
+        if (!canAccessAttachment(item, user.id)) return json(res, 404, { error: 'Attachment not found.' });
         return json(res, 200, { iv: item.iv, ciphertext: item.ciphertext });
       }
       if (url.pathname === '/api/auth/totp/setup' && req.method === 'POST') {
