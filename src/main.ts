@@ -115,7 +115,8 @@ const decryptedCache = new Map<string, string>();
 const attachmentUrlCache = new Map<string, string>();
 const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
-const autoPreviewStarted = new Set<string>();
+const previewTransfers = new Map<string, { percent: number; error?: string }>();
+let previewObserver: IntersectionObserver | undefined;
 const senderEnvelopeMigrations = new Set<string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callServer = undefined; callServerChannel = undefined; callParticipants = []; screenViewOpen = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
@@ -260,7 +261,12 @@ function messageBody(text: string) {
       const allowed = attachmentTypes;
       if (!file.id || !/^[a-f0-9]{32}$/.test(file.id) || !file.name || !allowed.includes(file.type || '') || !Number.isSafeInteger(file.size) || file.size! <= 0 || file.size! > maxAttachmentBytes || (file.chunkCount !== undefined && (!Number.isSafeInteger(file.chunkCount) || file.chunkCount !== Math.ceil(file.size! / attachmentChunkBytes) || !file.ivPrefix || bytesFromBase64(file.ivPrefix).length !== 8))) throw new Error('invalid attachment');
       const type = file.type!; const name = esc(file.name.slice(0, 120)); const url = attachmentUrlCache.get(file.id);
-      if (!url && type.startsWith('video/')) return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play loading" data-attachment-load="${esc(file.id)}" aria-label="Preparing video preview" title="Preparing video" disabled>▶</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}">${formatFileSize(file.size!)} · preparing preview…</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
+      if (!url && type.startsWith('video/')) {
+        const transfer = previewTransfers.get(file.id);
+        const error = transfer?.error;
+        const status = error || (transfer ? `Preparing video preview · ${transfer.percent}%` : `${formatFileSize(file.size!)} · preview loads when visible`);
+        return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play ${error ? '' : 'loading'}" data-attachment-load="${esc(file.id)}" aria-label="${error ? 'Retry video preview' : 'Preparing video preview'}" title="${error ? 'Retry video preview' : 'Preparing video preview'}" ${error ? '' : 'disabled'}>${error ? 'Retry' : '…'}</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}" ${error ? 'role="alert"' : 'role="status"'}>${esc(status)}</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
+      }
       if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
       if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">${videoPlayIcon}</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">${videoVolumeIcon(false)}</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">${videoFullscreenIcon}</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
       if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
@@ -328,13 +334,13 @@ async function refreshUnread() {
   const result = await api<{ unread: Record<string, number> }>('/messages/unread');
   unreadCounts = result.unread || {};
 }
-function openFriend(friend: User) { activeServer = undefined; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
-function openGroup(group: GroupChat) { activeServer = undefined; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear(); void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
+function openFriend(friend: User) { activeServer = undefined; activeGroup = undefined; activeFriend = friend; messageSearch = ''; editingMessageId = ''; void refreshMessages(friend).then(render).catch(e => { notice = e.message; render(); }); }
+function openGroup(group: GroupChat) { activeServer = undefined; activeFriend = undefined; activeGroup = group; messages = []; messageSearch = ''; editingMessageId = ''; void refreshMessages(group).then(render).catch(e => { notice = e.message; render(); }); }
 function openServer(server: PulseServer, channelId = server.channels.find(item => item.type === 'text' && item.accessible !== false)?.id) {
   const channel = server.channels.find(item => item.id === channelId && item.accessible !== false) || server.channels.find(item => item.type === 'text' && item.accessible !== false);
   if (activeServer?.id !== server.id) managingServerRoles = false;
   activeServer = server; activeFriend = undefined; activeGroup = channel && channel.accessible !== false ? { id: channel.id, name: channel.name, members: channelMembers(server, channel) } : undefined;
-  settingsOpen = false; messages = []; messageSearch = ''; editingMessageId = ''; autoPreviewStarted.clear();
+  settingsOpen = false; messages = []; messageSearch = ''; editingMessageId = '';
   if (activeGroup) void refreshMessages(activeGroup).then(render).catch(error => { notice = error.message; render(); }); else render();
 }
 function chatRoom(friend: User) { return `dm-${[me?.id, friend.id].sort().join('-')}`; }
@@ -508,9 +514,16 @@ function formatFileSize(bytes: number) { return bytes < 1024 * 1024 ? `${Math.ma
 function base64Bytes(bytes: Uint8Array) { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary); }
 function bytesFromBase64(value: string) { return Uint8Array.from(atob(value), character => character.charCodeAt(0)); }
 async function rawAttachmentRequest(path: string, method: 'GET' | 'PUT', body?: ArrayBuffer): Promise<ArrayBuffer> {
-  const response = await fetch(`${apiBase}/api${path}`, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/octet-stream' } : {}) }, ...(body ? { body } : {}) });
-  if (!response.ok) { const result = await response.json().catch(() => ({})); throw new Error(result.error || `Attachment transfer failed (${response.status}).`); }
-  return response.arrayBuffer();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 90_000);
+  try {
+    const response = await fetch(`${apiBase}/api${path}`, { method, signal: controller.signal, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/octet-stream' } : {}) }, ...(body ? { body } : {}) });
+    if (!response.ok) { const result = await response.json().catch(() => ({})); throw new Error(result.error || `Attachment transfer failed (${response.status}).`); }
+    return await response.arrayBuffer();
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Attachment transfer timed out. Check your connection and retry.');
+    throw error;
+  } finally { window.clearTimeout(timeout); }
 }
 const attachmentTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf', 'text/plain', 'video/mp4', 'video/webm', 'application/octet-stream'];
 function attachmentMime(file: File) {
@@ -614,6 +627,24 @@ async function loadAttachment(id: string, target: User | GroupChat, onProgress?:
 function downloadLocalFile(url: string, name: string) {
   const link = document.createElement('a'); link.href = url; link.download = name; link.style.display = 'none'; document.body.append(link); link.click(); link.remove();
 }
+async function prepareVideoPreview(id: string, target: User | GroupChat) {
+  if (pendingAttachmentLoads.has(id)) return pendingAttachmentLoads.get(id);
+  previewTransfers.set(id, { percent: 0 });
+  try {
+    const file = await loadAttachment(id, target, percent => {
+      previewTransfers.set(id, { percent });
+      const status = app.querySelector<HTMLElement>(`[data-video-progress="${id}"]`);
+      if (status) status.textContent = `Preparing video preview · ${percent}%`;
+    });
+    previewTransfers.delete(id);
+    if ((activeFriend || activeGroup)?.id === target.id) render();
+    return file;
+  } catch (error) {
+    previewTransfers.set(id, { percent: 0, error: error instanceof Error ? error.message : 'Video download failed. Try again.' });
+    if ((activeFriend || activeGroup)?.id === target.id) render();
+    throw error;
+  }
+}
 function formatVideoTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
   const total = Math.floor(seconds); const minutes = Math.floor(total / 60); const remainder = String(total % 60).padStart(2, '0');
@@ -646,6 +677,8 @@ async function playInlineVideo(video: HTMLVideoElement) {
 }
 
 function render() {
+  previewObserver?.disconnect();
+  previewObserver = undefined;
   if (!me) { renderAuth(); return; }
   if (settingsOpen) { renderSettings(); return; }
   const videoPlayback = new Map(Array.from(app.querySelectorAll<HTMLVideoElement>('.message-attachment-video')).map(video => [video.dataset.videoFile || '', { currentTime: video.currentTime, paused: video.paused }] as const).filter(([id]) => !!id));
@@ -920,7 +953,7 @@ function render() {
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentLoad; const target = conversation; if (!id || !target || attachmentUrlCache.has(id)) return;
     button.disabled = true; button.textContent = 'Loading preview…';
-    try { await loadAttachment(id, target, percent => { button.textContent = `Preparing preview · ${percent}%`; }); render(); }
+    try { await prepareVideoPreview(id, target); }
     catch (error) { button.disabled = false; button.textContent = 'Retry video'; button.title = error instanceof Error ? error.message : 'Video download failed'; showError(error); }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-download]').forEach(button => button.addEventListener('click', async () => {
@@ -958,20 +991,21 @@ function render() {
     if (document.fullscreenElement === shell) void document.exitFullscreen().catch(() => undefined);
     else void shell.requestFullscreen().catch(() => { const video = shell.querySelector<HTMLVideoElement>('video'); if (video) void playInlineVideo(video); });
   }));
+  const prepareVisibleVideo = (card: HTMLElement) => {
+    if (!card.isConnected) return;
+    const id = card.dataset.videoPreview;
+    if (!id || !conversation || pendingAttachmentLoads.has(id) || previewTransfers.get(id)?.error) return;
+    void prepareVideoPreview(id, conversation).catch(() => { /* Error state is rendered by the loader. */ });
+  };
+  if ('IntersectionObserver' in window) previewObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) if (entry.isIntersecting) {
+      previewObserver?.unobserve(entry.target);
+      prepareVisibleVideo(entry.target as HTMLElement);
+    }
+  }, { root: app.querySelector('#messages'), rootMargin: '320px' });
   app.querySelectorAll<HTMLElement>('[data-video-preview]').forEach(card => {
-    const id = card.dataset.videoPreview; const target = conversation;
-    if (!id || !target || autoPreviewStarted.has(id)) return;
-    autoPreviewStarted.add(id);
-    const prepare = () => { void loadAttachment(id, target, percent => { const status = app.querySelector<HTMLElement>(`[data-video-progress="${id}"]`); if (status) status.textContent = `Preparing video preview · ${percent}%`; }).then(() => render()).catch(error => {
-      const button = card.querySelector<HTMLButtonElement>('[data-attachment-load]');
-      if (button) { button.disabled = false; button.classList.remove('loading'); button.textContent = '↻'; button.setAttribute('aria-label', 'Retry video download'); button.title = 'Retry video download'; }
-      const status = card.querySelector<HTMLElement>('[data-video-progress]');
-      if (status) status.textContent = error instanceof Error ? error.message : 'Video download failed. Try again.';
-    }); };
-    if ('IntersectionObserver' in window) {
-      const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); prepare(); } }, { root: app.querySelector('#messages'), rootMargin: '320px' });
-      observer.observe(card);
-    } else prepare();
+    if (previewObserver) previewObserver.observe(card);
+    else prepareVisibleVideo(card);
   });
   app.querySelectorAll<HTMLVideoElement>('.message-attachment-video').forEach(video => {
     const play = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-play]');
