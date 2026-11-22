@@ -420,6 +420,13 @@ function setupServerPanels() {
   }
   const server = activeServer; if (!server) return;
   const canManage = server.currentPermissions.includes('manage_channels');
+  const openChannelCreator = (categoryId = '') => {
+    creatingServerChannel = true; creatingServerRole = false; creatingServer = false; creatingGroup = false;
+    invitingServerMember = false; serverSettingsOpen = false;
+    render();
+    const category = app.querySelector<HTMLSelectElement>('#create-server-channel select[name="categoryId"]');
+    if (category) category.value = categoryId;
+  };
   const categories = server.categories || [];
   const options = (selected = '') => `<option value="">No group</option>${categories.map(item => `<option value="${esc(item.id)}" ${item.id === selected ? 'selected' : ''}>${esc(item.name)}</option>`).join('')}`;
   const update = (next: PulseServer) => { servers = servers.map(item => item.id === next.id ? next : item); activeServer = next; render(); };
@@ -430,6 +437,13 @@ function setupServerPanels() {
   app.querySelector('#server-invite-form')?.remove();
   app.querySelector<HTMLButtonElement>('#server-menu-invite')?.addEventListener('click', () => { invitingServerMember = true; serverSettingsOpen = false; render(); });
   app.querySelector<HTMLButtonElement>('#server-menu-settings')?.addEventListener('click', () => { serverSettingsOpen = true; invitingServerMember = false; render(); });
+  if (canManage) {
+    const createChannel = document.createElement('button');
+    createChannel.type = 'button';
+    createChannel.textContent = 'Create channel';
+    createChannel.onclick = () => openChannelCreator();
+    app.querySelector('#server-menu-settings')?.before(createChannel);
+  }
   const channelForm = app.querySelector('#create-server-channel');
   channelForm?.insertAdjacentHTML('afterbegin', `<label>Channel group<select name="categoryId">${options()}</select></label>`);
   channelForm?.querySelector('.creation-form-actions')?.insertAdjacentHTML('beforebegin', `<label class="role-permission"><input name="private" type="checkbox">Private channel</label><fieldset><legend>Allow roles (private channels)</legend>${server.roles.map(role => `<label class="role-permission"><input type="checkbox" name="roles" value="${role.id}">${esc(role.name)}</label>`).join('') || '<small>No roles yet.</small>'}</fieldset><fieldset><legend>Allow members (private channels)</legend>${server.members.filter(member => member.id !== server.ownerId).map(member => `<label class="role-permission"><input type="checkbox" name="users" value="${member.id}">${esc(displayName(member))}</label>`).join('')}</fieldset>`);
@@ -441,6 +455,20 @@ function setupServerPanels() {
       const section = document.createElement('section');
       section.innerHTML = `<button type="button" class="channel-category-toggle" aria-expanded="${!collapsedChannelGroups.has(category.id)}"><span>${collapsedChannelGroups.has(category.id) ? '›' : '⌄'}</span>${esc(category.name)}</button>`;
       section.querySelector('button')!.onclick = () => { if (collapsedChannelGroups.has(category.id)) collapsedChannelGroups.delete(category.id); else collapsedChannelGroups.add(category.id); render(); };
+      const heading = document.createElement('div');
+      heading.className = 'channel-category-heading';
+      heading.append(section.querySelector('button')!);
+      if (canManage) {
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.className = 'channel-category-add';
+        add.textContent = '+';
+        add.setAttribute('aria-label', `Create channel in ${category.name}`);
+        add.title = `Create channel in ${category.name}`;
+        add.onclick = () => openChannelCreator(category.id);
+        heading.append(add);
+      }
+      section.append(heading);
       for (const channel of server.channels.filter(item => (item.categoryId || '') === category.id)) {
         const row = rows.get(channel.id); if (!row) continue;
         const members: Element[] = []; let next = row.nextElementSibling;
@@ -454,7 +482,6 @@ function setupServerPanels() {
     }
     channelContainer.querySelectorAll('.server-channel-group, .section-title').forEach(element => element.remove());
     channelContainer.append(grouped);
-    if (canManage) { const button = document.createElement('button'); button.type = 'button'; button.className = 'create-role-trigger'; button.textContent = '+ Create channel'; button.onclick = () => { creatingServerChannel = true; render(); }; channelContainer.append(button); }
   }
   if (!serverSettingsOpen && !invitingServerMember) return;
   const inviteLink = `https://pulse.overclockd.shop/?invite=${encodeURIComponent(server.inviteCode)}`;
