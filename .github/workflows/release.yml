@@ -23,6 +23,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install frontend dependencies
         run: npm ci
+      - name: Validate release versions and Rust lockfile
+        shell: pwsh
+        run: |
+          node scripts/check-release-version.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 > $null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Set release name
         id: release-meta
         shell: bash
