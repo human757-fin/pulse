@@ -5,6 +5,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
+import { readBody, RequestBodyError } from './request-body.mjs';
 
 const scrypt = promisify(scryptCb);
 const port = Number(process.env.PULSE_WEB_PORT || process.env.port2 || 8788);
@@ -78,14 +79,6 @@ function presenceState(user) {
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt, presence: presenceState(user), presencePreference: user.presence || 'online', customStatus: user.customStatus || '' }; }
 function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
 function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
-function readBody(req, maxBytes = 2_000_000) {
-  return new Promise((resolveBody, reject) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > maxBytes) { reject(new Error('Request is too large.')); req.destroy(); } });
-    req.on('end', () => { try { resolveBody(JSON.parse(body || '{}')); } catch { reject(new Error('Request must be valid JSON.')); } });
-    req.on('error', reject);
-  });
-}
 function sessionUser(req) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const session = db.sessions.find(s => s.token === token && s.expiresAt > Date.now());
@@ -283,6 +276,9 @@ async function sendEmailCode(email, purpose, userId = '') {
   return id;
 }
 async function serve(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
@@ -332,7 +328,7 @@ async function serve(req, res) {
       }
     }
     try {
-      const body = ['POST'].includes(req.method) ? await readBody(req) : {};
+      const body = ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readBody(req) : {};
       if (url.pathname === '/api/auth/email-code' && req.method === 'POST') {
         const email = emailKey(body.email);
         const purpose = String(body.purpose || '');
@@ -962,7 +958,7 @@ async function serve(req, res) {
         return json(res, 201, { message: { id: message.id, from: publicUser(user), ciphertext, iv, encryptionVersion: 1, createdAt: message.createdAt } });
       }
       return json(res, 404, { error: 'API route not found.' });
-    } catch (error) { return json(res, 400, { error: error instanceof Error ? error.message : 'Request failed.' }); }
+    } catch (error) { return json(res, error instanceof RequestBodyError ? error.status : 400, { error: error instanceof Error ? error.message : 'Request failed.' }); }
   }
   const pathname = decodeURIComponent(url.pathname);
   const requested = resolve(webRoot, `.${pathname}`);
@@ -977,4 +973,10 @@ async function serve(req, res) {
     res.end('Pulse could not read this page.');
   }).pipe(res);
 }
-createServer((req, res) => { void serve(req, res); }).listen(port, '0.0.0.0', () => console.log(`Pulse web and API listening on 0.0.0.0:${port}`));
+createServer((req, res) => {
+  void serve(req, res).catch(() => {
+    console.error('Pulse request failed unexpectedly.');
+    if (res.headersSent) { res.destroy(); return; }
+    json(res, 500, { error: 'Pulse could not complete this request. Try again.' });
+  });
+}).listen(port, '0.0.0.0', () => console.log(`Pulse web and API listening on 0.0.0.0:${port}`));

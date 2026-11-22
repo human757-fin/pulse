@@ -1,5 +1,7 @@
 import './style.css';
 import './servers.css';
+import './refresh.css';
+import './accessibility.css';
 import QRCode from 'qrcode';
 import packageInfo from '../package.json';
 import { createAttachmentCipher, createGroupAttachmentCipher, decryptFile, decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
@@ -686,6 +688,33 @@ function render() {
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (creationModal) app.insertAdjacentHTML('beforeend', creationModal);
   setupServerPanels();
+  const chatHeader = app.querySelector('.chat-header');
+  if (chatHeader) {
+    const navigationToggle = document.createElement('button');
+    navigationToggle.type = 'button';
+    navigationToggle.className = 'mobile-navigation-toggle';
+    navigationToggle.textContent = 'Chats';
+    navigationToggle.setAttribute('aria-label', 'Toggle chats and channels');
+    navigationToggle.setAttribute('aria-expanded', String(app.classList.contains('mobile-navigation-open')));
+    navigationToggle.onclick = () => {
+      const open = app.classList.toggle('mobile-navigation-open');
+      navigationToggle.setAttribute('aria-expanded', String(open));
+    };
+    chatHeader.prepend(navigationToggle);
+    app.querySelector('.sidebar')?.addEventListener('click', event => {
+      if ((event.target as Element).closest('[data-friend], [data-group], [data-server-channel], [data-server-voice]')) {
+        app.classList.remove('mobile-navigation-open');
+        navigationToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
+  }
+  app.querySelector('#message-input')?.setAttribute('aria-label', editingMessageId ? 'Edit message' : 'Message');
+  app.querySelector('#message-input')?.setAttribute('aria-describedby', 'attachment-status');
+  app.querySelector('.composer .send')?.setAttribute('aria-label', editingMessageId ? 'Save edit' : 'Send message');
+  app.querySelector('#attachment-status')?.setAttribute('role', 'status');
+  app.querySelector('#add-friend input')?.setAttribute('aria-label', 'Pulse username');
+  app.querySelector('#join-server input')?.setAttribute('aria-label', 'Server invite code');
+  app.querySelectorAll('.role-name-row input[name="name"]').forEach(input => input.setAttribute('aria-label', 'Role name'));
   if (group && !app.querySelector('#attach-button')) app.querySelector('#composer')?.insertAdjacentHTML('afterbegin', '<button type="button" class="attach" id="attach-button" title="Attach files (750 MB max)" aria-label="Attach files">＋</button>');
   if (attachmentStatus) setAttachmentStatus(attachmentStatus);
   if (notice) {

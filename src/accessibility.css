@@ -1,0 +1,43 @@
+/* Shared interaction tokens preserve the compact Pulse layout. */
+:root {
+  --focus-ring: #9ce8d8;
+  --control-radius: 8px;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.search:focus-within,
+.chat-search:focus-within {
+  border-color: var(--focus-ring);
+}
+
+button:disabled { cursor: not-allowed; }
+.creation-modal-scroll { scroll-padding-block: 16px; }
+.creation-modal input, .creation-modal select { min-width: 0; }
+.creation-modal label { overflow-wrap: anywhere; }
+
+/* Enlarge controls for touch without inflating dense desktop navigation. */
+@media (pointer: coarse) {
+  button, select, summary, input:not([type="checkbox"]):not([type="radio"]):not([type="range"]) {
+    min-height: 44px;
+  }
+  button { min-width: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
