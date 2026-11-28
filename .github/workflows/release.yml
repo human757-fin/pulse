@@ -1,4 +1,4 @@
-name: Build and publish Pulse
+name: Build and publish Umbra
 
 on:
   push:
@@ -39,11 +39,11 @@ jobs:
           if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
             kind="Pre"
             if [[ "${tag_message,,}" == hotfix:* ]]; then kind="Hotfix"; fi
-            release_name="Pulse ${BASH_REMATCH[1]} ${kind} ${BASH_REMATCH[2]}"
+            release_name="Umbra ${BASH_REMATCH[1]} ${kind} ${BASH_REMATCH[2]}"
           elif [[ "${tag_message,,}" == hotfix:* ]]; then
-            release_name="Pulse ${version} Hotfix"
+            release_name="Umbra ${version} Hotfix"
           else
-            release_name="Pulse ${version}"
+            release_name="Umbra ${version}"
           fi
           echo "name=${release_name}" >> "$GITHUB_OUTPUT"
       - name: Build and publish signed Windows installers
@@ -54,7 +54,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ steps.release-meta.outputs.name }}
-          releaseBody: Signed Windows installers and update metadata for Pulse.
+          releaseBody: Signed Windows installers and update metadata for Umbra.
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           updaterJsonPreferNsis: true

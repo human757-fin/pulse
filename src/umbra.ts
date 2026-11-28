@@ -3,7 +3,7 @@ import { umbraEnvelopeKey } from './crypto';
 type Api = <T>(path: string, options?: RequestInit) => Promise<T>;
 type Target = { kind: 'dm' | 'group'; id: string; label: string; members: { id: string; publicKey: JsonWebKey }[] };
 type Connection = { id: string; key: string };
-const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Pulse could not complete the request.';
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Umbra could not complete the request.';
 
 export function parseUmbraCode(code: string): Connection | undefined {
   const match = /^([a-f0-9]{32})\.([a-f0-9]{64})$/.exec(code.trim());
@@ -27,7 +27,7 @@ const fromBase64 = (value: string) => Uint8Array.from(atob(value), byte => byte.
 export function showUmbraApproval(app: HTMLElement, connection: Connection, user: { id: string; username: string }, ready: boolean, api: Api, close: () => void) {
   if (app.querySelector('#umbra-approval')) return;
   app.classList.remove('settings-view');
-  app.innerHTML = `<main class="auth-page" id="umbra-approval"><section class="auth-card"><div class="auth-brand"><img src="/pulse-mark.svg" alt=""><span>Pulse</span></div><h1>Connect Umbra</h1><p id="umbra-account" class="auth-subtitle"></p><form class="auth-form"><label>Send clips to<select required disabled><option value="">Loading your chats…</option></select></label><p class="auth-subtitle">Umbra can send encrypted clips to the chat you choose. You control automatic sharing in Umbra.</p><p class="form-error" role="status" aria-live="polite"></p><button class="primary-button" type="submit" disabled>Approve connection</button></form><div class="auth-switch"><button type="button" id="umbra-close">Cancel</button></div></section></main>`;
+  app.innerHTML = `<main class="auth-page" id="umbra-approval"><section class="auth-card"><div class="auth-brand"><img src="/pulse-mark.svg" alt=""><span>Umbra</span></div><h1>Connect Umbra Clips</h1><p id="umbra-account" class="auth-subtitle"></p><form class="auth-form"><label>Send clips to<select required disabled><option value="">Loading your chats…</option></select></label><p class="auth-subtitle">Umbra Clips can send encrypted clips to the chat you choose. You control automatic sharing in Umbra Clips.</p><p class="form-error" role="status" aria-live="polite"></p><button class="primary-button" type="submit" disabled>Approve connection</button></form><div class="auth-switch"><button type="button" id="umbra-close">Cancel</button></div></section></main>`;
   const form = app.querySelector<HTMLFormElement>('#umbra-approval form')!;
   const select = form.querySelector('select')!;
   const status = form.querySelector<HTMLElement>('[role=status]')!;
@@ -37,7 +37,7 @@ export function showUmbraApproval(app: HTMLElement, connection: Connection, user
   app.querySelector('#umbra-account')!.textContent = `Signed in as @${user.username}`;
   if (!ready) {
     form.querySelector('label')!.hidden = true;
-    status.textContent = 'Paste the connection code in Settings → Sign-in security on the Pulse device that already holds your chat encryption key.';
+    status.textContent = 'Paste the connection code in Settings → Sign-in security on the Umbra device that already holds your chat encryption key.';
     submit.hidden = true;
     return;
   }
@@ -60,7 +60,7 @@ export function showUmbraApproval(app: HTMLElement, connection: Connection, user
     if (!select.value || submit.disabled) return;
     const target = targets[Number(select.value)];
     submit.disabled = select.disabled = dismiss.disabled = true;
-    status.textContent = 'Connecting Umbra…';
+    status.textContent = 'Connecting Umbra Clips…';
     try {
       const linkNonce = toHex(crypto.getRandomValues(new Uint8Array(16)));
       const keys = Object.fromEntries(await Promise.all(target.members.map(async member => [member.id, await umbraEnvelopeKey(user.id, member.id, member.publicKey, linkNonce)] as const)));
@@ -71,15 +71,15 @@ export function showUmbraApproval(app: HTMLElement, connection: Connection, user
       const additionalData = encoder.encode(`pulse-umbra-pairing-v1:${connection.id}:${linkNonce}:${user.id}:${target.id}`);
       const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key, encoder.encode(JSON.stringify(keys)));
       await api(endpoint, { method: 'POST', body: JSON.stringify({ kind: target.kind, targetId: target.id, members: target.members, linkNonce, sealed: { iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) } }) });
-      status.textContent = `Approved for ${target.label}. Return to Umbra to finish connecting.`;
-      dismiss.textContent = 'Continue to Pulse';
+      status.textContent = `Approved for ${target.label}. Return to Umbra Clips to finish connecting.`;
+      dismiss.textContent = 'Continue to Umbra';
     } catch (error) { status.textContent = errorMessage(error); submit.disabled = select.disabled = false; }
     finally { dismiss.disabled = false; }
   };
 }
 
 export function mountUmbraSettings(parent: HTMLElement, api: Api, connect: (connection: Connection) => void) {
-  parent.insertAdjacentHTML('beforeend', `<section class="settings-section" id="umbra-settings"><h2>Umbra clip sharing</h2><form class="settings-form"><label>Umbra connection code<input name="code" autocomplete="off" spellcheck="false" maxlength="97" required></label><p>Copy the code from Umbra to approve a connection here.</p><button type="submit" class="primary-button">Choose a chat</button></form><div id="umbra-links"></div><p role="status" aria-live="polite"></p></section>`);
+  parent.insertAdjacentHTML('beforeend', `<section class="settings-section" id="umbra-settings"><h2>Umbra Clips</h2><form class="settings-form"><label>Connection code from Umbra Clips<input name="code" autocomplete="off" spellcheck="false" maxlength="97" required></label><p>Copy the code from Umbra Clips to approve a connection here.</p><button type="submit" class="primary-button">Choose a chat</button></form><div id="umbra-links"></div><p role="status" aria-live="polite"></p></section>`);
   const section = parent.querySelector('#umbra-settings')!;
   const form = section.querySelector('form')!;
   const links = section.querySelector('#umbra-links')!;
@@ -88,22 +88,22 @@ export function mountUmbraSettings(parent: HTMLElement, api: Api, connect: (conn
     event.preventDefault();
     const code = parseUmbraCode(String(new FormData(form).get('code') || ''));
     if (code) connect(code);
-    else status.textContent = 'Enter the connection code shown in Umbra.';
+    else status.textContent = 'Enter the connection code shown in Umbra Clips.';
   };
   async function refreshLinks() {
     const { links: active } = await api<{ links: { id: string; label: string; expiresAt: number }[] }>('/umbra/links');
     links.replaceChildren();
-    if (!active.length) links.textContent = 'No connected Umbra devices.';
+    if (!active.length) links.textContent = 'No connected Umbra Clips devices.';
     for (const link of active) {
       const row = document.createElement('p');
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = 'Disconnect';
-      button.setAttribute('aria-label', `Disconnect Umbra from ${link.label}`);
+      button.setAttribute('aria-label', `Disconnect Umbra Clips from ${link.label}`);
       row.append(`${link.label} · Expires ${new Date(link.expiresAt).toLocaleDateString()} `, button);
       button.onclick = async () => {
         button.disabled = true;
-        try { await api(`/umbra/links/${link.id}`, { method: 'DELETE' }); await refreshLinks(); status.textContent = 'Umbra disconnected.'; }
+        try { await api(`/umbra/links/${link.id}`, { method: 'DELETE' }); await refreshLinks(); status.textContent = 'Umbra Clips disconnected.'; }
         catch (error) { status.textContent = errorMessage(error); button.disabled = false; }
       };
       links.append(row);
@@ -122,7 +122,7 @@ export function showUmbraPicker(targetId: string, userId: string, api: Api, load
   const dialog = document.createElement('dialog');
   dialog.id = 'umbra-picker';
   dialog.setAttribute('aria-labelledby', 'umbra-picker-title');
-  dialog.innerHTML = `<h2 id="umbra-picker-title">Send an Umbra clip</h2><form id="umbra-picker-form" class="settings-form"><label id="umbra-device-row" hidden>Connected device<select id="umbra-device"></select></label><label id="umbra-clip-row" hidden>Recent clips<select id="umbra-clip" required></select></label><p role="status" aria-live="polite">Looking for Umbra…</p><button type="submit" class="primary-button" disabled>Send clip</button></form><form method="dialog"><button type="submit">Close</button></form>`;
+  dialog.innerHTML = `<h2 id="umbra-picker-title">Send from Umbra Clips</h2><form id="umbra-picker-form" class="settings-form"><label id="umbra-device-row" hidden>Connected device<select id="umbra-device"></select></label><label id="umbra-clip-row" hidden>Recent clips<select id="umbra-clip" required></select></label><p role="status" aria-live="polite">Looking for Umbra Clips…</p><button type="submit" class="primary-button" disabled>Send clip</button></form><form method="dialog"><button type="submit">Close</button></form>`;
   document.body.append(dialog);
   dialog.showModal();
   const controller = new AbortController();
@@ -160,7 +160,7 @@ export function showUmbraPicker(targetId: string, userId: string, api: Api, load
       if (value.error) throw new Error(value.error);
       return value as T;
     }
-    throw new Error('Umbra did not respond. Check that it is running on your PC and try again.');
+    throw new Error('Umbra Clips did not respond. Check that it is running on your PC and try again.');
   }
 
   async function load(link: PickerLink) {
@@ -168,7 +168,7 @@ export function showUmbraPicker(targetId: string, userId: string, api: Api, load
     selected = link;
     send.disabled = true;
     clips.disabled = true;
-    status.textContent = 'Loading recent clips from Umbra…';
+    status.textContent = 'Loading recent clips from Umbra Clips…';
     try {
       const reply = await exchange<{ clips: Clip[] }>(link, 'list');
       if (version !== activeLoad || signal.aborted) return;
@@ -177,13 +177,13 @@ export function showUmbraPicker(targetId: string, userId: string, api: Api, load
       available.forEach((clip, index) => clips.add(new Option(`${clip.name} (${(clip.size / 1_000_000).toFixed(1)} MB)`, String(index))));
       dialog.querySelector<HTMLElement>('#umbra-clip-row')!.hidden = false;
       clips.disabled = !available.length;
-      status.textContent = available.length ? 'Umbra will upload the clip you select.' : 'Save an MP4 clip in Umbra, then reopen this picker.';
+      status.textContent = available.length ? 'Umbra Clips will upload the clip you select.' : 'Save an MP4 clip in Umbra Clips, then reopen this picker.';
     } catch (error) { if (version === activeLoad && !signal.aborted) status.textContent = errorMessage(error); }
   }
 
   void api<{ links: PickerLink[] }>(`/umbra/pickers?target=${encodeURIComponent(targetId)}`, { signal }).then(result => {
     links = result.links;
-    if (!links.length) { status.textContent = 'In Umbra, sign in with Pulse and choose this chat as your destination.'; return; }
+    if (!links.length) { status.textContent = 'In Umbra Clips, sign in with Umbra and choose this chat as your destination.'; return; }
     links.forEach((link, index) => devices.add(new Option(`${link.label} · Device ${index + 1}`, String(index))));
     dialog.querySelector<HTMLElement>('#umbra-device-row')!.hidden = links.length < 2;
     void load(links[0]);
@@ -195,11 +195,11 @@ export function showUmbraPicker(targetId: string, userId: string, api: Api, load
     if (!selected || !clips.value || sending) return;
     const clip = available[Number(clips.value)];
     sending = send.disabled = devices.disabled = clips.disabled = true;
-    status.textContent = 'Asking Umbra to send the clip…';
+    status.textContent = 'Asking Umbra Clips to send the clip…';
     try {
       await exchange<{ queued: boolean }>(selected, 'send', clip.name);
       clips.value = '';
-      status.textContent = 'Clip queued. It will appear in this chat when Umbra finishes uploading.';
+      status.textContent = 'Clip queued. It will appear in this chat when Umbra Clips finishes uploading.';
     } catch (error) { if (!signal.aborted) status.textContent = errorMessage(error); }
     finally { sending = devices.disabled = clips.disabled = false; send.disabled = !clips.value; }
   };

@@ -70,7 +70,7 @@ export class VoiceClient {
 
   async setAudioOutputDevice(deviceId: string) {
     const supportsOutputSelection = 'setSinkId' in HTMLMediaElement.prototype;
-    if (deviceId && !supportsOutputSelection) throw new Error('Speaker selection is unavailable in this version of Windows WebView. Update Pulse and WebView2.');
+    if (deviceId && !supportsOutputSelection) throw new Error('Speaker selection is unavailable in this version of Windows WebView. Update Umbra and WebView2.');
     const mediaElements = [...this.audioElements.values()];
     const setSinkId = (audio: HTMLAudioElement, sinkId: string) => {
       const media = audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
@@ -87,7 +87,7 @@ export class VoiceClient {
     this.emit('connecting', 'Requesting microphone…');
     try {
       const parsedEndpoint = new URL(endpoint);
-      if (parsedEndpoint.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsedEndpoint.hostname)) throw new Error('Use a secure wss:// voice address to protect your Pulse sign-in.');
+      if (parsedEndpoint.protocol !== 'wss:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsedEndpoint.hostname)) throw new Error('Use a secure wss:// voice address to protect your Umbra sign-in.');
       this.voiceKey = voiceKey;
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this WebView. Update Microsoft Edge WebView2 and retry.');
       this.stream = await navigator.mediaDevices.getUserMedia({
@@ -146,7 +146,7 @@ export class VoiceClient {
   getRemoteScreenStream(peerId: string) { return this.remoteVideos.get(peerId); }
 
   async startScreenShare(settings: ScreenShareSettings) {
-    if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen sharing is unavailable. Update Pulse and Microsoft Edge WebView2.');
+    if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen sharing is unavailable. Update Umbra and Microsoft Edge WebView2.');
     if (this.screenStream) return;
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: { width: { ideal: settings.width }, height: { ideal: settings.height }, frameRate: { ideal: settings.fps, max: settings.fps } }, audio: true });
     const track = stream.getVideoTracks()[0];
@@ -183,7 +183,7 @@ export class VoiceClient {
 
   private async handle(msg: Signal) {
     if (msg.type === 'joined') {
-      if (msg.voiceProtocol !== voiceProtocol) { this.fail('Voice versions do not match. Update Pulse on both devices and restart the Pulse server.'); return; }
+      if (msg.voiceProtocol !== voiceProtocol) { this.fail('Voice versions do not match. Update Umbra on both devices and restart the Umbra server.'); return; }
       this.reconnectAttempts = 0;
       this.turnServers = (msg.iceServers as RTCIceServer[]) || [];
       this.iceTransportPolicy = msg.iceTransportPolicy === 'relay' && this.turnServers.length ? 'relay' : 'all';
@@ -225,7 +225,7 @@ export class VoiceClient {
       const from = String(msg.from);
       if (msg.fromUserId) this.peerUsers.set(from, String(msg.fromUserId));
       const description = msg.description as RTCSessionDescriptionInit;
-      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Umbra clients before calling.'); return; }
       const pc = this.makePeer(from);
       await this.preparePeerVideo(from);
       await pc.setRemoteDescription(description);
@@ -239,7 +239,7 @@ export class VoiceClient {
       const from = String(msg.from);
       const pc = this.peers.get(from);
       const description = msg.description as RTCSessionDescriptionInit;
-      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Pulse clients before calling.'); return; }
+      if (this.joinOptions?.roomType !== 'server' && !await this.verifyDescription(description, String(msg.voiceProof || ''), await this.keyForPeer(from))) { this.fail('Voice peer verification failed. Update both Umbra clients before calling.'); return; }
       if (pc) { await pc.setRemoteDescription(description); await this.flushIce(from, pc); }
       return;
     }
@@ -406,7 +406,7 @@ export class VoiceClient {
         if (media.setSinkId) void media.setSinkId(this.outputDeviceId).catch(error => this.emit('connected', error instanceof Error ? `Could not select speaker: ${error.message}` : 'Could not select speaker.'));
       }
       audio.srcObject = graph.destination.stream;
-      void audio.play().catch(() => this.emit('connected', 'Voice connected · click Pulse to hear audio'));
+      void audio.play().catch(() => this.emit('connected', 'Voice connected · click Umbra to hear audio'));
       this.emit('connected', `In voice with ${this.peerNames.get(id) || 'a friend'}`);
     };
     pc.onconnectionstatechange = () => {

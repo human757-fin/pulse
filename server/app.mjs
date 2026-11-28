@@ -158,7 +158,7 @@ async function getReleaseUpdate(channel, target, currentVersion) {
   const cacheKey = `${channel}:${target}:${currentVersion}`;
   const cached = updaterCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.update;
-  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Pulse-Updater', 'X-GitHub-Api-Version': '2022-11-28' };
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'Umbra-Updater', 'X-GitHub-Api-Version': '2022-11-28' };
   const releasesResponse = await fetch('https://api.github.com/repos/human757-fin/pulse/releases?per_page=30', { headers, signal: AbortSignal.timeout(10_000) });
   if (!releasesResponse.ok) throw new Error(`GitHub releases request failed (${releasesResponse.status}).`);
   const releases = await releasesResponse.json();
@@ -244,10 +244,10 @@ function verifySecondFactor(user, code) {
 }
 async function sendEmailCode(email, purpose, userId = '', id = randomBytes(24).toString('hex')) {
   const credentialHash = ['password-reset', 'two-factor'].includes(purpose) ? db.users.find(user => user.id === userId)?.passwordHash : undefined;
-  if (!process.env.RESEND_API_KEY || !process.env.PULSE_EMAIL_FROM) throw new Error('Email delivery is not configured on the Pulse server.');
+  if (!process.env.RESEND_API_KEY || !process.env.PULSE_EMAIL_FROM) throw new Error('Email delivery is not configured on the Umbra server.');
   const now = Date.now();
   if (now - globalEmailWindow.start > 60 * 60_000) { globalEmailWindow.start = now; globalEmailWindow.count = 0; }
-  if (globalEmailWindow.count >= 100) throw new Error('Pulse has reached its hourly email-code limit. Try again later.');
+  if (globalEmailWindow.count >= 100) throw new Error('Umbra has reached its hourly email-code limit. Try again later.');
   const addressKey = emailKey(email);
   const window = emailRequestWindows.get(addressKey) || { sentAt: 0, count: 0, windowStart: now };
   if (now - window.windowStart > 60 * 60_000) { window.windowStart = now; window.count = 0; }
@@ -255,24 +255,25 @@ async function sendEmailCode(email, purpose, userId = '', id = randomBytes(24).t
   window.sentAt = now; window.count += 1; emailRequestWindows.set(addressKey, window); globalEmailWindow.count += 1;
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
   const emailCopy = purpose === 'password-reset'
-    ? { subject: 'Reset your Pulse password', heading: 'Reset your password', action: 'choose a new password for your Pulse account' }
+    ? { subject: 'Reset your Umbra password', heading: 'Reset your password', action: 'choose a new password for your Umbra account' }
     : purpose === 'signup'
-    ? { subject: 'Verify your email for Pulse', heading: 'Verify your email', action: 'finish creating your Pulse account' }
+    ? { subject: 'Verify your email for Umbra', heading: 'Verify your email', action: 'finish creating your Umbra account' }
     : purpose === 'two-factor'
-      ? { subject: 'Your Pulse sign-in code', heading: 'Confirm your sign-in', action: 'sign in to your Pulse account' }
+      ? { subject: 'Your Umbra sign-in code', heading: 'Confirm your sign-in', action: 'sign in to your Umbra account' }
       : purpose === 'enable-2fa'
-        ? { subject: 'Your Pulse security code', heading: 'Enable email two-factor', action: 'enable email two-factor authentication' }
+        ? { subject: 'Your Umbra security code', heading: 'Enable email two-factor', action: 'enable email two-factor authentication' }
         : purpose === 'disable-2fa'
-          ? { subject: 'Your Pulse security code', heading: 'Disable email two-factor', action: 'disable email two-factor authentication' }
-          : { subject: 'Verify your email for Pulse', heading: 'Verify your email', action: 'verify your Pulse email address' };
-  const text = `${emailCopy.heading}\n\nYour Pulse verification code is ${code}.\n\nEnter this code to ${emailCopy.action}. It expires in 10 minutes and works once.\n\nIf you did not request this code, ignore this message. Do not share the code with anyone.`;
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${emailCopy.heading}</title></head><body style="margin:0;background:#f4f4f7;color:#222;font-family:Arial,Helvetica,sans-serif"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f7"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;background:#fff;border:1px solid #e5e5eb;border-radius:12px"><tr><td style="padding:30px 28px"><h1 style="margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;font-size:22px;line-height:1.3;color:#20212a">${emailCopy.heading}</h1><p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#3d3e48">Enter this code to ${emailCopy.action}:</p><p style="margin:0 0 18px;padding:14px 10px;background:#f4f2ff;border-radius:8px;text-align:center;font-family:Consolas,monospace;font-size:30px;line-height:1.3;font-weight:bold;letter-spacing:6px;color:#5146ba">${code}</p><p style="margin:0 0 14px;font-size:13px;line-height:1.6;color:#555661">This code expires in 10 minutes and works once.</p><p style="margin:0;font-size:13px;line-height:1.6;color:#686a74">If you did not request this code, ignore this message. Do not share the code with anyone.</p></td></tr></table><p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:#777">Pulse account security</p></td></tr></table></body></html>`;
+          ? { subject: 'Your Umbra security code', heading: 'Disable email two-factor', action: 'disable email two-factor authentication' }
+          : { subject: 'Verify your email for Umbra', heading: 'Verify your email', action: 'verify your Umbra email address' };
+  const text = `${emailCopy.heading}\n\nYour Umbra verification code is ${code}.\n\nEnter this code to ${emailCopy.action}. It expires in 10 minutes and works once.\n\nIf you did not request this code, ignore this message. Do not share the code with anyone.`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${emailCopy.heading}</title></head><body style="margin:0;background:#f4f4f7;color:#222;font-family:Arial,Helvetica,sans-serif"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f7"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:520px;background:#fff;border:1px solid #e5e5eb;border-radius:12px"><tr><td style="padding:30px 28px"><h1 style="margin:0 0 16px;font-family:Arial,Helvetica,sans-serif;font-size:22px;line-height:1.3;color:#20212a">${emailCopy.heading}</h1><p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#3d3e48">Enter this code to ${emailCopy.action}:</p><p style="margin:0 0 18px;padding:14px 10px;background:#f4f2ff;border-radius:8px;text-align:center;font-family:Consolas,monospace;font-size:30px;line-height:1.3;font-weight:bold;letter-spacing:6px;color:#5146ba">${code}</p><p style="margin:0 0 14px;font-size:13px;line-height:1.6;color:#555661">This code expires in 10 minutes and works once.</p><p style="margin:0;font-size:13px;line-height:1.6;color:#686a74">If you did not request this code, ignore this message. Do not share the code with anyone.</p></td></tr></table><p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:#777">Umbra account security</p></td></tr></table></body></html>`;
+  const from = process.env.PULSE_EMAIL_FROM.replace(/^Pulse(?=\s*<)/i, 'Umbra');
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST', headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: process.env.PULSE_EMAIL_FROM, to: [email], ...(process.env.PULSE_EMAIL_REPLY_TO ? { reply_to: process.env.PULSE_EMAIL_REPLY_TO } : {}), subject: emailCopy.subject, text, html }),
+    body: JSON.stringify({ from, to: [email], ...(process.env.PULSE_EMAIL_REPLY_TO ? { reply_to: process.env.PULSE_EMAIL_REPLY_TO } : {}), subject: emailCopy.subject, text, html }),
     signal: AbortSignal.timeout(10_000),
   });
-  if (!response.ok) { console.error('Email provider rejected a verification message with status:', response.status); throw new Error('Pulse could not send your email code. Check the email address and try again.'); }
+  if (!response.ok) { console.error('Email provider rejected a verification message with status:', response.status); throw new Error('Umbra could not send your email code. Check the email address and try again.'); }
   emailChallenges.set(id, { id, email: addressKey, purpose, userId, credentialHash, codeHash: hashCode(id, code), expiresAt: now + 10 * 60_000, attempts: 0 });
   for (const [challengeId, challenge] of emailChallenges) if (challenge.expiresAt <= now) emailChallenges.delete(challengeId);
   for (const [proof, item] of emailProofs) if (item.expiresAt <= now) emailProofs.delete(proof);
@@ -308,8 +309,8 @@ async function serve(req, res) {
         if (!update) { res.writeHead(204, { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }); res.end(); return; }
         return json(res, 200, update);
       } catch (error) {
-        console.error('Pulse updater check failed:', error instanceof Error ? error.message : 'unknown error');
-        return json(res, 503, { error: 'Pulse could not check GitHub for updates.' });
+        console.error('Umbra updater check failed:', error instanceof Error ? error.message : 'unknown error');
+        return json(res, 503, { error: 'Umbra could not check GitHub for updates.' });
       }
     }
     const attachmentChunk = url.pathname.match(/^\/api\/(attachments|umbra\/clips)\/([a-f0-9]{32})\/(\d+)$/);
@@ -330,7 +331,7 @@ async function serve(req, res) {
       try {
         await pipeline(req, limit, createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }));
         if (received !== expectedSize) throw new Error('Attachment chunk was incomplete.');
-        if (scoped && !umbra.canUpload(req, item)) throw new Error('The Umbra attachment upload is no longer authorized.');
+        if (scoped && !umbra.canUpload(req, item)) throw new Error('The Umbra Clips upload is no longer authorized.');
         if (item.chunks.includes(index)) { rmSync(temporaryPath, { force: true }); return json(res, 200, { ok: true }); }
         renameSync(temporaryPath, finalPath); item.chunks.push(index); persist();
         return json(res, 201, { ok: true });
@@ -358,7 +359,7 @@ async function serve(req, res) {
           // Respond before delivery for both known and unknown addresses.
           if (user) void sendEmailCode(email, 'password-reset', user.id, challengeId).catch(() => console.error('Password reset email could not be delivered.'));
         }
-        return json(res, 200, { challengeId, message: 'If this email belongs to a verified Pulse account, a reset code is on its way. Wait a minute before requesting another.' });
+        return json(res, 200, { challengeId, message: 'If this email belongs to a verified Umbra account, a reset code is on its way. Wait a minute before requesting another.' });
       }
       if (url.pathname === '/api/auth/password-reset/complete' && req.method === 'POST') {
         if (Object.keys(body).some(key => !['challengeId', 'code', 'password', 'secondFactor'].includes(key)) || typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) return json(res, 400, { error: 'Password must be 10–128 characters.' });
@@ -522,13 +523,13 @@ async function serve(req, res) {
         return json(res, 200, { user: accountUser(user) });
       }
       if (url.pathname === '/api/admin/suggestions' && req.method === 'GET') {
-        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Pulse administrator.' });
+        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Umbra administrator.' });
         const suggestions = [...db.suggestions].reverse().map(item => ({ id: item.id, text: item.text, createdAt: item.createdAt, status: item.status || '', user: publicUser(db.users.find(candidate => candidate.id === item.userId) || { id: '', username: 'unknown' }) }));
         return json(res, 200, { suggestions });
       }
       const adminSuggestion = url.pathname.match(/^\/api\/admin\/suggestions\/([a-f0-9]{24})$/);
       if (adminSuggestion && req.method === 'PATCH') {
-        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Pulse administrator.' });
+        if (usernameKey(user.username) !== 'zzz') return json(res, 403, { error: 'Admin access is only available to the Umbra administrator.' });
         const status = String(body.status || '');
         if (!['started', 'not-doing', 'will-do', 'done'].includes(status)) return json(res, 400, { error: 'Choose Started, Not doing, Will do, or Done.' });
         const suggestion = db.suggestions.find(item => item.id === adminSuggestion[1]);
@@ -547,7 +548,7 @@ async function serve(req, res) {
       if (url.pathname === '/api/calls/invite' && req.method === 'POST') {
         const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
         if (!target || target.id === user.id || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'Voice calls are available to accepted friends only.' });
-        if (!user.publicKey || !target.publicKey) return json(res, 409, { error: 'Both people need to sign in with an updated Pulse client before calling.' });
+        if (!user.publicKey || !target.publicKey) return json(res, 409, { error: 'Both people need to sign in with an updated Umbra client before calling.' });
         const now = Date.now();
         for (const [id, invite] of callInvites) if (invite.expiresAt <= now || (invite.from === user.id && invite.to === target.id)) callInvites.delete(id);
         if ([...callInvites.values()].filter(invite => invite.from === user.id).length >= 5) return json(res, 429, { error: 'You already have several calls ringing. End one before calling another friend.' });
@@ -605,7 +606,7 @@ async function serve(req, res) {
         if (user.totpEnabled) return json(res, 409, { error: 'Authenticator two-factor is already enabled.' });
         const challengeId = randomBytes(24).toString('hex'); const secret = base32Encode(randomBytes(20));
         totpSetups.set(challengeId, { userId: user.id, secret, expiresAt: Date.now() + 10 * 60_000, attempts: 0 });
-        return json(res, 200, { challengeId, secret, account: user.emailVerified && user.email ? user.email : user.username, issuer: 'Pulse' });
+        return json(res, 200, { challengeId, secret, account: user.emailVerified && user.email ? user.email : user.username, issuer: 'Umbra' });
       }
       if (url.pathname === '/api/auth/totp/confirm' && req.method === 'POST') {
         const challengeId = String(body.challengeId || ''); const setup = totpSetups.get(challengeId);
@@ -697,7 +698,7 @@ async function serve(req, res) {
         }
         if (body.roomType === 'group') {
           const group = db.groups.find(candidate => !candidate.serverId && candidate.id === String(body.friendId || '') && candidate.members.includes(user.id));
-          if (!user.publicKey || !group || body.room !== `group-${group.id}` || group.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This group voice room is not available to your account. Update Pulse and sign in again to enable voice encryption.' });
+          if (!user.publicKey || !group || body.room !== `group-${group.id}` || group.members.some(memberId => memberId !== user.id && isBlocked(user.id, memberId))) return json(res, 403, { error: 'This group voice room is not available to your account. Update Umbra and sign in again to enable voice encryption.' });
           return json(res, 200, { user: publicUser(user) });
         }
         const target = db.users.find(candidate => candidate.id === String(body.friendId || ''));
@@ -708,7 +709,7 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/keys' && req.method === 'POST') {
         const publicKey = body.publicKey;
-        if (!publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.x || '') || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.y || '')) return json(res, 400, { error: 'Invalid Pulse encryption public key.' });
+        if (!publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.x || '') || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.y || '')) return json(res, 400, { error: 'Invalid Umbra encryption public key.' });
         user.publicKey = { kty: 'EC', crv: 'P-256', x: publicKey.x, y: publicKey.y, ext: true };
         persist(); return json(res, 200, { ok: true });
       }
@@ -717,7 +718,7 @@ async function serve(req, res) {
         const target = db.users.find(u => u.id === publicKeyRequest[1]);
         const sharesGroup = db.groups.some(group => group.members.includes(user.id) && group.members.includes(target?.id));
         if (!target || isBlocked(user.id, target.id) || (target.id !== user.id && friendship(user.id, target.id)?.status !== 'accepted' && !sharesGroup)) return json(res, 403, { error: 'Encryption keys are available to you, your friends, and your group members.' });
-        if (!target.publicKey) return json(res, 404, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
+        if (!target.publicKey) return json(res, 404, { error: 'Your friend needs to sign in to an updated Umbra client to enable encryption.' });
         return json(res, 200, { publicKey: target.publicKey });
       }
       if (url.pathname === '/api/friends' && req.method === 'GET') {
@@ -728,7 +729,7 @@ async function serve(req, res) {
       }
       if (url.pathname === '/api/friends' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.username));
-        if (!target || isBlocked(user.id, target.id)) return json(res, 404, { error: 'No Pulse account has that username.' });
+        if (!target || isBlocked(user.id, target.id)) return json(res, 404, { error: 'No Umbra account has that username.' });
         if (target.id === user.id) return json(res, 400, { error: 'You cannot add yourself.' });
         const existing = friendship(user.id, target.id);
         if (existing) return json(res, 409, { error: existing.status === 'accepted' ? 'You are already friends.' : existing.to === user.id ? 'Accept the incoming request below.' : 'Friend request already sent.' });
@@ -930,7 +931,7 @@ async function serve(req, res) {
         if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         if (message.from !== user.id) return json(res, 403, { error: 'You can only edit or delete your own messages.' });
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
-        if (message.umbraNonce) return json(res, 400, { error: 'Umbra clip messages cannot be edited.' });
+        if (message.umbraNonce) return json(res, 400, { error: 'Shared clip messages cannot be edited.' });
         const envelopes = body.envelopes;
         const readyMembers = group.members.filter(id => canAccessGroup(group, id) && !!db.users.find(candidate => candidate.id === id)?.publicKey);
         if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Edited message must include your own encryption envelope and only updated group members.' });
@@ -1018,7 +1019,7 @@ async function serve(req, res) {
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
         const target = db.users.find(candidate => candidate.id === message.to);
         const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
-        if (message.umbraNonce) return json(res, 400, { error: 'Umbra clip messages cannot be edited.' });
+        if (message.umbraNonce) return json(res, 400, { error: 'Shared clip messages cannot be edited.' });
         const selfEnvelope = body.selfEnvelope;
         if (!target || !target.publicKey || !ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12 || (selfEnvelope && (!selfEnvelope.ciphertext || selfEnvelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.iv || '') || Buffer.from(selfEnvelope.iv, 'base64').length !== 12))) return json(res, 400, { error: 'Edited message envelope is invalid or too large.' });
         message.ciphertext = ciphertext; message.iv = iv; if (selfEnvelope) message.selfEnvelope = selfEnvelope; else delete message.selfEnvelope; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });
@@ -1026,7 +1027,7 @@ async function serve(req, res) {
       if (url.pathname === '/api/messages' && req.method === 'POST') {
         const target = db.users.find(u => u.key === usernameKey(body.to)); const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
         if (!target || isBlocked(user.id, target.id) || friendship(user.id, target.id)?.status !== 'accepted') return json(res, 403, { error: 'You can message friends after they accept your request.' });
-        if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Pulse client to enable encryption.' });
+        if (!target.publicKey) return json(res, 409, { error: 'Your friend needs to sign in to an updated Umbra client to enable encryption.' });
         const selfEnvelope = body.selfEnvelope;
         if (!ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12 || (selfEnvelope && (!selfEnvelope.ciphertext || selfEnvelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.iv || '') || Buffer.from(selfEnvelope.iv, 'base64').length !== 12))) return json(res, 400, { error: 'Message envelope is invalid or too large.' });
         const message = { id: randomBytes(12).toString('hex'), from: user.id, to: target.id, ciphertext, iv, ...(selfEnvelope ? { selfEnvelope } : {}), createdAt: new Date().toISOString() }; db.messages.push(message); persist();
@@ -1039,19 +1040,19 @@ async function serve(req, res) {
   const requested = resolve(webRoot, `.${pathname}`);
   const safe = requested === webRoot || requested.startsWith(webRoot + sep);
   const file = safe && existsSync(requested) && statSync(requested).isFile() ? requested : join(webRoot, 'index.html');
-  if (!existsSync(file)) { res.writeHead(503, { 'Content-Type': 'text/plain' }); res.end('Pulse web app is not built.'); return; }
+  if (!existsSync(file)) { res.writeHead(503, { 'Content-Type': 'text/plain' }); res.end('Umbra web app is not built.'); return; }
   const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
   res.writeHead(200, { 'Content-Type': types[extname(file)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin' });
   createReadStream(file).on('error', error => {
     console.error(`Failed reading web asset ${file}:`, error.message);
     if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Pulse could not read this page.');
+    res.end('Umbra could not read this page.');
   }).pipe(res);
 }
 createServer((req, res) => {
   void serve(req, res).catch(() => {
-    console.error('Pulse request failed unexpectedly.');
+    console.error('Umbra request failed unexpectedly.');
     if (res.headersSent) { res.destroy(); return; }
-    json(res, 500, { error: 'Pulse could not complete this request. Try again.' });
+    json(res, 500, { error: 'Umbra could not complete this request. Try again.' });
   });
-}).listen(port, '0.0.0.0', () => console.log(`Pulse web and API listening on 0.0.0.0:${port}`));
+}).listen(port, '0.0.0.0', () => console.log(`Umbra web and API listening on 0.0.0.0:${port}`));

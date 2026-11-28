@@ -1,6 +1,6 @@
-# Pulse voice on a VPS
+# Umbra voice on a VPS
 
-Pulse voice supports two callers per room. The signaling service runs on the VPS over WebSocket; Caddy provides TLS so clients connect with `wss://`. Audio normally travels peer-to-peer. Optional coturn relays audio when the callers' networks block a direct connection.
+Umbra voice supports two callers per room. The signaling service runs on the VPS over WebSocket; Caddy provides TLS so clients connect with `wss://`. Audio normally travels peer-to-peer. Optional coturn relays audio when the callers' networks block a direct connection.
 
 ## 1. Point a domain at the VPS
 
@@ -26,11 +26,11 @@ Create `/etc/pulse-voice.env` for the signaling server configuration:
 sudo nano /etc/pulse-voice.env
 ```
 
-Set the signaling port and the address of the Pulse account API (running on the same VPS by default):
+Set the signaling port and the address of the Umbra account API (running on the same VPS by default):
 
 ```ini
 PULSE_VOICE_PORT=8787
-# Pulse voice checks account sessions and friend relationships through the API.
+# Umbra voice checks account sessions and friend relationships through the API.
 PULSE_API_URL=http://127.0.0.1:8788
 ```
 
@@ -53,7 +53,7 @@ Put `deploy/Caddyfile` in Caddy's config (commonly `/etc/caddy/Caddyfile`) and r
 sudo systemctl reload caddy
 ```
 
-Allow inbound TCP ports 80 and 443 so Caddy can obtain and renew the certificate. In Pulse, set the signaling server to `wss://voice.example.com/voice`. Callers must sign in to Pulse and be accepted friends; no shared voice token is required.
+Allow inbound TCP ports 80 and 443 so Caddy can obtain and renew the certificate. In Umbra, set the signaling server to `wss://voice.example.com/voice`. Callers must sign in to Umbra and be accepted friends; no shared voice token is required.
 
 For local development, `.env.example` shows how to prefill the VPS URL in a client build. Copy it to `.env.local` and replace the example domain, or enter the URL directly in the voice panel.
 
@@ -81,6 +81,6 @@ sudo ufw allow 49160:49200/udp
 ## Scope and security
 
 - This is a 1:1 WebRTC milestone, not the later multi-user SFU.
-- The signaling server checks Pulse sessions and accepted-friend relationships before admitting a caller to a DM voice room.
+- The signaling server checks Umbra sessions and accepted-friend relationships before admitting a caller to a DM voice room.
 - WebRTC encrypts media in transit. This prototype does not authenticate device identities, so it does not yet meet the spec's full end-to-end encryption design.
 - Voice and chat room names are still demo identifiers. The text chat itself is local sample data.

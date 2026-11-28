@@ -27,5 +27,5 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running Pulse");
+        .expect("error while running Umbra");
 }

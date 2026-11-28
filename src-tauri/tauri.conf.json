@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Pulse",
-  "version": "0.3.18-4",
+  "productName": "Umbra Chat",
+  "mainBinaryName": "UmbraChat",
+  "version": "0.3.18-5",
   "identifier": "com.pulse.client",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "Pulse",
+        "title": "Umbra",
         "width": 1280,
         "height": 820,
         "minWidth": 640,
@@ -25,6 +26,7 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Umbra",
     "createUpdaterArtifacts": true,
     "targets": [
       "nsis",
@@ -36,7 +38,15 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "uninstallerIcon": "icons/icon.ico"
+        "uninstallerIcon": "installer/uninstall.ico",
+        "sidebarImage": "installer/nsis-sidebar.bmp",
+        "headerImage": "installer/nsis-header.bmp",
+        "uninstallerHeaderImage": "installer/nsis-uninstall-header.bmp"
+      },
+      "wix": {
+        "upgradeCode": "f489e72e-67e7-532a-9abe-1104ee33e0b3",
+        "bannerPath": "installer/msi-banner.bmp",
+        "dialogImagePath": "installer/msi-dialog.bmp"
       }
     }
   },

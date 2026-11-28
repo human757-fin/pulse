@@ -53,8 +53,8 @@ async function handle(client, message) {
       const friendId = String(message.friendId || '');
       const roomType = message.roomType === 'server' ? 'server' : message.roomType === 'group' ? 'group' : 'dm';
       const authToken = String(message.authToken || '').trim();
-      if (message.voiceProtocol !== voiceProtocol) { send(client, { type: 'error', message: 'Voice versions do not match. Update Pulse on both devices and restart the Pulse server.' }); return; }
-      if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Pulse and select an accepted friend before calling.' }); return; }
+      if (message.voiceProtocol !== voiceProtocol) { send(client, { type: 'error', message: 'Voice versions do not match. Update Umbra on both devices and restart the Umbra server.' }); return; }
+      if (!roomName || !friendId || !authToken) { send(client, { type: 'error', message: 'Sign in to Umbra and select an accepted friend before calling.' }); return; }
       client.joining = true;
       let account;
       try {
@@ -66,7 +66,7 @@ async function handle(client, message) {
         });
         if (response.ok) account = (await response.json()).user;
       } catch {
-        send(client, { type: 'error', message: 'Pulse could not verify your account. Try again in a moment.' });
+        send(client, { type: 'error', message: 'Umbra could not verify your account. Try again in a moment.' });
         return;
       } finally { client.joining = false; }
       if (!account?.id || !account?.username) { send(client, { type: 'error', message: 'Sign in again and make sure you are friends before calling.' }); return; }
@@ -120,7 +120,7 @@ function consume(client, chunk) {
   }
 }
 
-const server = createServer((_, response) => { response.writeHead(404); response.end('Pulse voice signaling'); });
+const server = createServer((_, response) => { response.writeHead(404); response.end('Umbra voice signaling'); });
 server.on('upgrade', (request, socket) => {
   const key = request.headers['sec-websocket-key'];
   if (new URL(request.url || '/', 'http://localhost').pathname !== '/voice' || request.headers.upgrade?.toLowerCase() !== 'websocket' || !key) { socket.destroy(); return; }
@@ -132,4 +132,4 @@ server.on('upgrade', (request, socket) => {
   socket.on('error', () => leave(client));
 });
 
-server.listen(port, '0.0.0.0', () => console.log(`Pulse voice signaling listening on ws://0.0.0.0:${port}`));
+server.listen(port, '0.0.0.0', () => console.log(`Umbra voice signaling listening on ws://0.0.0.0:${port}`));

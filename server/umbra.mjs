@@ -80,8 +80,8 @@ export function createUmbra({ db, persist, json, sessionUser, friendship, isBloc
     const method = req.method;
     if (path === '/pairings' && method === 'POST') {
       for (const [id, pairing] of pairings) if (pairing.expiresAt <= Date.now()) pairings.delete(id);
-      if (typeof body.proofHash !== 'string' || !secretPattern.test(body.proofHash)) return reject(400, 'Invalid Umbra pairing request.');
-      if (pairings.size >= 1000) return reject(429, 'Too many pending Umbra connections. Try again later.');
+      if (typeof body.proofHash !== 'string' || !secretPattern.test(body.proofHash)) return reject(400, 'Invalid Umbra Clips pairing request.');
+      if (pairings.size >= 1000) return reject(429, 'Too many pending Umbra Clips connections. Try again later.');
       const id = randomId();
       pairings.set(id, { proofHash: body.proofHash, expiresAt: Date.now() + 300_000 });
       return respond(201, { id });
@@ -91,12 +91,12 @@ export function createUmbra({ db, persist, json, sessionUser, friendship, isBloc
     if (pairingRequest) {
       const [, id, claim] = pairingRequest;
       const pairing = pairings.get(id);
-      if (!pairing || pairing.expiresAt <= Date.now()) return reject(404, 'This Umbra connection expired. Start again in Umbra.');
+      if (!pairing || pairing.expiresAt <= Date.now()) return reject(404, 'This Umbra Clips connection expired. Start again in Umbra Clips.');
       if (claim && method === 'GET') {
-        if (!secretPattern.test(bearer(req)) || digest(bearer(req)) !== pairing.proofHash) return reject(403, 'Invalid Umbra pairing proof.');
+        if (!secretPattern.test(bearer(req)) || digest(bearer(req)) !== pairing.proofHash) return reject(403, 'Invalid Umbra Clips pairing proof.');
         if (pairing.link && !pairing.claimed) {
-          if (!currentDestination(pairing.link)) return reject(409, 'This Pulse chat or its encryption keys changed. Start another connection.');
-          if (db.umbraLinks.filter(link => link.userId === pairing.link.userId && link.expiresAt > Date.now()).length >= 10) return reject(409, 'Disconnect an Umbra device in Pulse settings first.');
+          if (!currentDestination(pairing.link)) return reject(409, 'This Umbra chat or its encryption keys changed. Start another connection.');
+          if (db.umbraLinks.filter(link => link.userId === pairing.link.userId && link.expiresAt > Date.now()).length >= 10) return reject(409, 'Disconnect an Umbra Clips device in Umbra settings first.');
           if (!db.umbraLinks.some(link => link.id === pairing.link.id)) db.umbraLinks.push(pairing.link);
           persist();
           pairing.claimed = true;
@@ -105,14 +105,14 @@ export function createUmbra({ db, persist, json, sessionUser, friendship, isBloc
       }
       const user = sessionUser(req);
       if (!user) return reject(401, 'Sign in to continue.');
-      if (pairing.result) return reject(409, 'This Umbra connection has already been approved.');
+      if (pairing.result) return reject(409, 'This Umbra Clips connection has already been approved.');
       if (!claim && method === 'GET') return respond(200, { targets: targets(user) });
       if (!claim && method === 'POST') {
         const target = targets(user).find(item => item.kind === body.kind && item.id === body.targetId);
         if (!target || JSON.stringify(target.members) !== JSON.stringify(body.members)) return reject(409, 'This chat or its encryption keys changed. Reload and try again.');
-        if (!validEnvelope(body.sealed) || !idPattern.test(body.linkNonce || '')) return reject(400, 'Invalid encrypted Umbra connection.');
+        if (!validEnvelope(body.sealed) || !idPattern.test(body.linkNonce || '')) return reject(400, 'Invalid encrypted Umbra Clips connection.');
         db.umbraLinks = db.umbraLinks.filter(link => link.expiresAt > Date.now());
-        if (db.umbraLinks.filter(link => link.userId === user.id).length >= 10) return reject(409, 'Disconnect an Umbra device in Pulse settings first.');
+        if (db.umbraLinks.filter(link => link.userId === user.id).length >= 10) return reject(409, 'Disconnect an Umbra Clips device in Umbra settings first.');
         const linkId = randomId();
         const token = randomBytes(32).toString('hex');
         const expiresAt = Date.now() + 90 * day;
@@ -158,46 +158,46 @@ export function createUmbra({ db, persist, json, sessionUser, friendship, isBloc
         const user = sessionUser(req);
         if (!user) return reject(401, 'Sign in to continue.');
         const link = db.umbraLinks.find(link => link.id === linkId && link.userId === user.id && link.expiresAt > now);
-        if (!link || !currentDestination(link)) return reject(409, 'Reconnect Umbra to this chat first.');
+        if (!link || !currentDestination(link)) return reject(409, 'Reconnect Umbra Clips to this chat first.');
         const existing = libraryRequests.get(requestId);
         if (method === 'GET' && existing?.linkId === linkId) return respond(200, existing.result ? { result: existing.result } : { pending: true });
-        if (method !== 'POST') return reject(404, 'The Umbra request expired. Check that Umbra is running and try again.');
-        if (!validEnvelope(body.command) || existing) return reject(400, 'Invalid Umbra request.');
-        if (libraryRequests.size >= 2000 || [...libraryRequests.values()].filter(request => request.linkId === linkId && !request.result).length >= 4) return reject(429, 'Too many pending Umbra requests. Try again shortly.');
+        if (method !== 'POST') return reject(404, 'The Umbra Clips request expired. Check that Umbra Clips is running and try again.');
+        if (!validEnvelope(body.command) || existing) return reject(400, 'Invalid Umbra Clips request.');
+        if (libraryRequests.size >= 2000 || [...libraryRequests.values()].filter(request => request.linkId === linkId && !request.result).length >= 4) return reject(429, 'Too many pending Umbra Clips requests. Try again shortly.');
         libraryRequests.set(requestId, { linkId, command: body.command, expiresAt: now + 30_000 });
         return respond(201, { pending: true });
       }
       const link = getLink(req);
-      if (!link) return reject(401, 'Reconnect Umbra to Pulse.');
+      if (!link) return reject(401, 'Reconnect Umbra Clips to Umbra.');
       const requestId = desktopLibrary[1];
       if (!requestId && method === 'GET') {
         const commands = [...libraryRequests].filter(([, item]) => item.linkId === link.id && !item.result).map(([id, item]) => ({ id, command: item.command }));
         return respond(200, { commands });
       }
       const command = libraryRequests.get(requestId);
-      if (method !== 'POST' || command?.linkId !== link.id) return reject(404, 'Umbra request expired.');
-      if (!validEnvelope(body.result)) return reject(400, 'Invalid Umbra response.');
+      if (method !== 'POST' || command?.linkId !== link.id) return reject(404, 'Umbra Clips request expired.');
+      if (!validEnvelope(body.result)) return reject(400, 'Invalid Umbra Clips response.');
       command.result ||= body.result;
       return respond(200, { ok: true });
     }
 
     const clipRequest = path.match(/^\/clips\/([a-f0-9]{32})(\/publish)?$/);
-    if (!clipRequest) return reject(404, 'Umbra route not found.');
+    if (!clipRequest) return reject(404, 'Umbra Clips route not found.');
     const link = getLink(req);
-    if (!link) return reject(401, 'Reconnect Umbra to Pulse.');
+    if (!link) return reject(401, 'Reconnect Umbra Clips to Umbra.');
     const target = currentDestination(link);
-    if (!target) return reject(409, 'This Pulse chat or its encryption keys changed. Reconnect Umbra to approve the destination again.');
+    if (!target) return reject(409, 'This Umbra chat or its encryption keys changed. Reconnect Umbra Clips to approve the destination again.');
     const [, jobId, publish] = clipRequest;
     const items = db.attachments.filter(item => item.umbraLink === link.id && item.umbraJob === jobId);
     const sent = items.some(item => item.publishedAt);
     if (!publish && method === 'GET') return respond(200, { sent });
-    if (method !== 'POST') return reject(404, 'Umbra route not found.');
+    if (method !== 'POST') return reject(404, 'Umbra Clips route not found.');
     if (sent) return respond(200, { sent });
 
     if (!publish) {
       pruneUploads();
       const { id, size, ivPrefix } = body;
-      if (!idPattern.test(id || '') || !Number.isSafeInteger(size) || size < 1 || size > maxBytes || !validBinary(ivPrefix, 8)) return reject(400, 'Invalid Umbra clip upload.');
+      if (!idPattern.test(id || '') || !Number.isSafeInteger(size) || size < 1 || size > maxBytes || !validBinary(ivPrefix, 8)) return reject(400, 'Invalid Umbra Clips clip upload.');
       const existing = db.attachments.find(item => item.id === id);
       if (existing) {
         if (existing.umbraLink === link.id && existing.umbraJob === jobId && existing.size === size && existing.ivPrefix === ivPrefix) return respond(200, { sent: false });
@@ -208,7 +208,7 @@ export function createUmbra({ db, persist, json, sessionUser, friendship, isBloc
         db.attachments = db.attachments.filter(candidate => candidate !== item);
         removeUpload(item.id);
       }
-      if (pending.filter(item => item.umbraJob !== jobId).length >= 8) return reject(429, 'Too many unfinished Umbra uploads. Try again later.');
+      if (pending.filter(item => item.umbraJob !== jobId).length >= 8) return reject(429, 'Too many unfinished Umbra Clips uploads. Try again later.');
       const destination = target.kind === 'dm' ? { to: target.id } : { groupId: target.id, recipients: target.members.map(member => member.id) };
       db.attachments.push({ id, from: link.userId, ...destination, umbraLink: link.id, umbraJob: jobId, size, ivPrefix, chunkSize, chunkCount: Math.ceil(size / chunkSize), chunks: [], createdAt: new Date().toISOString() });
       persist();
