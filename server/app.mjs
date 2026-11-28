@@ -6,6 +6,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { readBody, RequestBodyError } from './request-body.mjs';
+import { createUmbra } from './umbra.mjs';
 
 const scrypt = promisify(scryptCb);
 const port = Number(process.env.PULSE_WEB_PORT || process.env.port2 || 8788);
@@ -78,7 +79,7 @@ function presenceState(user) {
   return !user.lastActivityAt || Date.now() - user.lastActivityAt > 5 * 60_000 ? 'idle' : 'online';
 }
 function publicUser(user) { return { id: user.id, username: user.username, displayName: user.displayName || user.username, profileVersion: user.profileVersion || '', createdAt: user.createdAt, presence: presenceState(user), presencePreference: user.presence || 'online', customStatus: user.customStatus || '' }; }
-function accountUser(user) { return { ...publicUser(user), email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
+function accountUser(user) { return { ...publicUser(user), encryptionReady: !!user.publicKey, email: user.email || '', emailVerified: !!user.emailVerified, twoFactorEnabled: !!user.twoFactorEnabled, authenticatorEnabled: !!user.totpEnabled }; }
 function profileData(user) { return { displayName: user.displayName || user.username, bio: user.bio || '', avatar: user.avatar || '', banner: user.banner || '' }; }
 function sessionUser(req) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -106,6 +107,7 @@ function canAccessGroup(group, userId) {
 }
 function canAccessAttachment(item, userId, uploading = false) {
   if (!item) return false;
+  if (item.umbraLink && (uploading || !item.publishedAt)) return false;
   if (!item.groupId) return (uploading ? item.from === userId : item.from === userId || item.to === userId) && !isBlocked(item.from, item.to) && friendship(item.from, item.to)?.status === 'accepted';
   const group = db.groups.find(group => group.id === item.groupId && group.members.includes(userId));
   if (!group || !canAccessGroup(group, userId) || !(item.recipients || []).includes(userId)) return false;
@@ -278,6 +280,8 @@ async function sendEmailCode(email, purpose, userId = '', id = randomBytes(24).t
   if (emailRequestWindows.size > 10000) for (const [address, item] of emailRequestWindows) { if (now - item.windowStart > 2 * 60 * 60_000) emailRequestWindows.delete(address); if (emailRequestWindows.size <= 8000) break; }
   return id;
 }
+const umbra = createUmbra({ db, persist, json, sessionUser, friendship, isBlocked, canAccessGroup, hasServerPermission, chunkSize: attachmentChunkBytes, maxBytes: maxAttachmentBytes, removeUpload: id => rmSync(join(attachmentDir, id), { recursive: true, force: true }) });
+
 async function serve(req, res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -285,8 +289,9 @@ async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
-    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login', '/api/auth/password-reset', '/api/auth/password-reset/complete', '/api/auth/password-change'].includes(url.pathname)) {
-      const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
+    const startUmbraPairing = url.pathname === '/api/umbra/pairings' && req.method === 'POST';
+    if (startUmbraPairing || ['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login', '/api/auth/password-reset', '/api/auth/password-reset/complete', '/api/auth/password-change'].includes(url.pathname)) {
+      const key = `${startUmbraPairing ? 'umbra:' : ''}${req.socket.remoteAddress || 'unknown'}`; const now = Date.now();
       const entry = requestWindows.get(key) || { start: now, count: 0 };
       if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
       entry.count += 1; requestWindows.set(key, entry);
@@ -307,11 +312,13 @@ async function serve(req, res) {
         return json(res, 503, { error: 'Pulse could not check GitHub for updates.' });
       }
     }
-    const attachmentChunk = url.pathname.match(/^\/api\/attachments\/([a-f0-9]{32})\/(\d+)$/);
+    const attachmentChunk = url.pathname.match(/^\/api\/(attachments|umbra\/clips)\/([a-f0-9]{32})\/(\d+)$/);
     if (attachmentChunk && req.method === 'PUT') {
-      const user = sessionUser(req); const [, id, rawIndex] = attachmentChunk; const item = db.attachments.find(file => file.id === id);
-      if (!user) return json(res, 401, { error: 'Sign in to continue.' });
-      if (!item || !Array.isArray(item.chunks) || !canAccessAttachment(item, user.id, true)) return json(res, 404, { error: 'Attachment upload not found.' });
+      const [, route, id, rawIndex] = attachmentChunk; const item = db.attachments.find(file => file.id === id);
+      const scoped = route === 'umbra/clips';
+      const user = scoped ? undefined : sessionUser(req);
+      if (!scoped && !user) return json(res, 401, { error: 'Sign in to continue.' });
+      if (!item || !Array.isArray(item.chunks) || !(scoped ? umbra.canUpload(req, item) : canAccessAttachment(item, user.id, true))) return json(res, 404, { error: 'Attachment upload not found.' });
       const index = Number(rawIndex);
       if (!Number.isSafeInteger(index) || index < 0 || index >= item.chunkCount) return json(res, 400, { error: 'Attachment chunk index is invalid.' });
       if (item.chunks.includes(index)) return json(res, 200, { ok: true });
@@ -323,6 +330,8 @@ async function serve(req, res) {
       try {
         await pipeline(req, limit, createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }));
         if (received !== expectedSize) throw new Error('Attachment chunk was incomplete.');
+        if (scoped && !umbra.canUpload(req, item)) throw new Error('The Umbra attachment upload is no longer authorized.');
+        if (item.chunks.includes(index)) { rmSync(temporaryPath, { force: true }); return json(res, 200, { ok: true }); }
         renameSync(temporaryPath, finalPath); item.chunks.push(index); persist();
         return json(res, 201, { ok: true });
       } catch (error) {
@@ -332,6 +341,7 @@ async function serve(req, res) {
     }
     try {
       const body = ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readBody(req) : {};
+      if (url.pathname.startsWith('/api/umbra/')) return umbra.handle(req, res, url.pathname.slice('/api/umbra'.length), body);
       if (url.pathname === '/api/auth/password-reset' && req.method === 'POST') {
         if (typeof body.email !== 'string' || Object.keys(body).some(key => key !== 'email')) return json(res, 400, { error: 'Enter your account email address.' });
         const email = emailKey(body.email);
@@ -367,6 +377,7 @@ async function serve(req, res) {
         if (user.passwordHash !== previousHash) return json(res, 400, { error: 'Request a new reset code and try again.' });
         user.salt = salt; user.passwordHash = passwordHash;
         db.sessions = db.sessions.filter(session => session.userId !== user.id);
+        umbra.revokeUser(user.id);
         for (const [id, item] of emailChallenges) if (item.userId === user.id) emailChallenges.delete(id);
         for (const [id, item] of totpLoginChallenges) if (item.userId === user.id) totpLoginChallenges.delete(id);
         persist();
@@ -488,6 +499,7 @@ async function serve(req, res) {
         if (user.passwordHash !== previousHash) return json(res, 409, { error: 'Your password changed. Sign in again.' });
         user.salt = salt; user.passwordHash = passwordHash;
         db.sessions = db.sessions.filter(session => session.userId !== user.id);
+        umbra.revokeUser(user.id);
         for (const [id, item] of emailChallenges) if (item.userId === user.id) emailChallenges.delete(id);
         for (const [id, item] of totpLoginChallenges) if (item.userId === user.id) totpLoginChallenges.delete(id);
         persist();
@@ -918,6 +930,7 @@ async function serve(req, res) {
         if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         if (message.from !== user.id) return json(res, 403, { error: 'You can only edit or delete your own messages.' });
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
+        if (message.umbraNonce) return json(res, 400, { error: 'Umbra clip messages cannot be edited.' });
         const envelopes = body.envelopes;
         const readyMembers = group.members.filter(id => canAccessGroup(group, id) && !!db.users.find(candidate => candidate.id === id)?.publicKey);
         if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes) || !envelopes[user.id] || Object.keys(envelopes).length > readyMembers.length || Object.keys(envelopes).some(id => !readyMembers.includes(id))) return json(res, 400, { error: 'Edited message must include your own encryption envelope and only updated group members.' });
@@ -929,7 +942,7 @@ async function serve(req, res) {
         if (!group) return json(res, 404, { error: 'Group chat not found.' });
         if (!canAccessGroup(group, user.id)) return json(res, 403, { error: 'This channel is private.' });
         const items = db.messages.filter(message => message.groupId === group.id).slice(-200);
-        return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, encryptionVersion: 1 } : { encryptionVersion: 2 }), createdAt: message.createdAt, ...(message.editedAt ? { editedAt: message.editedAt } : {}) }; }) });
+        return json(res, 200, { messages: items.map(message => { const sender = db.users.find(candidate => candidate.id === message.from); const envelope = message.envelopes?.[user.id]; return { id: message.id, from: publicUser(sender), ...(envelope ? { ...envelope, ...(message.umbraNonce ? { encryptionVersion: 3, umbraNonce: message.umbraNonce } : { encryptionVersion: 1 }) } : { encryptionVersion: 2 }), createdAt: message.createdAt, ...(message.editedAt ? { editedAt: message.editedAt } : {}) }; }) });
       }
       if (groupMessages && req.method === 'POST') {
         const group = db.groups.find(item => item.id === groupMessages[1] && item.members.includes(user.id));
@@ -995,7 +1008,7 @@ async function serve(req, res) {
         }
         if (markedRead) persist();
         const items = db.messages.filter(m => (m.from === user.id && m.to === target.id) || (m.from === target.id && m.to === user.id)).slice(-100);
-        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? (m.from === user.id && m.selfEnvelope ? { ...m.selfEnvelope, selfCopy: true, encryptionVersion: 1 } : { ciphertext: m.ciphertext, iv: m.iv, encryptionVersion: 1 }) : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt, ...(m.editedAt ? { editedAt: m.editedAt } : {}) })) });
+        return json(res, 200, { messages: items.map(m => ({ id: m.id, from: publicUser(db.users.find(u => u.id === m.from)), ...(m.ciphertext ? { ...(m.from === user.id && m.selfEnvelope ? { ...m.selfEnvelope, selfCopy: true } : { ciphertext: m.ciphertext, iv: m.iv }), ...(m.umbraNonce ? { encryptionVersion: 3, umbraNonce: m.umbraNonce } : { encryptionVersion: 1 }) } : { text: m.text, encryptionVersion: 0 }), createdAt: m.createdAt, ...(m.editedAt ? { editedAt: m.editedAt } : {}) })) });
       }
       const directMessageAction = url.pathname.match(/^\/api\/messages\/([a-f0-9]{24})$/);
       if (directMessageAction && ['PATCH', 'DELETE'].includes(req.method)) {
@@ -1005,6 +1018,7 @@ async function serve(req, res) {
         if (req.method === 'DELETE') { db.messages = db.messages.filter(item => item.id !== message.id); persist(); return json(res, 200, { ok: true }); }
         const target = db.users.find(candidate => candidate.id === message.to);
         const ciphertext = String(body.ciphertext || ''); const iv = String(body.iv || '');
+        if (message.umbraNonce) return json(res, 400, { error: 'Umbra clip messages cannot be edited.' });
         const selfEnvelope = body.selfEnvelope;
         if (!target || !target.publicKey || !ciphertext || ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(iv) || Buffer.from(iv, 'base64').length !== 12 || (selfEnvelope && (!selfEnvelope.ciphertext || selfEnvelope.ciphertext.length > 1_000_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.ciphertext) || !/^[A-Za-z0-9+/]+={0,2}$/.test(selfEnvelope.iv || '') || Buffer.from(selfEnvelope.iv, 'base64').length !== 12))) return json(res, 400, { error: 'Edited message envelope is invalid or too large.' });
         message.ciphertext = ciphertext; message.iv = iv; if (selfEnvelope) message.selfEnvelope = selfEnvelope; else delete message.selfEnvelope; message.editedAt = new Date().toISOString(); persist(); return json(res, 200, { ok: true });

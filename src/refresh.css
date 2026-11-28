@@ -169,6 +169,16 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .auth-subtitle { color: var(--muted); font-size: 15px; }
 .auth-form { gap: 20px; }
 .auth-form label { color: var(--muted); font-size: 14px; }
+#umbra-approval select { min-height: 44px; width: 100%; padding: 0 11px; background: var(--canvas); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; }
+#umbra-approval [role=status] { color: var(--muted); font-size: 14px; }
+#umbra-links { margin-top: 14px; }
+.umbra-picker-button svg { display: block; width: 23px; height: 23px; }
+#umbra-picker { width: min(92vw, 470px); max-height: 90vh; padding: 24px; border: 1px solid var(--line); border-radius: 13px; color: var(--text); background: var(--surface); }
+#umbra-picker::backdrop { background: #080910b3; }
+#umbra-picker h2 { margin: 0 0 16px; font-size: 20px; }
+#umbra-picker select { width: 100%; min-width: 0; }
+#umbra-picker [role=status] { color: var(--muted); }
+#umbra-picker [method=dialog] { margin-top: 16px; }
 .auth-form input { min-height: 48px; padding: 12px; background: var(--canvas); border-color: var(--line); border-radius: 8px; font-size: 16px; }
 .auth-form button[type=submit] { min-height: 48px; background: var(--accent); color: var(--on-accent); font-size: 15px; font-weight: 600; }
 .form-error, .settings-form-error, #server-panel-error { color: #ffadb7; font-size: 13px; }

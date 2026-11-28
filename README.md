@@ -32,6 +32,14 @@ Open `http://localhost:8788` to create an account in a browser. Calls use your P
 
 Email verification and optional email-code or authenticator-app two-factor authentication use the Resend email API and TOTP. Set `RESEND_API_KEY` and `PULSE_EMAIL_FROM` in the environment before starting `npm run web-server`; verify the sender domain in Resend. Existing accounts can add and verify an email or configure an authenticator app under **Settings → Sign-in security**. New accounts verify their email before creation.
 
+## Umbra clip sharing
+
+In Umbra, open **Settings → Pulse → Sign in with Pulse**. Approve a friend DM, group DM, or server text channel. You can also copy Umbra’s connection code and paste it into **Pulse → Settings → Sign-in security** on the device that holds your chat encryption key. This settings section also lets you disconnect an Umbra device.
+
+Use **Send an Umbra clip** in the linked Pulse chat to choose a recent clip while Umbra is running on the capture PC. Pulse loads clip names and sizes for the picker. Umbra streams the selected file as an encrypted attachment. To share subsequent short and long replay saves automatically, enable the switch in Umbra’s Pulse settings.
+
+Update the Pulse server and web build together. Pulse desktop clients that open Umbra shares or approve a connection from Settings need the updated frontend as well. The Pulse server update keeps existing accounts and messages in the configured data folder.
+
 ## VPS deployment
 
 See [VOICE_SETUP.md](VOICE_SETUP.md) for a direct VPS setup and [deploy/PTERODACTYL.md](deploy/PTERODACTYL.md) for Pterodactyl with GitHub updates and Cloudflare Tunnel.

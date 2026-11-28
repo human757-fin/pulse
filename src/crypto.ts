@@ -32,16 +32,17 @@ async function saveIdentity(record: IdentityRecord): Promise<void> {
   });
 }
 
-export async function initializeIdentity(userId: string, uploadPublicKey: (key: JsonWebKey) => Promise<void>): Promise<void> {
+export async function initializeIdentity(userId: string, uploadPublicKey: (key: JsonWebKey) => Promise<void>, registeredKey?: JsonWebKey): Promise<void> {
   if (!crypto.subtle || !indexedDB) throw new Error('This device does not support Pulse encryption. Update Microsoft Edge WebView2 or use a current browser.');
   let record = await storedIdentity(userId);
+  if (registeredKey && (!record || keyFingerprint(record.publicKey) !== keyFingerprint(registeredKey))) throw new Error('Approve Umbra from the Pulse app or browser that already holds your chat encryption key.');
   if (!record) {
     const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
     record = { userId, pair, publicKey: await crypto.subtle.exportKey('jwk', pair.publicKey) };
     await saveIdentity(record);
   }
   identity = record;
-  await uploadPublicKey(record.publicKey);
+  if (!registeredKey) await uploadPublicKey(record.publicKey);
 }
 
 function keyFingerprint(key: JsonWebKey): string {
@@ -90,12 +91,19 @@ export async function encryptMessage(ownId: string, friendId: string, plaintext:
   return { iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) };
 }
 
-export async function decryptMessage(ownId: string, friendId: string, iv: string, ciphertext: string, fetchPeerKey: PeerKeyFetcher): Promise<string> {
+export async function decryptMessage(ownId: string, friendId: string, iv: string, ciphertext: string, fetchPeerKey: PeerKeyFetcher, umbraNonce?: string): Promise<string> {
   const remote = await peerKey(friendId, fetchPeerKey);
-  const key = await deriveAesKey(friendId, remote, 'pulse-dm-text-v1', [ownId, friendId], false);
+  const key = await deriveAesKey(friendId, remote, umbraNonce ? `pulse-umbra-clip-message-v1:${umbraNonce}` : 'pulse-dm-text-v1', [ownId, friendId], false);
   const aad = encoder.encode(`pulse-dm-v1:${[ownId, friendId].sort().join(':')}`);
   const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv), additionalData: aad }, key, fromBase64(ciphertext));
   return new TextDecoder().decode(plaintext);
+}
+
+export async function umbraEnvelopeKey(ownId: string, memberId: string, publicKey: JsonWebKey, linkNonce: string) {
+  if (memberId === ownId && (!identity || keyFingerprint(identity.publicKey) !== keyFingerprint(publicKey))) throw new Error('Approve Umbra on the Pulse device that has your current chat encryption key.');
+  const remote = await peerKey(memberId, async () => publicKey);
+  const key = await deriveAesKey(memberId, remote, `pulse-umbra-clip-message-v1:${linkNonce}`, [ownId, memberId], true);
+  return toBase64(new Uint8Array(await crypto.subtle.exportKey('raw', key)));
 }
 
 export async function encryptFile(ownId: string, friendId: string, attachmentId: string, plaintext: ArrayBuffer, fetchPeerKey: PeerKeyFetcher): Promise<{ iv: string; ciphertext: string }> {

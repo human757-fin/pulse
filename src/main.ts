@@ -8,10 +8,11 @@ import QRCode from 'qrcode';
 import packageInfo from '../package.json';
 import { createAttachmentCipher, createGroupAttachmentCipher, decryptFile, decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
 import { VoiceClient, type ScreenShareSettings, type VoiceParticipant, type VoiceState, type VoiceUpdate } from './voice';
+import { mountUmbraSettings, readUmbraConnection, showUmbraApproval, showUmbraPicker } from './umbra';
 
 type Presence = 'online' | 'idle' | 'away' | 'dnd' | 'offline';
 type User = { id: string; username: string; email?: string; emailVerified?: boolean; twoFactorEnabled?: boolean; authenticatorEnabled?: boolean; displayName?: string; bio?: string; profileVersion?: string; avatar?: string; banner?: string; presence?: Presence; presencePreference?: Exclude<Presence, 'offline'>; customStatus?: string; encryptionReady?: boolean };
-type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; selfCopy?: boolean; encryptionVersion: number };
+type ChatMessage = { id: string; from: User; text: string; createdAt: string; editedAt?: string; iv?: string; ciphertext?: string; selfCopy?: boolean; encryptionVersion: number; umbraNonce?: string };
 type Friends = { friends: User[]; incoming: User[]; outgoing: User[] };
 type GroupChat = { id: string; name: string; members: User[] };
 type ServerChannel = { id: string; name: string; categoryId?: string; private?: boolean; allowedUserIds?: string[]; allowedRoleIds?: string[]; accessible?: boolean; type: 'text' | 'voice' };
@@ -28,6 +29,8 @@ const hasDraggedFiles = (event: DragEvent) => Array.from(event.dataTransfer?.typ
 document.addEventListener('dragover', event => { if (hasDraggedFiles(event)) event.preventDefault(); }, true);
 document.addEventListener('drop', event => { if (hasDraggedFiles(event)) event.preventDefault(); }, true);
 const runningInTauri = window.location.protocol === 'tauri:' || '__TAURI_INTERNALS__' in window;
+let umbraConnection = readUmbraConnection();
+if (umbraConnection) sessionStorage.setItem('pulse.umbra-protect-key', '1');
 const apiBase = (import.meta.env.VITE_PULSE_API_URL || (runningInTauri ? 'https://pulse.overclockd.shop' : window.location.origin)).replace(/\/$/, '');
 let token = localStorage.getItem('pulse.authToken') || '';
 localStorage.removeItem('pulse.voiceToken');
@@ -69,7 +72,7 @@ let outgoingCallInviteId = '';
 let voiceMuted = false;
 let voiceDeafened = false;
 let unreadCounts: Record<string, number> = {};
-let authMode: 'login' | 'signup' = 'signup';
+let authMode: 'login' | 'signup' = umbraConnection ? 'login' : 'signup';
 let authPhase: 'credentials' | 'verify-email' | 'verify-two-factor' = 'credentials';
 let pendingAuth: { challengeId: string; email?: string; username?: string; password?: string; method?: 'email' | 'totp' } | undefined;
 let authError = '';
@@ -162,6 +165,8 @@ const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.sta
 voice.setPreferredAudioDevices(audioInputDeviceId, audioOutputDeviceId);
 const esc = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const presenceLabel = (presence?: Presence) => ({ online: 'Online', idle: 'Idle', away: 'Away', dnd: 'Do Not Disturb', offline: 'Offline' }[presence || 'offline']);
+const groupChatIcon = '<span class="group-chat-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a5 5 0 0 1 5-5h2a5 5 0 0 1 5 5v1m1-13a3 3 0 0 1 0 6m2 2a5 5 0 0 1 3 4v1"/></svg></span>';
+const pulseGlyph = '<img src="/pulse-mark.svg" width="24" height="24" alt="">';
 const avatarWithPresence = (user: User, className = '') => avatar(user, className).replace('</span>', `<i class="presence-mark ${user.presence || 'offline'}" title="${presenceLabel(user.presence)}" aria-label="${presenceLabel(user.presence)}"></i></span>`);
 const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const signalUrl = () => localStorage.getItem('pulse.signalUrl') || import.meta.env.VITE_PULSE_SIGNAL_URL || (runningInTauri ? 'wss://voice.overclockd.shop/voice' : window.location.hostname.startsWith('pulse.') ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname.replace(/^pulse\./, 'voice.')}/voice` : 'ws://127.0.0.1:8787');
@@ -214,6 +219,7 @@ function renderPasswordReset() {
 }
 
 function renderAuth() {
+  document.querySelector<HTMLDialogElement>('#umbra-picker')?.close();
   app.classList.remove('settings-view');
   if (passwordResetOpen) { renderPasswordReset(); return; }
   const verification = authPhase !== 'credentials';
@@ -387,7 +393,10 @@ function readImage(file: File | undefined, maxBytes: number, label: string, allo
 }
 const fetchFriendKey = async (userId: string) => (await api<{ publicKey: JsonWebKey }>(`/keys/${encodeURIComponent(userId)}`)).publicKey;
 async function initializeAccountCrypto(user: User) {
-  await initializeIdentity(user.id, async publicKey => { await api('/keys', { method: 'POST', body: JSON.stringify({ publicKey }) }); });
+  cryptoReady = false;
+  const protectKey = umbraConnection || sessionStorage.getItem('pulse.umbra-protect-key');
+  const registeredKey = protectKey && user.encryptionReady ? await fetchFriendKey(user.id) : undefined;
+  await initializeIdentity(user.id, async publicKey => { await api('/keys', { method: 'POST', body: JSON.stringify({ publicKey }) }); }, registeredKey);
   cryptoReady = true;
 }
 async function refreshMessages(target: User | GroupChat | undefined = activeGroup || activeFriend) {
@@ -402,15 +411,17 @@ async function refreshMessages(target: User | GroupChat | undefined = activeGrou
     const from = { ...message.from, displayName: senderProfile.displayName || message.from.displayName, avatar: senderProfile.avatar, banner: senderProfile.banner, bio: senderProfile.bio };
     message = { ...message, from };
     if (message.encryptionVersion === 2) return { ...message, text: 'This message was sent before your account had group encryption set up.' };
-    if (message.encryptionVersion !== 1 || !message.ciphertext || !message.iv) return { ...message, text: 'This older message was sent before encryption was enabled.' };
+    const fromUmbra = message.encryptionVersion === 3 && /^[a-f0-9]{32}$/.test(message.umbraNonce || '');
+    if ((message.encryptionVersion !== 1 && !fromUmbra) || !message.ciphertext || !message.iv) return { ...message, text: 'This older message was sent before encryption was enabled.' };
     if (decryptedCache.has(message.id)) return { ...message, text: decryptedCache.get(message.id)! };
     try {
       // Direct-message senders decrypt their own copy using the conversation peer's key.
       // Group messages already have a per-member envelope, so each client uses its sender's key.
       const decryptionPeerId = !isGroup && message.from.id === me!.id && !message.selfCopy ? target.id : message.from.id;
-      const text = await decryptMessage(me!.id, decryptionPeerId, message.iv, message.ciphertext, fetchFriendKey);
+      const text = await decryptMessage(me!.id, decryptionPeerId, message.iv, message.ciphertext, fetchFriendKey, fromUmbra ? message.umbraNonce : undefined);
+      if (fromUmbra && !text.startsWith(attachmentV2Prefix)) throw new Error('This Umbra clip could not be opened.');
       decryptedCache.set(message.id, text);
-      if (!isGroup && message.from.id === me!.id && !message.selfCopy && message.iv && message.ciphertext && !senderEnvelopeMigrations.has(message.id)) {
+      if (!fromUmbra && !isGroup && message.from.id === me!.id && !message.selfCopy && message.iv && message.ciphertext && !senderEnvelopeMigrations.has(message.id)) {
         senderEnvelopeMigrations.add(message.id);
         void encryptMessage(me!.id, me!.id, text, fetchFriendKey)
           .then(selfEnvelope => api(`/messages/${encodeURIComponent(message.id)}`, { method: 'PATCH', body: JSON.stringify({ iv: message.iv, ciphertext: message.ciphertext, selfEnvelope }) }))
@@ -453,7 +464,7 @@ async function refreshIncomingCall() {
 }
 function callActiveState() { return voiceState === 'connected' || voiceState === 'waiting' || voiceState === 'connecting' || voiceState === 'reconnecting'; }
 function callRailMarkup() {
-  if (callActiveState() && (callFriend || callGroup)) return `<button type="button" class="rail-call-user" data-call-return title="Return to active call" aria-label="Return to active call">${callGroup ? '<span class="group-chat-icon">✦</span>' : avatar(callFriend!, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>`;
+  if (callActiveState() && (callFriend || callGroup)) return `<button type="button" class="rail-call-user" data-call-return title="Return to active call" aria-label="Return to active call">${callGroup ? groupChatIcon : avatar(callFriend!, 'rail-call-avatar')}<span class="rail-call-dot"></span></button>`;
   if (incomingCall) return `<button type="button" class="incoming-call-rail" data-join-call title="Join ${esc(displayName(incomingCall.caller))}'s call" aria-label="Join call with ${esc(displayName(incomingCall.caller))}"><span class="incoming-call-avatar">${avatar(incomingCall.caller, 'rail-call-avatar')}<span class="incoming-call-speaker" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12"/></svg></span></span><small>JOIN CALL</small></button>`;
   return '';
 }
@@ -675,8 +686,8 @@ async function sendAttachment(file: File, target: User | GroupChat, onProgress?:
 async function loadAttachment(id: string, target: User | GroupChat, onProgress?: (percent: number) => void) {
   const message = messages.find(item => item.text.startsWith(attachmentV2Prefix) && item.text.includes(`"id":"${id}"`));
   if (!message) throw new Error('Attachment details are missing from this chat.');
-  const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { name: string; type: string; size: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[]; groupKey?: string; groupId?: string };
-  if ('members' in target && (!meta.groupKey || meta.groupId !== target.id)) throw new Error('Group attachment encryption details are invalid.');
+  const meta = JSON.parse(message.text.slice(attachmentV2Prefix.length)) as { name: string; type: string; size: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[]; groupKey?: string; groupId?: string; clipKey?: string };
+  if ('members' in target && !meta.clipKey && (!meta.groupKey || meta.groupId !== target.id)) throw new Error('Group attachment encryption details are invalid.');
   const cached = attachmentUrlCache.get(id);
   if (cached) return { url: cached, name: meta.name };
   const pending = pendingAttachmentLoads.get(id);
@@ -688,7 +699,7 @@ async function loadAttachment(id: string, target: User | GroupChat, onProgress?:
     };
     let blob: Blob;
     if (meta.chunkCount && meta.ivPrefix) {
-      const cipher = meta.groupKey && meta.groupId ? await createGroupAttachmentCipher(bytesFromBase64(meta.groupKey), meta.groupId) : await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
+      const cipher = meta.clipKey ? await createGroupAttachmentCipher(bytesFromBase64(meta.clipKey), 'umbra') : meta.groupKey && meta.groupId ? await createGroupAttachmentCipher(bytesFromBase64(meta.groupKey), meta.groupId) : await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
       for (let start = 0; start < meta.chunkCount; start += 3) {
         const batch = Array.from({ length: Math.min(3, meta.chunkCount - start) }, (_, offset) => start + offset);
         const encryptedChunks = await Promise.all(batch.map(index => rawAttachmentRequest(`/attachments/${id}/${index}`, 'GET')));
@@ -792,6 +803,13 @@ function render() {
   previewObserver?.disconnect();
   previewObserver = undefined;
   if (!me) { renderAuth(); return; }
+  if (umbraConnection) {
+    showUmbraApproval(app, umbraConnection, me, cryptoReady, api, () => {
+      umbraConnection = undefined;
+      render();
+    });
+    return;
+  }
   if (settingsOpen) { renderSettings(); return; }
   const videoPlayback = new Map(Array.from(app.querySelectorAll<HTMLVideoElement>('.message-attachment-video')).map(video => [video.dataset.videoFile || '', { currentTime: video.currentTime, paused: video.paused }] as const).filter(([id]) => !!id));
   const retainedPlayers = new Map(Array.from(app.querySelectorAll<HTMLElement>('[data-video-shell]')).map(shell => [shell.dataset.videoShell!, shell]));
@@ -821,10 +839,10 @@ function render() {
   const callScreenStage = callVisible && (screenSharing || voiceVideoPeers.length > 0 || screenViewOpen) ? `<section class="call-screen-stage call-stage-grid" aria-label="People and streams in this call">${screenSharing ? `<figure class="call-stage-tile stream-tile local" aria-label="You are sharing your screen"><video autoplay muted playsinline data-local-screen></video><span class="stream-live-badge">LIVE</span><figcaption>${avatar(me, 'stage-caption-avatar')}<strong>${esc(displayName(me))}</strong><span>Your screen</span></figcaption></figure>` : ''}${remoteStreamTiles}${callUserTiles}${!screenSharing && !voiceVideoPeers.length ? '<div class="screen-share-empty">No one is sharing a screen right now.</div>' : ''}</section>` : '';
   const railCall = callRailMarkup();
   const accountFooter = `<div class="account-footer-wrap">${presenceMenuOpen ? `<form class="presence-popover" id="presence-form"><strong>Set your status</strong><label>Activity<select name="presence"><option value="online" ${presencePreference === 'online' ? 'selected' : ''}>● Online</option><option value="idle" ${presencePreference === 'idle' ? 'selected' : ''}>◷ Idle</option><option value="dnd" ${presencePreference === 'dnd' ? 'selected' : ''}>⊖ Do Not Disturb</option><option value="away" ${presencePreference === 'away' ? 'selected' : ''}>◌ Away</option></select></label><label>Status<input name="customStatus" maxlength="80" value="${esc(me.customStatus || '')}" placeholder="What are you up to?"/></label><small>Up to 80 characters</small><p class="presence-error" role="alert">${esc(presenceSaveError)}</p><button class="primary-button" type="submit">Save status</button></form>` : ''}<div class="account-footer"><button type="button" class="account-identity" id="account-status-toggle" aria-expanded="${presenceMenuOpen}" title="Change activity and status">${avatarWithPresence(me, 'account-avatar')}<span class="account-identity-copy"><strong>${esc(displayName(me))}</strong><small>${callActive ? '☎ In a call' : esc(me.customStatus || presenceLabel(me.presence))}</small></span></button><div class="account-controls"><button type="button" class="account-control ${voiceMuted ? 'selected' : ''}" id="sidebar-mic" aria-label="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}" title="${voiceMuted ? 'Unmute microphone' : 'Mute microphone'}" ${callActive ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4m-4 0h8"/>${voiceMuted ? '<path d="m4 4 16 16"/>' : ''}</svg></button><button type="button" class="account-control ${voiceDeafened ? 'selected' : ''}" id="sidebar-deafen" aria-label="${voiceDeafened ? 'Undeafen' : 'Deafen'}" title="${voiceDeafened ? 'Turn audio back on' : 'Deafen'}" ${callActive ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13a9 9 0 0 1 18 0v5h-5v-6h5M3 12h5v6H3v-5"/>${voiceDeafened ? '<path d="m4 4 16 16"/>' : ''}</svg></button><button type="button" class="account-control account-settings-control" id="settings-open-sidebar" aria-label="Settings" title="Settings">⚙</button></div></div></div>`;
-  const friendProfile = friend ? `<div class="profile-banner" ${friend.banner ? `style="background-image:url('${esc(friend.banner)}')"` : ''}></div><div class="profile-detail-avatar">${avatarWithPresence(friend, 'profile-detail-pic')}</div><section class="profile-detail-copy"><h2>${esc(displayName(friend))}</h2><span>@${esc(friend.username)}</span><small class="profile-presence ${friend.presence || 'offline'}">${presenceLabel(friend.presence)}${friend.customStatus ? ` · ${esc(friend.customStatus)}` : ''}</small><p>${esc(friend.bio || 'No bio yet.')}</p></section><div class="profile-divider"></div><div class="profile-detail-meta"><strong>Pulse member</strong><span>Direct message</span></div>` : group ? `<div class="profilebar-empty group-profile"><div class="welcome-icon">✦</div><strong>${esc(group.name)}</strong><p>${group.members.length} members</p>${group.members.map(member => `<button class="group-member" type="button" data-user-context="${esc(member.id)}">${avatar(member, 'tiny')}<span>${esc(displayName(member))}${member.id === me!.id ? ' · you' : member.encryptionReady === false ? ' · update needed' : ''}</span></button>`).join('')}</div>` : `<div class="profilebar-empty"><div class="welcome-icon">✦</div><strong>Your conversation</strong><p>Choose a friend or group to start chatting.</p></div>`;
+  const friendProfile = friend ? `<div class="profile-banner" ${friend.banner ? `style="background-image:url('${esc(friend.banner)}')"` : ''}></div><div class="profile-detail-avatar">${avatarWithPresence(friend, 'profile-detail-pic')}</div><section class="profile-detail-copy"><h2>${esc(displayName(friend))}</h2><span>@${esc(friend.username)}</span><small class="profile-presence ${friend.presence || 'offline'}">${presenceLabel(friend.presence)}${friend.customStatus ? ` · ${esc(friend.customStatus)}` : ''}</small><p>${esc(friend.bio || 'No bio yet.')}</p></section><div class="profile-divider"></div><div class="profile-detail-meta"><strong>Pulse member</strong><span>Direct message</span></div>` : group ? `<div class="profilebar-empty group-profile"><div class="welcome-icon">${pulseGlyph}</div><strong>${esc(group.name)}</strong><p>${group.members.length} members</p>${group.members.map(member => `<button class="group-member" type="button" data-user-context="${esc(member.id)}">${avatar(member, 'tiny')}<span>${esc(displayName(member))}${member.id === me!.id ? ' · you' : member.encryptionReady === false ? ' · update needed' : ''}</span></button>`).join('')}</div>` : `<div class="profilebar-empty"><div class="welcome-icon">${pulseGlyph}</div><strong>Your conversation</strong><p>Choose a friend or group to start chatting.</p></div>`;
   const friendsTitle = friendsPanel === 'requests' ? 'Friend requests' : friendsPanel === 'add' ? 'Add a friend' : 'Friends';
   const friendPanelContent = friendsPanel === 'friends'
-    ? `<div class="section-title">GROUP CHATS <button type="button" class="mini-add" id="new-group" title="Create group chat" aria-label="Create group chat">＋</button></div>${groups.map(item => `<button type="button" class="nav-item dm-item group-chat-item ${group?.id === item.id ? 'selected' : ''}" data-group="${esc(item.id)}"><span class="group-chat-icon">✦</span><span>${esc(item.name)}</span></button>`).join('') || '<p class="side-empty">No group chats yet.</p>'}<div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}" data-user-context="${esc(f.id)}">${avatarWithPresence(f, 'tiny')}<span>${esc(displayName(f))}</span>${unreadCounts[f.id] ? `<span class="unread-count" aria-label="${unreadCounts[f.id]} unread messages">${unreadCounts[f.id] > 99 ? '99+' : unreadCounts[f.id]}</span>` : ''}</button>`).join('') || '<p class="side-empty">Your friends will show up here.</p>'}`
+    ? `<div class="section-title">GROUP CHATS <button type="button" class="mini-add" id="new-group" title="Create group chat" aria-label="Create group chat">＋</button></div>${groups.map(item => `<button type="button" class="nav-item dm-item group-chat-item ${group?.id === item.id ? 'selected' : ''}" data-group="${esc(item.id)}">${groupChatIcon}<span>${esc(item.name)}</span></button>`).join('') || '<p class="side-empty">No group chats yet.</p>'}<div class="section-title">FRIENDS <span>${friends.friends.length}</span></div>${friends.friends.map(f => `<button class="nav-item dm-item ${friend?.id === f.id ? 'selected' : ''}" data-friend="${esc(f.id)}" data-user-context="${esc(f.id)}">${avatarWithPresence(f, 'tiny')}<span>${esc(displayName(f))}</span>${unreadCounts[f.id] ? `<span class="unread-count" aria-label="${unreadCounts[f.id]} unread messages">${unreadCounts[f.id] > 99 ? '99+' : unreadCounts[f.id]}</span>` : ''}</button>`).join('') || '<p class="side-empty">Your friends will show up here.</p>'}`
     : friendsPanel === 'requests'
       ? `<div class="section-title">INCOMING <span>${friends.incoming.length}</span></div>${friends.incoming.map(f => `<div class="request-row"><span>${esc(f.username)}</span><button class="accept-button" data-accept="${esc(f.id)}">Accept</button></div>`).join('') || '<p class="side-empty">No new requests.</p>'}<div class="section-title">SENT</div>${friends.outgoing.map(f => `<p class="side-empty">Request sent to ${esc(f.username)}</p>`).join('') || '<p class="side-empty">No pending requests.</p>'}`
       : `<p class="side-empty add-friend-help">Add someone by their Pulse username. They’ll appear in Friends after they accept.</p><form id="add-friend" class="add-friend"><input name="username" required minlength="3" maxlength="24" placeholder="Pulse username"/><button title="Send friend request" aria-label="Send friend request">＋</button></form>`;
@@ -855,8 +873,8 @@ function render() {
     ${!activeServer && friendsPanel === 'friends' ? '<label class="search"><span>⌕</span><input id="friend-search" placeholder="Find a friend"/><kbd>⌕</kbd></label>' : ''}
     ${!activeServer ? `<nav class="friend-tabs" aria-label="Friends navigation"><button class="friend-tab ${friendsPanel === 'friends' ? 'active' : ''}" data-friends-panel="friends">Friends</button><button class="friend-tab ${friendsPanel === 'requests' ? 'active' : ''}" data-friends-panel="requests">Requests${friends.incoming.length ? ` <span aria-label="${friends.incoming.length} pending requests">${friends.incoming.length}</span>` : ''}</button><button class="friend-tab ${friendsPanel === 'add' ? 'active' : ''}" data-friends-panel="add">Add friend</button></nav>` : ''}
     <div class="side-scroll"><section>${sidebarContent}</section></div>${accountFooter}</aside>
-  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>${incomingCall?.caller.id === friend.id ? 'Join call' : 'Call'}</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
-    ${callBar}${callParticipantBar}${callScreenStage}${conversation ? `<label class="chat-search ${friend ? 'direct-message-search' : ''}"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files here to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
+  <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? groupChatIcon : pulseGlyph}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>${incomingCall?.caller.id === friend.id ? 'Join call' : 'Call'}</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
+    ${callBar}${callParticipantBar}${callScreenStage}${conversation ? `<label class="chat-search ${friend ? 'direct-message-search' : ''}"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files here to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">${pulseGlyph}</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">${pulseGlyph}</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
     ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : ''}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (creationModal) app.insertAdjacentHTML('beforeend', creationModal);
@@ -1021,6 +1039,17 @@ function render() {
   app.querySelectorAll<HTMLButtonElement>('[data-message-edit]').forEach(button => button.onclick = () => { const item = messages.find(message => message.id === button.dataset.messageEdit); if (!item || item.from.id !== me?.id) return; editingMessageId = item.id; render(); const input = app.querySelector<HTMLInputElement>('#message-input'); if (input) { input.value = item.text; input.focus(); input.setSelectionRange(input.value.length, input.value.length); } });
   app.querySelectorAll<HTMLButtonElement>('[data-message-delete]').forEach(button => button.onclick = async () => { const item = messages.find(message => message.id === button.dataset.messageDelete); if (!item || item.from.id !== me?.id || !window.confirm('Delete this message for everyone?')) return; try { const path = activeGroup ? `/groups/${encodeURIComponent(activeGroup.id)}/messages/${encodeURIComponent(item.id)}` : `/messages/${encodeURIComponent(item.id)}`; await api(path, { method: 'DELETE' }); messages = messages.filter(message => message.id !== item.id); decryptedCache.delete(item.id); notice = 'Message deleted.'; render(); } catch (error) { showError(error); } });
   const composer = app.querySelector<HTMLFormElement>('#composer');
+  if (composer && conversation && cryptoReady && canCompose(conversation)) {
+    const picker = document.createElement('button');
+    picker.type = 'button';
+    picker.className = 'attach umbra-picker-button';
+    picker.title = 'Send an Umbra clip';
+    picker.setAttribute('aria-label', picker.title);
+    picker.innerHTML = '<svg viewBox="0 0 64 64" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M32 7a25 25 0 1 0 0 50 25 25 0 0 0 0-50Zm6 6a19 19 0 1 1 0 38 19 19 0 0 1 0-38Z"/><path d="M37 23.5c0-1.2.6-1.6 1.6-.95l12.2 8c1.2.75 1.2 2.15 0 2.9l-12.2 8c-1 .65-1.6.25-1.6-.95z"/></svg>';
+    const ownId = me.id;
+    picker.onclick = () => showUmbraPicker(conversation.id, ownId, api, () => fetchFriendKey(ownId));
+    composer.prepend(picker);
+  }
   if (composer && conversation) {
     const sending = sendingConversations.has(conversation.id);
     const items = attachmentDrafts.list(conversation.id);
@@ -1429,6 +1458,7 @@ function renderSettings() {
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
   if (settingsTab === 'security') {
+    mountUmbraSettings(app.querySelector('.settings-content')!, api, connection => { umbraConnection = connection; render(); });
     app.querySelector('.settings-content')?.insertAdjacentHTML('beforeend', `<section class="settings-section"><h2>Change password</h2><p>Changing your password signs out all sessions. Your messages and encryption keys stay unchanged.</p><form id="change-password-form" class="settings-form"><label>Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label><label>New password<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label><label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label>${me.authenticatorEnabled ? '<label>Authenticator or recovery code<input name="secondFactor" autocomplete="one-time-code" maxlength="24" required></label>' : ''}<p class="settings-form-error" role="alert"></p><button type="submit" class="primary-button">Change password</button></form></section>`);
     const passwordForm = app.querySelector<HTMLFormElement>('#change-password-form')!;
     passwordForm.onsubmit = async event => {
