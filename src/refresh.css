@@ -300,6 +300,11 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .composer .composer-hint { position: static; flex: 0 0 100%; order: 10; margin: 0; padding: 0 4px; text-align: left; white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
 .video-preview-play:not(.loading) { width: auto; min-width: 48px; padding: 6px; border-radius: 8px; font-size: 12px; }
 .video-preview-info > small { white-space: normal; overflow-wrap: anywhere; }
+.attachment-transfer-status { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.attachment-transfer-status[hidden] { display: none; }
+.attachment-transfer-status[data-state=complete] { color: #90dfb0; }
+.attachment-transfer-status[data-state=error] { color: #ffadb7; }
+.auth-form label > small { color: var(--muted); font-size: 12px; }
 
 @media (max-width: 1120px) {
   .profilebar, .rightbar { display: none; }

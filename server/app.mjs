@@ -49,6 +49,7 @@ const totpLoginChallenges = new Map();
 const totpDisableAttempts = new Map();
 const emailProofs = new Map();
 const emailRequestWindows = new Map();
+const passwordResetWindows = new Map();
 const challengeSecret = randomBytes(32);
 const globalEmailWindow = { start: Date.now(), count: 0 };
 const updaterCache = new Map();
@@ -239,7 +240,8 @@ function verifySecondFactor(user, code) {
   }
   return false;
 }
-async function sendEmailCode(email, purpose, userId = '') {
+async function sendEmailCode(email, purpose, userId = '', id = randomBytes(24).toString('hex')) {
+  const credentialHash = ['password-reset', 'two-factor'].includes(purpose) ? db.users.find(user => user.id === userId)?.passwordHash : undefined;
   if (!process.env.RESEND_API_KEY || !process.env.PULSE_EMAIL_FROM) throw new Error('Email delivery is not configured on the Pulse server.');
   const now = Date.now();
   if (now - globalEmailWindow.start > 60 * 60_000) { globalEmailWindow.start = now; globalEmailWindow.count = 0; }
@@ -249,9 +251,10 @@ async function sendEmailCode(email, purpose, userId = '') {
   if (now - window.windowStart > 60 * 60_000) { window.windowStart = now; window.count = 0; }
   if (now - window.sentAt < 60_000 || window.count >= 5) throw new Error('Wait before requesting another email code.');
   window.sentAt = now; window.count += 1; emailRequestWindows.set(addressKey, window); globalEmailWindow.count += 1;
-  const id = randomBytes(24).toString('hex');
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-  const emailCopy = purpose === 'signup'
+  const emailCopy = purpose === 'password-reset'
+    ? { subject: 'Reset your Pulse password', heading: 'Reset your password', action: 'choose a new password for your Pulse account' }
+    : purpose === 'signup'
     ? { subject: 'Verify your email for Pulse', heading: 'Verify your email', action: 'finish creating your Pulse account' }
     : purpose === 'two-factor'
       ? { subject: 'Your Pulse sign-in code', heading: 'Confirm your sign-in', action: 'sign in to your Pulse account' }
@@ -268,7 +271,7 @@ async function sendEmailCode(email, purpose, userId = '') {
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) { console.error('Email provider rejected a verification message with status:', response.status); throw new Error('Pulse could not send your email code. Check the email address and try again.'); }
-  emailChallenges.set(id, { id, email: addressKey, purpose, userId, codeHash: hashCode(id, code), expiresAt: now + 10 * 60_000, attempts: 0 });
+  emailChallenges.set(id, { id, email: addressKey, purpose, userId, credentialHash, codeHash: hashCode(id, code), expiresAt: now + 10 * 60_000, attempts: 0 });
   for (const [challengeId, challenge] of emailChallenges) if (challenge.expiresAt <= now) emailChallenges.delete(challengeId);
   for (const [proof, item] of emailProofs) if (item.expiresAt <= now) emailProofs.delete(proof);
   if (emailChallenges.size > 10000) for (const challengeId of emailChallenges.keys()) { emailChallenges.delete(challengeId); if (emailChallenges.size <= 8000) break; }
@@ -282,7 +285,7 @@ async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
-    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login'].includes(url.pathname)) {
+    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login', '/api/auth/password-reset', '/api/auth/password-reset/complete'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
       const entry = requestWindows.get(key) || { start: now, count: 0 };
       if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
@@ -329,6 +332,46 @@ async function serve(req, res) {
     }
     try {
       const body = ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readBody(req) : {};
+      if (url.pathname === '/api/auth/password-reset' && req.method === 'POST') {
+        if (typeof body.email !== 'string' || Object.keys(body).some(key => key !== 'email')) return json(res, 400, { error: 'Enter your account email address.' });
+        const email = emailKey(body.email);
+        if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: 'Enter a valid email address.' });
+        const now = Date.now();
+        for (const [key, window] of passwordResetWindows) if (now - window.start >= 3600_000) passwordResetWindows.delete(key);
+        const key = createHash('sha256').update(email).digest('hex');
+        const window = passwordResetWindows.get(key) || { start: now, sentAt: 0, count: 0 };
+        const allowed = now - window.sentAt >= 60_000 && window.count < 5 && passwordResetWindows.size < 10000;
+        const challengeId = randomBytes(24).toString('hex');
+        if (allowed) {
+          window.sentAt = now; window.count++; passwordResetWindows.set(key, window);
+          const user = db.users.find(item => item.emailVerified && emailKey(item.email) === email);
+          // Respond before delivery for both known and unknown addresses.
+          if (user) void sendEmailCode(email, 'password-reset', user.id, challengeId).catch(() => console.error('Password reset email could not be delivered.'));
+        }
+        return json(res, 200, { challengeId, message: 'If this email belongs to a verified Pulse account, a reset code is on its way. Wait a minute before requesting another.' });
+      }
+      if (url.pathname === '/api/auth/password-reset/complete' && req.method === 'POST') {
+        if (Object.keys(body).some(key => !['challengeId', 'code', 'password', 'secondFactor'].includes(key)) || typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) return json(res, 400, { error: 'Password must be 10–128 characters.' });
+        const challenge = emailChallenges.get(String(body.challengeId || ''));
+        const user = challenge && db.users.find(item => item.id === challenge.userId);
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
+        const valid = challenge?.purpose === 'password-reset' && challenge.expiresAt > Date.now() && user?.emailVerified && emailKey(user.email) === challenge.email && user.passwordHash === challenge.credentialHash && /^\d{6}$/.test(code) && timingSafeEqual(Buffer.from(hashCode(challenge.id, code), 'hex'), Buffer.from(challenge.codeHash, 'hex'));
+        if (!valid || (user.totpEnabled && !verifySecondFactor(user, String(body.secondFactor || '')))) {
+          if (challenge?.purpose === 'password-reset' && ++challenge.attempts >= 5) emailChallenges.delete(challenge.id);
+          return json(res, 400, { error: 'Code is incorrect or expired. Include your authenticator or recovery code if enabled, or request a new email code.' });
+        }
+        emailChallenges.delete(challenge.id);
+        const previousHash = user.passwordHash;
+        const salt = randomBytes(16).toString('hex');
+        const passwordHash = (await scrypt(body.password, salt, 64)).toString('hex');
+        if (user.passwordHash !== previousHash) return json(res, 400, { error: 'Request a new reset code and try again.' });
+        user.salt = salt; user.passwordHash = passwordHash;
+        db.sessions = db.sessions.filter(session => session.userId !== user.id);
+        for (const [id, item] of emailChallenges) if (item.userId === user.id) emailChallenges.delete(id);
+        for (const [id, item] of totpLoginChallenges) if (item.userId === user.id) totpLoginChallenges.delete(id);
+        persist();
+        return json(res, 200, { ok: true, message: 'Password reset. Sign in with your new password.' });
+      }
       if (url.pathname === '/api/auth/email-code' && req.method === 'POST') {
         const email = emailKey(body.email);
         const purpose = String(body.purpose || '');
@@ -366,7 +409,7 @@ async function serve(req, res) {
         }
         const targetUser = db.users.find(candidate => candidate.id === challenge.userId);
         if (challenge.purpose === 'two-factor') {
-          if (!targetUser || targetUser.totpEnabled || !targetUser.twoFactorEnabled || !targetUser.emailVerified || emailKey(targetUser.email) !== challenge.email) return json(res, 401, { error: 'Sign in again and use your configured two-factor method.' });
+          if (!targetUser || challenge.credentialHash !== targetUser.passwordHash || targetUser.totpEnabled || !targetUser.twoFactorEnabled || !targetUser.emailVerified || emailKey(targetUser.email) !== challenge.email) return json(res, 401, { error: 'Sign in again and use your configured two-factor method.' });
           const token = randomBytes(32).toString('hex'); db.sessions = db.sessions.filter(session => session.expiresAt > Date.now()); db.sessions.push({ token, userId: targetUser.id, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 }); persist();
           return json(res, 200, { token, user: accountUser(targetUser) });
         }

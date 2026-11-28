@@ -116,6 +116,19 @@ const attachmentUrlCache = new Map<string, string>();
 const videoValidationErrors = new Map<string, string>();
 const pendingAttachmentLoads = new Map<string, Promise<{ url: string; name: string }>>();
 const previewTransfers = new Map<string, { percent: number; error?: string }>();
+type DownloadState = { state: 'downloading' | 'complete' | 'error'; percent: number; error?: string };
+const attachmentDownloads = new Map<string, DownloadState>();
+function downloadLabel(value: DownloadState) {
+  return value.state === 'complete' ? 'Download complete' : value.state === 'error' ? value.error || 'Download failed. Try again.' : `Downloading and decrypting · ${value.percent}%`;
+}
+function updateDownload(id: string, value: DownloadState) {
+  attachmentDownloads.set(id, value);
+  app.querySelectorAll<HTMLElement>(`[data-download-status="${id}"]`).forEach(status => {
+    status.hidden = false;
+    status.dataset.state = value.state;
+    status.textContent = downloadLabel(value);
+  });
+}
 let previewObserver: IntersectionObserver | undefined;
 const senderEnvelopeMigrations = new Set<string>();
 const voice = new VoiceClient((update: VoiceUpdate) => { voiceState = update.state; voiceMessage = update.message; voicePeers = update.peers; callParticipants = update.participants; voiceVideoPeers = update.videoPeers; screenSharing = update.sharingScreen; if (update.state === 'disconnected') { voiceRoom = ''; callFriend = undefined; callGroup = undefined; callServer = undefined; callServerChannel = undefined; callParticipants = []; screenViewOpen = false; screenQualityOpen = false; void cancelOutgoingCallInvite(); } render(); });
@@ -133,8 +146,49 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   return result as T;
 }
 
+let passwordResetOpen = false;
+let passwordResetStage: 'email' | 'code' | 'done' = 'email';
+let passwordResetEmail = '';
+let passwordResetChallenge = '';
+
+function renderPasswordReset() {
+  const done = passwordResetStage === 'done';
+  const verify = passwordResetStage === 'code';
+  const fields = verify
+    ? `<label>Email reset code<input name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label><label>New password<input name="password" type="password" autocomplete="new-password" required minlength="10" maxlength="128"></label><label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" required minlength="10" maxlength="128"></label><label>Authenticator or recovery code <small>Only if you enabled authenticator 2FA</small><input name="secondFactor" autocomplete="off" maxlength="24"></label>`
+    : `<label>Account email<input name="email" type="email" autocomplete="email" required maxlength="254" value="${esc(passwordResetEmail)}"></label>`;
+  app.innerHTML = `<main class="auth-page"><section class="auth-card"><div class="auth-brand"><img src="/pulse-mark.svg" alt=""><span>Pulse</span></div><h1>${done ? 'Password reset' : verify ? 'Choose a new password' : 'Forgot your password?'}</h1><p class="auth-subtitle">${done ? 'Your password has changed and previous sessions are signed out. Sign in again to continue.' : verify ? 'If this email belongs to a verified account, a code is on its way. It expires in 10 minutes. Check your spam folder too.' : 'Enter the verified email address linked to your Pulse account.'}</p>${done ? '' : `<form id="password-reset-form" class="auth-form">${fields}<p id="password-reset-error" class="form-error" role="alert"></p><button class="primary-button" type="submit">${verify ? 'Reset password' : 'Send reset code'}</button></form>`}<div class="auth-switch">${verify ? '<button type="button" id="reset-request-again">Request a new code</button>' : ''}<button type="button" id="reset-back">Back to sign in</button></div></section></main>`;
+  app.querySelector('#reset-back')?.addEventListener('click', () => { passwordResetOpen = false; passwordResetStage = 'email'; passwordResetChallenge = ''; authMode = 'login'; authPhase = 'credentials'; authError = ''; pendingAuth = undefined; renderAuth(); });
+  app.querySelector('#reset-request-again')?.addEventListener('click', () => { passwordResetStage = 'email'; passwordResetChallenge = ''; renderPasswordReset(); });
+  const form = app.querySelector<HTMLFormElement>('#password-reset-form');
+  if (!form) return;
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const values = new FormData(form);
+    const error = form.querySelector<HTMLElement>('#password-reset-error')!;
+    error.textContent = '';
+    if (verify && values.get('password') !== values.get('confirmPassword')) { error.textContent = 'Passwords do not match.'; return; }
+    const submit = form.querySelector<HTMLButtonElement>('button[type=submit]')!;
+    if (submit.disabled) return;
+    submit.disabled = true; submit.textContent = 'Please wait…';
+    try {
+      if (verify) {
+        await api('/auth/password-reset/complete', { method: 'POST', body: JSON.stringify({ challengeId: passwordResetChallenge, code: values.get('code'), password: values.get('password'), secondFactor: values.get('secondFactor') }) });
+        passwordResetStage = 'done'; passwordResetChallenge = '';
+      } else {
+        passwordResetEmail = String(values.get('email') || '').trim();
+        const result = await api<{ challengeId: string }>('/auth/password-reset', { method: 'POST', body: JSON.stringify({ email: passwordResetEmail }) });
+        passwordResetChallenge = result.challengeId; passwordResetStage = 'code';
+      }
+      if (passwordResetOpen) renderPasswordReset();
+    } catch (failure) { error.textContent = failure instanceof Error ? failure.message : 'Could not reset your password. Try again.'; }
+    finally { submit.disabled = false; submit.textContent = verify ? 'Reset password' : 'Send reset code'; }
+  };
+}
+
 function renderAuth() {
   app.classList.remove('settings-view');
+  if (passwordResetOpen) { renderPasswordReset(); return; }
   const verification = authPhase !== 'credentials';
   const title = authPhase === 'verify-email' ? 'Check your email' : authPhase === 'verify-two-factor' ? 'Two-factor code' : authMode === 'signup' ? 'Create your Pulse account' : 'Welcome back';
   const subtitle = authPhase === 'verify-email' ? `Enter the six-digit code we sent to ${esc(pendingAuth?.email || '')}.` : authPhase === 'verify-two-factor' && pendingAuth?.method === 'totp' ? 'Enter the six-digit code from your authenticator app or an unused recovery code.' : authPhase === 'verify-two-factor' ? 'Enter the sign-in code sent to your verified email.' : authMode === 'signup' ? 'Verify your email, then add friends and start talking.' : 'Sign in with your username or verified email.';
@@ -144,6 +198,10 @@ function renderAuth() {
       ? '<label>Username<input name="username" required minlength="3" maxlength="24" pattern="[A-Za-z0-9._]+" autocomplete="username" placeholder="Your username"/></label><label>Email<input name="email" type="email" required maxlength="254" autocomplete="email" placeholder="you@example.com"/></label><label>Password<input name="password" required minlength="10" maxlength="128" type="password" autocomplete="new-password" placeholder="At least 10 characters"/></label><small>Usernames are 3–24 characters: letters, numbers, dots, and underscores.</small>'
       : '<label>Username or email<input name="username" required autocomplete="username" placeholder="Username or email"/></label><label>Password<input name="password" required minlength="10" maxlength="128" type="password" autocomplete="current-password" placeholder="Your password"/></label>';
   app.innerHTML = `<main class="auth-page"><section class="auth-card"><div class="auth-brand"><img src="/pulse-mark.svg" alt=""><span>Pulse</span></div><div class="eyebrow">YOUR SPACE, YOUR PEOPLE</div><h1>${title}</h1><p class="auth-subtitle">${subtitle}</p><form id="auth-form" class="auth-form">${fields}<p class="form-error">${esc(authError)}</p><button class="primary-button" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Please wait…' : authPhase === 'verify-email' ? 'Verify email' : authPhase === 'verify-two-factor' ? 'Verify and sign in' : authMode === 'signup' ? 'Send verification code' : 'Sign in'}</button></form>${verification ? `<div class="auth-switch">${authPhase === 'verify-email' ? '<button id="auth-resend">Resend code</button>' : ''}<button id="auth-back">Back</button></div>` : `<div class="auth-switch">${authMode === 'signup' ? 'Already have an account?' : 'New to Pulse?'} <button id="auth-switch">${authMode === 'signup' ? 'Sign in' : 'Create an account'}</button></div>`}<footer>Pulse is in early access. Messages are stored on the Pulse server.</footer></section></main>`;
+  if (authMode === 'login' && authPhase === 'credentials') {
+    app.querySelector('#auth-form')?.insertAdjacentHTML('afterend', '<div class="auth-switch"><button type="button" id="forgot-password">Forgot password?</button></div>');
+    app.querySelector('#forgot-password')?.addEventListener('click', () => { passwordResetOpen = true; passwordResetStage = 'email'; passwordResetChallenge = ''; renderAuth(); });
+  }
   app.querySelector<HTMLButtonElement>('#auth-switch')?.addEventListener('click', () => { authMode = authMode === 'signup' ? 'login' : 'signup'; authPhase = 'credentials'; pendingAuth = undefined; authError = ''; renderAuth(); });
   app.querySelector<HTMLButtonElement>('#auth-back')?.addEventListener('click', () => { authPhase = 'credentials'; pendingAuth = undefined; authError = ''; renderAuth(); });
   app.querySelector<HTMLButtonElement>('#auth-resend')?.addEventListener('click', async () => {
@@ -255,6 +313,17 @@ const avatar = (user: User, className = '') => `<span class="avatar ${className}
 const attachmentPrefix = 'PULSE_ATTACHMENT_V1:';
 const attachmentV2Prefix = 'PULSE_ATTACHMENT_V2:';
 function messageBody(text: string) {
+  const content = messageContent(text);
+  if (!text.startsWith(attachmentV2Prefix)) return content;
+  try {
+    const { id } = JSON.parse(text.slice(attachmentV2Prefix.length));
+    if (typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id)) return content;
+    const state = attachmentDownloads.get(id);
+    const downloadable = content.replace(/<a (?=[^>]*\bdownload=)/g, `<a data-attachment-download="${id}" `);
+    return `${downloadable}<p class="attachment-transfer-status" data-download-status="${id}" data-state="${state?.state || ''}" role="status" ${state ? '' : 'hidden'}>${state ? esc(downloadLabel(state)) : ''}</p>`;
+  } catch { return content; }
+}
+function messageContent(text: string) {
   if (text.startsWith(attachmentV2Prefix)) {
     try {
       const file = JSON.parse(text.slice(attachmentV2Prefix.length)) as { id?: string; name?: string; type?: string; size?: number; chunkCount?: number; ivPrefix?: string; chunkHashes?: string[] };
@@ -583,6 +652,10 @@ async function loadAttachment(id: string, target: User | GroupChat, onProgress?:
   const pending = pendingAttachmentLoads.get(id);
   if (pending) return pending;
   const task = (async () => {
+    const progress = (percent: number) => {
+      if (attachmentDownloads.get(id)?.state === 'downloading') updateDownload(id, { state: 'downloading', percent });
+      onProgress?.(percent);
+    };
     let blob: Blob;
     if (meta.chunkCount && meta.ivPrefix) {
       const cipher = meta.groupKey && meta.groupId ? await createGroupAttachmentCipher(bytesFromBase64(meta.groupKey), meta.groupId) : await createAttachmentCipher(me!.id, target.id, fetchFriendKey); const ivPrefix = bytesFromBase64(meta.ivPrefix); const parts: Uint8Array[] = [];
@@ -597,7 +670,7 @@ async function loadAttachment(id: string, target: User | GroupChat, onProgress?:
           }
           parts.push(new Uint8Array(plaintext));
         }
-        onProgress?.(Math.min(100, Math.round((start + batch.length) / meta.chunkCount * 100)));
+        progress(Math.min(100, Math.round((start + batch.length) / meta.chunkCount * 100)));
       }
       const actualSize = parts.reduce((total, part) => total + part.byteLength, 0);
       if (actualSize !== meta.size) throw new Error(`This video is incomplete (${formatFileSize(actualSize)} of ${formatFileSize(meta.size)} downloaded).`);
@@ -606,7 +679,7 @@ async function loadAttachment(id: string, target: User | GroupChat, onProgress?:
       const encrypted = await api<{ iv: string; ciphertext: string }>(`/attachments/${id}`);
       const bytes = await decryptFile(me!.id, target.id, id, encrypted.iv, encrypted.ciphertext, fetchFriendKey);
       blob = new Blob([bytes], { type: meta.type });
-      onProgress?.(100);
+      progress(100);
     }
     if (meta.type === 'video/mp4' || meta.type === 'video/webm') {
       const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
@@ -952,15 +1025,33 @@ function render() {
   });
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentLoad; const target = conversation; if (!id || !target || attachmentUrlCache.has(id)) return;
+    const download = button.textContent?.startsWith('Download file');
+    if (download) updateDownload(id, { state: 'downloading', percent: 0 });
     button.disabled = true; button.textContent = 'Loading preview…';
-    try { await prepareVideoPreview(id, target); }
-    catch (error) { button.disabled = false; button.textContent = 'Retry video'; button.title = error instanceof Error ? error.message : 'Video download failed'; showError(error); }
+    try {
+      const file = await prepareVideoPreview(id, target);
+      if (download && file) { downloadLocalFile(file.url, file.name); updateDownload(id, { state: 'complete', percent: 100 }); notice = `Download complete: ${file.name}`; render(); }
+    } catch (error) {
+      if (download) updateDownload(id, { state: 'error', percent: 0, error: error instanceof Error ? error.message : 'Download failed. Try again.' });
+      button.disabled = false; button.textContent = 'Retry'; button.title = error instanceof Error ? error.message : 'Attachment download failed'; showError(error);
+    }
   }));
-  app.querySelectorAll<HTMLButtonElement>('[data-attachment-download]').forEach(button => button.addEventListener('click', async () => {
+  app.querySelectorAll<HTMLButtonElement>('[data-attachment-download]').forEach(button => button.addEventListener('click', async event => {
+    event.preventDefault();
     const id = button.dataset.attachmentDownload; const target = conversation; if (!id || !target) return;
-    button.disabled = true; button.textContent = 'Preparing download…';
-    try { const file = await loadAttachment(id, target, percent => { button.textContent = `Preparing download · ${percent}%`; }); render(); downloadLocalFile(file.url, file.name); }
-    catch (error) { showError(error); }
+    if (attachmentDownloads.get(id)?.state === 'downloading') return;
+    button.disabled = true; if (button.tagName === 'BUTTON') button.textContent = 'Preparing download…';
+    updateDownload(id, { state: 'downloading', percent: previewTransfers.get(id)?.percent || 0 });
+    try {
+      const file = await loadAttachment(id, target, percent => { if (button.tagName === 'BUTTON') button.textContent = `Downloading · ${percent}%`; });
+      downloadLocalFile(file.url, file.name);
+      updateDownload(id, { state: 'complete', percent: 100 });
+      notice = `Download complete: ${file.name}`;
+      render();
+    } catch (error) {
+      updateDownload(id, { state: 'error', percent: 0, error: error instanceof Error ? error.message : 'Download failed. Try again.' });
+      showError(error);
+    } finally { button.disabled = false; if (button.tagName === 'BUTTON') button.textContent = 'Download'; }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-video-play]').forEach(button => button.addEventListener('click', async () => {
     const video = button.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');

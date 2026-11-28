@@ -40,3 +40,21 @@ test('video previews survive a rerender before intersection and do not retry fai
   observers[2].visible();
   assert.deepEqual(downloads, ['video-a'], 'failed previews must wait for an explicit retry');
 });
+
+test('attachment download status displays progress, completion and errors safely', () => {
+  const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('type DownloadState =');
+  const end = source.indexOf('let previewObserver:', start);
+  const status = { hidden: true, dataset: {}, textContent: '' };
+  const context = { app: { querySelectorAll: () => [status] } };
+  vm.createContext(context);
+  vm.runInContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  context.updateDownload('file', { state: 'downloading', percent: 42 });
+  assert.equal(status.hidden, false);
+  assert.match(status.textContent, /42%/);
+  context.updateDownload('file', { state: 'complete', percent: 100 });
+  assert.equal(status.textContent, 'Download complete');
+  context.updateDownload('file', { state: 'error', percent: 0, error: 'Transfer interrupted. Retry.' });
+  assert.equal(status.dataset.state, 'error');
+  assert.equal(status.textContent, 'Transfer interrupted. Retry.');
+});
