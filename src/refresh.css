@@ -298,6 +298,7 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .composer #message-input:focus-visible { outline: none; box-shadow: none; }
 .composer:focus-within { border-color: #70747d; box-shadow: none; }
 .composer .composer-hint { position: static; flex: 0 0 100%; order: 10; margin: 0; padding: 0 4px; text-align: left; white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+.composer .composer-hint:empty { display: none; }
 .video-preview-play:not(.loading) { width: auto; min-width: 48px; padding: 6px; border-radius: 8px; font-size: 12px; }
 .video-preview-info > small { white-space: normal; overflow-wrap: anywhere; }
 .attachment-transfer-status { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
@@ -305,6 +306,57 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .attachment-transfer-status[data-state=complete] { color: #90dfb0; }
 .attachment-transfer-status[data-state=error] { color: #ffadb7; }
 .auth-form label > small { color: var(--muted); font-size: 12px; }
+
+/* Attachment drafts occupy their own row above the composer controls. */
+.pending-attachments { display: flex; flex: 0 0 100%; gap: 12px; overflow-x: auto; padding: 4px 4px 16px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+.pending-attachment { position: relative; display: grid; align-content: start; gap: 6px; flex: 0 0 190px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.pending-preview { position: relative; display: grid; place-items: center; height: 124px; overflow: hidden; border-radius: 6px; background: #1e1f22; }
+.pending-preview img, .pending-preview video { width: 100%; height: 100%; max-height: 124px; object-fit: contain; }
+.pending-file-icon { width: 48px; height: 56px; color: #b4bcff; }
+.pending-media-label { position: absolute; left: 8px; bottom: 8px; padding: 2px 6px; border-radius: 4px; background: #111c; color: white; font-size: 10px; }
+.pending-attachment strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+.pending-attachment small, .pending-attachment p { margin: 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.pending-attachment.failed { border-color: #bb6370; }
+.pending-attachment.failed p { color: #ffadb7; }
+.pending-remove { position: absolute; top: 6px; right: 6px; display: grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 6px; color: #ffadb7; background: var(--surface-raised); }
+.pending-remove:hover { background: #64333c; }
+.pending-remove svg, .attachment-icon-download svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.composer:has(.pending-attachments) .composer-hint { display: none; }
+.composer:has(.pending-attachments) { max-height: min(420px, 65vh); overflow-y: auto; }
+.video-player-shell, .video-preview-card { position: relative; }
+.video-player-shell { overflow: hidden; border-radius: 10px; background: #111214; }
+.video-preview-card { min-height: 130px; padding: 16px; gap: 16px; background: var(--surface); }
+.video-preview-thumb { width: 100px; height: 80px; background: #1e1f22; border-color: var(--line); }
+.video-preview-info { padding-right: 32px; gap: 8px; }
+.video-preview-info > strong { font-size: 13px; }
+.video-preview-info > small { font-size: 11px; }
+.attachment-icon-download { position: absolute; top: 10px; right: 10px; z-index: 3; display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 1px solid #737780; border-radius: 8px; background: #24262de8; color: #f2f3f5; opacity: 0; transition: opacity 160ms ease-out, background-color 160ms ease-out; }
+.video-player-shell:hover .attachment-icon-download, .video-player-shell:focus-within .attachment-icon-download,
+.video-preview-card:hover .attachment-icon-download, .video-preview-card:focus-within .attachment-icon-download,
+.attachment-icon-download[data-state=downloading], .attachment-icon-download[data-state=complete] { opacity: 1; }
+.attachment-icon-download:hover { background: #404249; }
+.attachment-icon-download[data-state=complete] { color: #90dfb0; }
+.message-attachment .pulse-video-controls { padding: 10px 12px; gap: 10px; border-top: 1px solid var(--line); background: #25272c; }
+.pulse-video-controls button { display: grid; place-items: center; width: 32px; height: 32px; padding: 5px; border: 0; border-radius: 6px; color: var(--text); background: transparent; }
+.pulse-video-controls button:hover { background: var(--surface-hover); }
+.pulse-video-controls button svg { width: 18px; height: 18px; }
+.attachment-transfer-status[data-state=complete] { display: none; }
+.attachment-transfer-status[data-state=downloading] { width: fit-content; padding: 4px 8px; border-radius: 6px; background: var(--surface-raised); font-size: 11px; }
+.video-player-shell:fullscreen { display: flex; flex-direction: column; justify-content: center; width: 100%; height: 100%; border: 0; border-radius: 0; }
+.video-player-shell:fullscreen video { flex: 1; min-height: 0; width: 100%; height: calc(100% - 56px); max-height: none; object-fit: contain; }
+.video-player-shell:fullscreen .pulse-video-controls { flex: none; }
+@media (hover: none) { .attachment-icon-download { opacity: 1; } }
+.video-compatibility-canvas { display: none; }
+.compatibility-picture .message-attachment-video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.compatibility-picture .video-compatibility-canvas { display: block; width: 100%; aspect-ratio: 16 / 9; max-height: 360px; object-fit: contain; background: #111214; cursor: pointer; }
+.video-player-shell:fullscreen.compatibility-picture .video-compatibility-canvas { flex: 1; min-height: 0; height: calc(100% - 56px); max-height: none; }
+.video-compatibility[aria-pressed=true] { background: var(--surface-selected); color: #b4bcff; }
+@media (max-width: 600px) {
+  .message-attachment .pulse-video-controls { gap: 4px; padding: 8px; }
+  .pulse-video-controls .video-volume { display: none; }
+  .pulse-video-controls .video-seek { min-width: 24px; }
+  .pending-attachment { flex-basis: 160px; }
+}
 
 @media (max-width: 1120px) {
   .profilebar, .rightbar { display: none; }

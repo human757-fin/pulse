@@ -46,7 +46,7 @@ test('attachment download status displays progress, completion and errors safely
   const start = source.indexOf('type DownloadState =');
   const end = source.indexOf('let previewObserver:', start);
   const status = { hidden: true, dataset: {}, textContent: '' };
-  const context = { app: { querySelectorAll: () => [status] } };
+  const context = { app: { querySelectorAll: selector => selector.includes('data-download-status') ? [status] : [] } };
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
   context.updateDownload('file', { state: 'downloading', percent: 42 });

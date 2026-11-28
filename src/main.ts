@@ -2,6 +2,8 @@ import './style.css';
 import './servers.css';
 import './refresh.css';
 import './accessibility.css';
+import { AttachmentDrafts } from './attachment-drafts';
+import { installCompatibilityPicture } from './video-picture';
 import QRCode from 'qrcode';
 import packageInfo from '../package.json';
 import { createAttachmentCipher, createGroupAttachmentCipher, decryptFile, decryptMessage, encryptMessage, initializeIdentity, voiceEncryptionKey } from './crypto';
@@ -74,6 +76,19 @@ let authError = '';
 let notice = '';
 let busy = false;
 let attachmentStatus = '';
+const attachmentDrafts = new AttachmentDrafts();
+const sendingConversations = new Set<string>();
+function canCompose(target: User | GroupChat) {
+  const server = servers.find(item => item.channels.some(channel => channel.id === target.id));
+  return !server || server.currentPermissions.includes('send_messages');
+}
+function stageAttachments(files: File[], target: User | GroupChat) {
+  if (!canCompose(target)) throw new Error('You do not have permission to send messages here.');
+  if (sendingConversations.has(target.id)) throw new Error('Wait for the current upload to finish.');
+  if (editingMessageId) throw new Error('Finish editing your message before attaching files.');
+  attachmentDrafts.add(target.id, files);
+  if ((activeFriend || activeGroup)?.id === target.id) render();
+}
 function setAttachmentStatus(value: string) { attachmentStatus = value; const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) { status.textContent = value; status.setAttribute('role', 'status'); } }
 let settingsOpen = false;
 let serverSettingsOpen = false;
@@ -128,6 +143,18 @@ function updateDownload(id: string, value: DownloadState) {
     status.dataset.state = value.state;
     status.textContent = downloadLabel(value);
   });
+  app.querySelectorAll<HTMLButtonElement>(`[data-attachment-download="${id}"].attachment-icon-download`).forEach(button => {
+    button.innerHTML = value.state === 'complete' ? downloadCompleteIcon : downloadAttachmentIcon;
+    button.dataset.state = value.state;
+    button.disabled = value.state === 'downloading';
+    button.title = downloadLabel(value);
+    button.setAttribute('aria-label', downloadLabel(value));
+  });
+}
+function attachmentDownloadControl(id: string, name: string) {
+  const state = attachmentDownloads.get(id);
+  const label = state?.state === 'complete' ? 'Download complete. Download again' : state?.state === 'downloading' ? downloadLabel(state) : `Download ${name}`;
+  return `<button type="button" class="attachment-icon-download" data-attachment-download="${esc(id)}" data-state="${state?.state || ''}" title="${esc(label)}" aria-label="${esc(label)}" ${state?.state === 'downloading' ? 'disabled' : ''}>${state?.state === 'complete' ? downloadCompleteIcon : downloadAttachmentIcon}</button>`;
 }
 let previewObserver: IntersectionObserver | undefined;
 const senderEnvelopeMigrations = new Set<string>();
@@ -334,10 +361,10 @@ function messageContent(text: string) {
         const transfer = previewTransfers.get(file.id);
         const error = transfer?.error;
         const status = error || (transfer ? `Preparing video preview · ${transfer.percent}%` : `${formatFileSize(file.size!)} · preview loads when visible`);
-        return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play ${error ? '' : 'loading'}" data-attachment-load="${esc(file.id)}" aria-label="${error ? 'Retry video preview' : 'Preparing video preview'}" title="${error ? 'Retry video preview' : 'Preparing video preview'}" ${error ? '' : 'disabled'}>${error ? 'Retry' : '…'}</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}" ${error ? 'role="alert"' : 'role="status"'}>${esc(status)}</small><div class="video-preview-actions"><button type="button" class="attachment-download-action" data-attachment-download="${esc(file.id)}">Download</button></div></div></div>`;
+        return `<div class="video-preview-card" data-video-preview="${esc(file.id)}"><div class="video-preview-thumb"><button type="button" class="video-preview-play ${error ? '' : 'loading'}" data-attachment-load="${esc(file.id)}" aria-label="${error ? 'Retry video preview' : 'Preparing video preview'}" title="${error ? 'Retry video preview' : 'Preparing video preview'}" ${error ? '' : 'disabled'}>${error ? 'Retry' : '…'}</button><small>VIDEO</small></div><div class="video-preview-info"><strong>${name}</strong><small data-video-progress="${esc(file.id)}" ${error ? 'role="alert"' : 'role="status"'}>${esc(status)}</small><div class="video-preview-actions">${attachmentDownloadControl(file.id, file.name)}</div></div></div>`;
       }
       if (!url) return `<button type="button" class="attachment-load" data-attachment-load="${esc(file.id)}">${type.startsWith('image/') ? 'Load image' : 'Download file'} · ${name} <span>${formatFileSize(file.size!)}</span></button>`;
-      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video><button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">${videoPlayIcon}</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">${videoVolumeIcon(false)}</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">${videoFullscreenIcon}</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p><a class="attachment-download-button" href="${esc(url)}" download="${name}">Download video</a></div>`;
+      if (type.startsWith('video/')) return `<div class="message-attachment"><div class="video-player-shell" data-video-shell="${esc(file.id)}"><video class="message-attachment-video" data-video-file="${esc(file.id)}" preload="metadata" playsinline webkit-playsinline tabindex="0" aria-label="${name}. Press Space to play or pause; arrow keys seek or adjust volume." src="${esc(url)}"></video>${attachmentDownloadControl(file.id, file.name)}<button type="button" class="video-center-play" data-video-play aria-label="Play video" title="Play video">▶</button><div class="pulse-video-controls"><button type="button" class="video-toggle" data-video-toggle aria-label="Play video" title="Play / pause">${videoPlayIcon}</button><span class="video-time" data-video-time>0:00 / --:--</span><input class="video-seek" data-video-seek type="range" min="0" max="1000" value="0" aria-label="Seek video"><button type="button" class="video-volume-toggle" data-video-volume-toggle aria-label="Mute video" title="Mute">${videoVolumeIcon(false)}</button><input class="video-volume" data-video-volume type="range" min="0" max="1" step="0.05" value="1" aria-label="Video volume"><button type="button" class="video-compatibility" data-video-compatibility aria-label="Toggle compatibility video display" aria-pressed="false" title="Try compatibility display if the picture is black"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 4h18v13H3V4Zm5 17h8m-4-4v4M7 8h10m-10 4h6"/></svg></button><button type="button" class="video-fullscreen" data-video-fullscreen aria-label="Fullscreen" title="Fullscreen">${videoFullscreenIcon}</button></div></div><p class="video-playback-error" ${videoValidationErrors.has(file.id) ? '' : 'hidden'}>${esc(videoValidationErrors.get(file.id) || '')}</p></div>`;
       if (type.startsWith('image/')) return `<div class="message-attachment"><a href="${esc(url)}" download="${name}"><img class="message-attachment-image" src="${esc(url)}" alt="${name}"/></a><a class="attachment-name" href="${esc(url)}" download="${name}">${name}</a></div>`;
       return `<div class="message-attachment-file"><span class="attachment-file-icon">${type === 'application/pdf' ? 'PDF' : 'TXT'}</span><a href="${esc(url)}" download="${name}">${name}</a></div>`;
     } catch { return '<p>Could not display this attachment.</p>'; }
@@ -622,13 +649,16 @@ async function sendAttachment(file: File, target: User | GroupChat, onProgress?:
       const index = nextIndex++;
       const start = index * attachmentChunkBytes;
       const plaintext = await file.slice(start, Math.min(start + attachmentChunkBytes, file.size)).arrayBuffer();
-      chunkHashes[index] = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', plaintext)), byte => byte.toString(16).padStart(2, '0')).join('');
-      const encrypted = await cipher.encrypt(id, ivPrefix, index, plaintext);
+      const [digest, encrypted] = await Promise.all([crypto.subtle.digest('SHA-256', plaintext), cipher.encrypt(id, ivPrefix, index, plaintext)]);
+      chunkHashes[index] = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
       await rawAttachmentRequest(`/attachments/${id}/${index}`, 'PUT', encrypted);
       uploaded += Math.min(attachmentChunkBytes, file.size - start); setAttachmentStatus(`Uploading ${file.name} · ${Math.floor(uploaded / file.size * 100)}%`); onProgress?.(uploaded, file.size);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(3, chunkCount) }, uploadWorker));
+  // Wait for all active workers before retrying a failed file.
+  const uploads = await Promise.allSettled(Array.from({ length: Math.min(4, chunkCount) }, uploadWorker));
+  const failure = uploads.find(result => result.status === 'rejected');
+  if (failure?.status === 'rejected') throw failure.reason;
   const content = attachmentV2Prefix + JSON.stringify({ id, name: file.name.slice(0, 120), type, size: file.size, chunkCount, ivPrefix: ivPrefixBase64, chunkHashes, ...(groupKey ? { groupKey: base64Bytes(groupKey), groupId: target.id } : {}) });
   if (group) {
     const envelopes: Record<string, { iv: string; ciphertext: string }> = {};
@@ -727,6 +757,9 @@ const videoPlayIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5
 const videoPauseIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zm6 0h4v14h-4z" fill="currentColor" stroke="none"/></svg>';
 const videoVolumeIcon = (muted: boolean) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><${muted ? 'path d="m17 9 5 6m0-6-5 6"' : 'path d="M16 9a5 5 0 0 1 0 6m2-9a9 9 0 0 1 0 12"'}/></svg>`;
 const videoFullscreenIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4"/></svg>';
+const downloadAttachmentIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/></svg>';
+const downloadCompleteIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>';
+const removeAttachmentIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13M10 10v7m4-7v7"/></svg>';
 function reportInlineVideoError(video: HTMLVideoElement, error?: unknown) {
   const status = video.closest('.message-attachment')?.querySelector<HTMLElement>('.video-playback-error');
   if (!status) return;
@@ -749,12 +782,19 @@ async function playInlineVideo(video: HTMLVideoElement) {
   catch (error) { reportInlineVideoError(video, error); }
 }
 
+let renderAfterVideoFullscreen = false;
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && renderAfterVideoFullscreen) { renderAfterVideoFullscreen = false; render(); }
+});
+
 function render() {
+  if (document.fullscreenElement?.classList.contains('video-player-shell')) { renderAfterVideoFullscreen = true; return; }
   previewObserver?.disconnect();
   previewObserver = undefined;
   if (!me) { renderAuth(); return; }
   if (settingsOpen) { renderSettings(); return; }
   const videoPlayback = new Map(Array.from(app.querySelectorAll<HTMLVideoElement>('.message-attachment-video')).map(video => [video.dataset.videoFile || '', { currentTime: video.currentTime, paused: video.paused }] as const).filter(([id]) => !!id));
+  const retainedPlayers = new Map(Array.from(app.querySelectorAll<HTMLElement>('[data-video-shell]')).map(shell => [shell.dataset.videoShell!, shell]));
   app.classList.remove('settings-view');
   const draft = app.querySelector<HTMLInputElement>('#message-input')?.value || '';
   const wasComposing = document.activeElement === app.querySelector<HTMLInputElement>('#message-input');
@@ -817,7 +857,7 @@ function render() {
     <div class="side-scroll"><section>${sidebarContent}</section></div>${accountFooter}</aside>
   <main class="main"><header class="chat-header"><div class="chat-heading"><span class="head-hash">${friend ? avatar(friend, 'tiny') : group ? '<span class="group-chat-icon">✦</span>' : '✦'}</span><div><h1>${conversation ? esc(friend ? displayName(friend) : group!.name) : friendsTitle}</h1><p>${friend ? esc(friend.bio || 'Direct message') : group ? `${group.members.length} members · end-to-end encrypted` : friendsPanel === 'friends' ? 'Chat and call your friends.' : friendsTitle}</p></div></div><div class="header-actions">${friend && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>${incomingCall?.caller.id === friend.id ? 'Join call' : 'Call'}</button>` : ''}${group && !callActive ? `<button id="call-button" class="call-button" ${cryptoReady ? '' : 'disabled'}>Call</button>` : ''}</div></header>
     ${callBar}${callParticipantBar}${callScreenStage}${conversation ? `<label class="chat-search ${friend ? 'direct-message-search' : ''}"><span>⌕</span><input id="message-search" type="search" placeholder="Search this chat" value="${esc(messageSearch)}" aria-label="Search messages in this chat"/><kbd>Ctrl K</kbd>${messageSearch ? '<button type="button" id="clear-message-search" aria-label="Clear search">×</button>' : ''}</label>` : ''}<div class="drop-overlay" id="drop-overlay" aria-hidden="true">Drop files here to send</div><div class="message-area" id="messages">${conversation ? (messages.length ? messages.filter(m => !messageSearch || m.text.toLowerCase().includes(messageSearch.toLowerCase())).map(m => `<article class="message ${m.from.id === me!.id ? 'own' : ''}" data-message-id="${esc(m.id)}" data-user-context="${esc(m.from.id)}">${avatar(m.from, 'message-avatar')}<div class="message-body"><div class="message-meta"><strong>${esc(displayName(m.from))}</strong><time>${time(m.createdAt)}</time>${m.editedAt ? '<span class="message-edited">edited</span>' : ''}<div class="message-actions"><button type="button" data-message-copy="${esc(m.id)}" title="Copy message">Copy</button>${m.from.id === me!.id && !m.text.startsWith(attachmentV2Prefix) ? `<button type="button" data-message-edit="${esc(m.id)}" title="Edit message">Edit</button>` : ''}${m.from.id === me!.id ? `<button type="button" data-message-delete="${esc(m.id)}" title="Delete message">Delete</button>` : ''}</div></div>${messageBody(m.text)}</div></article>`).join('') || `<div class="empty-chat"><h2>No messages found</h2><p>Try another search.</p></div>` : `<div class="empty-chat"><div class="welcome-icon">✦</div><h2>${friend ? `Say hello to ${esc(displayName(friend))}` : `Start ${esc(group!.name)}`}</h2><p>Messages in this conversation are end-to-end encrypted.</p></div>`) : `<div class="welcome"><div class="welcome-icon">✦</div><h2>${friendsPanel === 'friends' ? `Welcome to Pulse, ${esc(displayName(me))}` : friendsPanel === 'requests' ? 'Friend requests' : 'Add a friend'}</h2><p>${friendsPanel === 'friends' ? 'Choose a friend or create a group chat.' : friendsPanel === 'requests' ? 'Incoming requests appear in the sidebar. Accept one to start chatting.' : 'Enter a Pulse username in the sidebar to send a friend request.'}</p></div>`}</div>
-    ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : `🔒 End-to-end encrypted${friend ? ' · drop files here · 750 MB max' : ' · group messages'}`}</div></form>` : ''}
+    ${conversation ? `<form id="composer" class="composer ${editingMessageId ? 'editing-message' : ''}">${friend ? '<button type="button" class="attach" id="attach-button" title="Attach files or videos (750 MB max)" aria-label="Attach a file">＋</button><input id="attachment-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,video/mp4,video/webm,.mp4,.webm" hidden/>' : ''}<input id="message-input" maxlength="4096" autocomplete="off" placeholder="${editingMessageId ? 'Edit your message' : `Message ${esc(friend ? friend.username : group!.name)}`}"/><button class="send" type="submit" title="${editingMessageId ? 'Save edit' : 'Send encrypted message'}" ${cryptoReady ? '' : 'disabled'}>↑</button>${editingMessageId ? '<button type="button" id="cancel-message-edit" class="cancel-edit" title="Cancel edit">×</button>' : ''}<div class="composer-hint" id="attachment-status">${editingMessageId ? 'Editing message · Esc to cancel' : ''}</div></form>` : ''}
   </main><aside class="profilebar">${friendProfile}</aside><div class="toast ${notice ? 'show' : ''}">${esc(notice)}</div>`;
   if (creationModal) app.insertAdjacentHTML('beforeend', creationModal);
   setupServerPanels();
@@ -981,22 +1021,35 @@ function render() {
   app.querySelectorAll<HTMLButtonElement>('[data-message-edit]').forEach(button => button.onclick = () => { const item = messages.find(message => message.id === button.dataset.messageEdit); if (!item || item.from.id !== me?.id) return; editingMessageId = item.id; render(); const input = app.querySelector<HTMLInputElement>('#message-input'); if (input) { input.value = item.text; input.focus(); input.setSelectionRange(input.value.length, input.value.length); } });
   app.querySelectorAll<HTMLButtonElement>('[data-message-delete]').forEach(button => button.onclick = async () => { const item = messages.find(message => message.id === button.dataset.messageDelete); if (!item || item.from.id !== me?.id || !window.confirm('Delete this message for everyone?')) return; try { const path = activeGroup ? `/groups/${encodeURIComponent(activeGroup.id)}/messages/${encodeURIComponent(item.id)}` : `/messages/${encodeURIComponent(item.id)}`; await api(path, { method: 'DELETE' }); messages = messages.filter(message => message.id !== item.id); decryptedCache.delete(item.id); notice = 'Message deleted.'; render(); } catch (error) { showError(error); } });
   const composer = app.querySelector<HTMLFormElement>('#composer');
-  if (composer && conversation) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); if (!text) return; input.disabled = true; try {
-    if (editingMessageId) { const path = group ? `/groups/${encodeURIComponent(group.id)}/messages/${encodeURIComponent(editingMessageId)}` : `/messages/${encodeURIComponent(editingMessageId)}`; if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); const selfEnvelope = await encryptMessage(me!.id, me!.id, text, fetchFriendKey); await api(path, { method: 'PATCH', body: JSON.stringify({ ...envelope, selfEnvelope }) }); } else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(path, { method: 'PATCH', body: JSON.stringify({ envelopes }) }); } decryptedCache.delete(editingMessageId); editingMessageId = ''; }
-    else if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); const selfEnvelope = await encryptMessage(me!.id, me!.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope, selfEnvelope }) }); }
-    else if (group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(`/groups/${encodeURIComponent(group.id)}/messages`, { method: 'POST', body: JSON.stringify({ envelopes }) }); }
-    input.value = ''; await refreshMessages(conversation); render(); app.querySelector<HTMLInputElement>('#message-input')?.focus();
-  } catch (error) { showError(error); input.disabled = false; } };
+  if (composer && conversation) {
+    const sending = sendingConversations.has(conversation.id);
+    const items = attachmentDrafts.list(conversation.id);
+    if (items.length) composer.insertAdjacentHTML('afterbegin', `<div class="pending-attachments" aria-label="Attachments ready to send">${items.map(item => {
+      const type = attachmentMime(item.file);
+      const preview = type.startsWith('image/') ? `<img src="${esc(item.url)}" alt="Preview of ${esc(item.file.name)}">` : type.startsWith('video/') ? `<video src="${esc(item.url)}#t=0.1" preload="metadata" muted playsinline aria-label="Preview of ${esc(item.file.name)}"></video>` : `<svg class="pending-file-icon" viewBox="0 0 48 56" fill="none" aria-hidden="true"><path d="M8 2h20l12 12v40H8V2Z" fill="currentColor"/><path d="M28 2v14h12" stroke="var(--surface)" stroke-width="3"/></svg>`;
+      return `<article class="pending-attachment ${item.error ? 'failed' : ''}"><div class="pending-preview">${preview}${type.startsWith('video/') ? '<span class="pending-media-label">Video</span>' : ''}</div><button type="button" class="pending-remove" data-remove-attachment="${item.id}" aria-label="Remove ${esc(item.file.name)}" title="Remove attachment" ${sending ? 'disabled' : ''}>${removeAttachmentIcon}</button><strong title="${esc(item.file.name)}">${esc(item.file.name)}</strong><small>${formatFileSize(item.file.size)}</small><p data-pending-progress="${item.id}" role="status">${esc(item.error || (sending ? `Uploading · ${item.percent}%` : 'Ready to send'))}</p></article>`;
+    }).join('')}</div>`);
+    composer.querySelectorAll<HTMLButtonElement>('[data-remove-attachment]').forEach(button => button.onclick = () => { if (!sendingConversations.has(conversation.id)) { attachmentDrafts.remove(conversation.id, button.dataset.removeAttachment!); render(); } });
+    const input = composer.querySelector<HTMLInputElement>('#message-input');
+    if (input) input.disabled = sending || !canCompose(conversation);
+    const send = composer.querySelector<HTMLButtonElement>('.send');
+    if (send) { send.disabled = sending || !cryptoReady || !canCompose(conversation); send.setAttribute('aria-label', sending ? 'Uploading attachments' : 'Send message and attachments'); }
+  }
+  if (composer && conversation) composer.onsubmit = async e => { e.preventDefault(); const input = app.querySelector<HTMLInputElement>('#message-input')!; const text = input.value.trim(); const queued = [...attachmentDrafts.list(conversation.id)]; if ((!text && !queued.length) || sendingConversations.has(conversation.id) || !cryptoReady || !canCompose(conversation)) return; sendingConversations.add(conversation.id); input.disabled = true; try { for (const item of queued) { item.error = undefined; try { await sendAttachment(item.file, conversation, (uploaded, total) => { item.percent = Math.floor(uploaded / total * 100); const status = app.querySelector<HTMLElement>(`[data-pending-progress="${item.id}"]`); if (status) { status.textContent = `Uploading · ${item.percent}%`; status.style.setProperty('--upload-progress', `${item.percent}%`); } }); attachmentDrafts.remove(conversation.id, item.id); } catch (error) { item.error = error instanceof Error ? error.message : 'Upload failed. Press Send to retry.'; throw error; } }
+    if (editingMessageId) { const path = group ? `/groups/${encodeURIComponent(group.id)}/messages/${encodeURIComponent(editingMessageId)}` : `/messages/${encodeURIComponent(editingMessageId)}`; if (friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); const selfEnvelope = await encryptMessage(me!.id, me!.id, text, fetchFriendKey); await api(path, { method: 'PATCH', body: JSON.stringify({ ...envelope, selfEnvelope }) }); } else if (text && group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(path, { method: 'PATCH', body: JSON.stringify({ envelopes }) }); } decryptedCache.delete(editingMessageId); editingMessageId = ''; }
+    else if (text && friend) { const envelope = await encryptMessage(me!.id, friend.id, text, fetchFriendKey); const selfEnvelope = await encryptMessage(me!.id, me!.id, text, fetchFriendKey); await api('/messages', { method: 'POST', body: JSON.stringify({ to: friend.username, ...envelope, selfEnvelope }) }); }
+    else if (text && group) { const envelopes: Record<string, { iv: string; ciphertext: string }> = {}; for (const member of group.members.filter(member => member.encryptionReady !== false)) { try { envelopes[member.id] = await encryptMessage(me!.id, member.id, text, fetchFriendKey); } catch (error) { if (member.id === me!.id) throw error; } } await api(`/groups/${encodeURIComponent(group.id)}/messages`, { method: 'POST', body: JSON.stringify({ envelopes }) }); }
+    input.value = ''; if ((activeFriend || activeGroup)?.id === conversation.id) { const current = app.querySelector<HTMLInputElement>('#message-input'); if (current) current.value = ''; } setAttachmentStatus(''); await refreshMessages(conversation);
+  } catch (error) { setAttachmentStatus(error instanceof Error ? error.message : 'Send failed.'); } finally { sendingConversations.delete(conversation.id); if ((activeFriend || activeGroup)?.id === conversation.id) { render(); app.querySelector<HTMLInputElement>('#message-input')?.focus(); } } };
   app.querySelector<HTMLButtonElement>('#attach-button')?.addEventListener('click', () => {
     if (!conversation) return;
     const target = conversation;
     // Keep the native picker outside the frequently replaced chat DOM.
     const picker = document.createElement('input'); picker.type = 'file'; picker.multiple = true; picker.hidden = true; document.body.append(picker);
     picker.addEventListener('cancel', () => picker.remove(), { once: true });
-    picker.addEventListener('change', async () => {
+    picker.addEventListener('change', () => {
       const files = Array.from(picker.files || []); picker.remove();
-      try { for (const file of files) await sendAttachment(file, target); if ((activeFriend || activeGroup)?.id === target.id) { await refreshMessages(target); render(); } }
-      catch (error) { setAttachmentStatus(error instanceof Error ? error.message : 'Upload failed.'); showError(error); }
+      try { stageAttachments(files, target); } catch (error) { showError(error); }
     }, { once: true });
     picker.click();
   });
@@ -1009,19 +1062,7 @@ function render() {
     event.preventDefault();
     if (!conversation) return;
     const target = conversation;
-    try {
-      for (const file of files) await sendAttachment(file, target, (uploaded, total) => {
-        const status = app.querySelector<HTMLElement>('#attachment-status');
-        if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`;
-      });
-      if ((activeFriend || activeGroup)?.id === target.id) { await refreshMessages(target); render(); }
-    } catch (error) { showError(error); }
-  });
-  app.querySelector<HTMLInputElement>('#attachment-input')?.addEventListener('change', async event => {
-    const picker = event.currentTarget as HTMLInputElement; const files = Array.from(picker.files || []); picker.value = ''; if (!files.length || !friend) return;
-    const target = friend;
-    try { for (const file of files) await sendAttachment(file, target, (uploaded, total) => { const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`; }); await refreshMessages(target); render(); }
-    catch (error) { showError(error); }
+    try { stageAttachments(files, target); } catch (error) { showError(error); }
   });
   app.querySelectorAll<HTMLButtonElement>('[data-attachment-load]').forEach(button => button.addEventListener('click', async () => {
     const id = button.dataset.attachmentLoad; const target = conversation; if (!id || !target || attachmentUrlCache.has(id)) return;
@@ -1030,7 +1071,7 @@ function render() {
     button.disabled = true; button.textContent = 'Loading preview…';
     try {
       const file = await prepareVideoPreview(id, target);
-      if (download && file) { downloadLocalFile(file.url, file.name); updateDownload(id, { state: 'complete', percent: 100 }); notice = `Download complete: ${file.name}`; render(); }
+      if (download && file) { downloadLocalFile(file.url, file.name); updateDownload(id, { state: 'complete', percent: 100 }); render(); }
     } catch (error) {
       if (download) updateDownload(id, { state: 'error', percent: 0, error: error instanceof Error ? error.message : 'Download failed. Try again.' });
       button.disabled = false; button.textContent = 'Retry'; button.title = error instanceof Error ? error.message : 'Attachment download failed'; showError(error);
@@ -1040,18 +1081,17 @@ function render() {
     event.preventDefault();
     const id = button.dataset.attachmentDownload; const target = conversation; if (!id || !target) return;
     if (attachmentDownloads.get(id)?.state === 'downloading') return;
-    button.disabled = true; if (button.tagName === 'BUTTON') button.textContent = 'Preparing download…';
+    button.disabled = true; if (button.tagName === 'BUTTON' && !button.classList.contains('attachment-icon-download')) button.textContent = 'Preparing download…';
     updateDownload(id, { state: 'downloading', percent: previewTransfers.get(id)?.percent || 0 });
     try {
-      const file = await loadAttachment(id, target, percent => { if (button.tagName === 'BUTTON') button.textContent = `Downloading · ${percent}%`; });
+      const file = await loadAttachment(id, target, percent => { if (button.tagName === 'BUTTON' && !button.classList.contains('attachment-icon-download')) button.textContent = `Downloading · ${percent}%`; });
       downloadLocalFile(file.url, file.name);
       updateDownload(id, { state: 'complete', percent: 100 });
-      notice = `Download complete: ${file.name}`;
       render();
     } catch (error) {
       updateDownload(id, { state: 'error', percent: 0, error: error instanceof Error ? error.message : 'Download failed. Try again.' });
       showError(error);
-    } finally { button.disabled = false; if (button.tagName === 'BUTTON') button.textContent = 'Download'; }
+    } finally { button.disabled = false; if (button.tagName === 'BUTTON' && !button.classList.contains('attachment-icon-download')) button.textContent = 'Download'; }
   }));
   app.querySelectorAll<HTMLButtonElement>('[data-video-play]').forEach(button => button.addEventListener('click', async () => {
     const video = button.closest('.video-player-shell')?.querySelector<HTMLVideoElement>('video');
@@ -1099,6 +1139,8 @@ function render() {
     else prepareVisibleVideo(card);
   });
   app.querySelectorAll<HTMLVideoElement>('.message-attachment-video').forEach(video => {
+    const compatibility = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-compatibility]');
+    if (compatibility && video.parentElement) installCompatibilityPicture(video.parentElement, video, compatibility);
     const play = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-play]');
     const toggle = video.parentElement?.querySelector<HTMLButtonElement>('[data-video-toggle]');
     const seek = video.parentElement?.querySelector<HTMLInputElement>('[data-video-seek]');
@@ -1138,8 +1180,7 @@ function render() {
     main.addEventListener('drop', async event => {
       if (!hasFiles(event)) return; event.preventDefault(); dragDepth = 0; main.classList.remove('drag-active');
       const files = Array.from(event.dataTransfer?.files || []); const target = conversation;
-      try { for (const file of files) await sendAttachment(file, target, (uploaded, total) => { const status = app.querySelector<HTMLElement>('#attachment-status'); if (status) status.textContent = `Uploading ${file.name} · ${Math.floor(uploaded / total * 100)}%`; }); await refreshMessages(target); render(); }
-      catch (error) { showError(error); }
+      try { stageAttachments(files, target); } catch (error) { showError(error); }
     });
   }
   if (activeServer) app.querySelector<HTMLButtonElement>('#call-button')?.remove();
@@ -1173,6 +1214,15 @@ function render() {
     void voice.updateScreenShareSettings({ ...screenSize, fps: Number(screenFps) }).catch(showError);
   });
   app.querySelector<HTMLInputElement>('#voice-endpoint')?.addEventListener('change', e => localStorage.setItem('pulse.signalUrl', (e.currentTarget as HTMLInputElement).value.trim()));
+  // Keep decoded media and controls alive across presence/message refreshes.
+  for (const [id, retained] of retainedPlayers) {
+    const replacement = app.querySelector<HTMLElement>(`[data-video-shell="${id}"]`);
+    const oldVideo = retained.querySelector<HTMLVideoElement>('video');
+    const newVideo = replacement?.querySelector<HTMLVideoElement>('video');
+    if (!replacement || !oldVideo || oldVideo.src !== newVideo?.src) continue;
+    replacement.replaceWith(retained);
+    if (videoPlayback.get(id)?.paused === false) void oldVideo.play().catch(error => reportInlineVideoError(oldVideo, error));
+  }
   const nextDraft = app.querySelector<HTMLInputElement>('#message-input');
   if (nextDraft && draft) { nextDraft.value = draft; if (wasComposing) nextDraft.focus(); }
   const area = app.querySelector('#messages'); if (area && friend) area.scrollTop = area.scrollHeight;
@@ -1295,6 +1345,7 @@ app.addEventListener('click', event => {
 });
 
 async function signOut() {
+  attachmentDrafts.clear();
   await cancelOutgoingCallInvite();
   try { await api('/logout', { method: 'POST', body: '{}' }); } catch {}
   token = ''; me = undefined; activeFriend = undefined; activeGroup = undefined; activeServer = undefined; groups = []; servers = []; incomingCall = undefined; settingsOpen = false;
@@ -1377,6 +1428,28 @@ function renderSettings() {
   app.querySelector<HTMLButtonElement>('[data-join-call]')?.addEventListener('click', () => { void joinIncomingCall(); });
   app.querySelector<HTMLButtonElement>('#logout-settings')!.onclick = () => void signOut();
   app.querySelector<HTMLButtonElement>('#settings-close')!.onclick = () => { settingsOpen = false; render(); };
+  if (settingsTab === 'security') {
+    app.querySelector('.settings-content')?.insertAdjacentHTML('beforeend', `<section class="settings-section"><h2>Change password</h2><p>Changing your password signs out all sessions. Your messages and encryption keys stay unchanged.</p><form id="change-password-form" class="settings-form"><label>Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label><label>New password<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label><label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label>${me.authenticatorEnabled ? '<label>Authenticator or recovery code<input name="secondFactor" autocomplete="one-time-code" maxlength="24" required></label>' : ''}<p class="settings-form-error" role="alert"></p><button type="submit" class="primary-button">Change password</button></form></section>`);
+    const passwordForm = app.querySelector<HTMLFormElement>('#change-password-form')!;
+    passwordForm.onsubmit = async event => {
+      event.preventDefault();
+      const values = new FormData(passwordForm);
+      const error = passwordForm.querySelector<HTMLElement>('[role=alert]')!;
+      error.textContent = '';
+      if (values.get('password') !== values.get('confirmPassword')) { error.textContent = 'Passwords do not match.'; return; }
+      const submit = passwordForm.querySelector<HTMLButtonElement>('button[type=submit]')!;
+      if (submit.disabled) return;
+      submit.disabled = true; submit.textContent = 'Changing password…';
+      try {
+        await api('/auth/password-change', { method: 'POST', body: JSON.stringify({ currentPassword: values.get('currentPassword'), password: values.get('password'), secondFactor: values.get('secondFactor') || '' }) });
+        authMode = 'login'; authPhase = 'credentials'; authError = ''; pendingAuth = undefined;
+        await signOut();
+        const subtitle = app.querySelector('.auth-subtitle');
+        if (subtitle) subtitle.textContent = 'Password changed. Sign in with your new password.';
+      } catch (failure) { error.textContent = failure instanceof Error ? failure.message : 'Could not change password.'; }
+      finally { submit.disabled = false; submit.textContent = 'Change password'; }
+    };
+  }
   app.querySelectorAll<HTMLButtonElement>('[data-settings-tab]').forEach(button => button.onclick = () => { settingsTab = button.dataset.settingsTab as typeof settingsTab; renderSettings(); if (settingsTab === 'calls') void refreshAudioDevices(); if (settingsTab === 'admin') void refreshAdminSuggestions(); });
   app.querySelector<HTMLButtonElement>('#admin-suggestions-refresh')?.addEventListener('click', () => void refreshAdminSuggestions());
   app.querySelectorAll<HTMLSelectElement>('[data-admin-suggestion-status]').forEach(select => select.addEventListener('change', () => {

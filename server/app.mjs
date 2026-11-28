@@ -285,7 +285,7 @@ async function serve(req, res) {
   const url = new URL(req.url || '/', 'http://localhost');
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS' }); res.end(); return; }
   if (url.pathname.startsWith('/api/')) {
-    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login', '/api/auth/password-reset', '/api/auth/password-reset/complete'].includes(url.pathname)) {
+    if (['/api/signup', '/api/login', '/api/auth/email-code', '/api/auth/totp/login', '/api/auth/password-reset', '/api/auth/password-reset/complete', '/api/auth/password-change'].includes(url.pathname)) {
       const key = req.socket.remoteAddress || 'unknown'; const now = Date.now();
       const entry = requestWindows.get(key) || { start: now, count: 0 };
       if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
@@ -475,6 +475,24 @@ async function serve(req, res) {
         return json(res, 200, { token, user: accountUser(user) });
       }
       const user = sessionUser(req);
+      if (url.pathname === '/api/auth/password-change' && req.method === 'POST') {
+        if (!user) return json(res, 401, { error: 'Sign in to change your password.' });
+        if (Object.keys(body).some(key => !['currentPassword', 'password', 'secondFactor'].includes(key)) || typeof body.currentPassword !== 'string' || body.currentPassword.length > 128 || typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) return json(res, 400, { error: 'Enter your current password and a new password with 10–128 characters.' });
+        if (body.password === body.currentPassword) return json(res, 400, { error: 'Choose a different new password.' });
+        const previousHash = user.passwordHash;
+        const candidate = await scrypt(body.currentPassword, user.salt, 64);
+        const expected = Buffer.from(previousHash, 'hex');
+        if (expected.length !== candidate.length || !timingSafeEqual(candidate, expected) || user.passwordHash !== previousHash || (user.totpEnabled && !verifySecondFactor(user, String(body.secondFactor || '')))) return json(res, 400, { error: 'Current password or authenticator code is incorrect.' });
+        const salt = randomBytes(16).toString('hex');
+        const passwordHash = (await scrypt(body.password, salt, 64)).toString('hex');
+        if (user.passwordHash !== previousHash) return json(res, 409, { error: 'Your password changed. Sign in again.' });
+        user.salt = salt; user.passwordHash = passwordHash;
+        db.sessions = db.sessions.filter(session => session.userId !== user.id);
+        for (const [id, item] of emailChallenges) if (item.userId === user.id) emailChallenges.delete(id);
+        for (const [id, item] of totpLoginChallenges) if (item.userId === user.id) totpLoginChallenges.delete(id);
+        persist();
+        return json(res, 200, { ok: true });
+      }
       if (url.pathname === '/api/me' && req.method === 'GET') return user ? json(res, 200, { user: accountUser(user) }) : json(res, 401, { error: 'Sign in to continue.' });
       if (!user) return json(res, 401, { error: 'Sign in to continue.' });
       if (url.pathname === '/api/presence' && req.method === 'POST') {
